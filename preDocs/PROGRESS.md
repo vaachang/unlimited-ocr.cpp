@@ -137,6 +137,11 @@ bf16 激活舍入。详见 `ALIGNMENT.md` §4、`PITFALLS.md` §9。CPU 完整�
 
 ## 7. 后续计划
 
+> **下一步（2026-09-15 决定）**：端到端图像 OCR 对齐。执行顺序 E0 分词器对齐 →
+> E1 `<image>`/`images_seq_mask` 布局 → E2 图像预处理 → E3 Engine 注入视觉
+> embedding → E4 首 token logits/greedy 对比 → E5 `no_repeat_ngram_size=35`。
+> 详细子任务见 `tAgent.md`。
+
 1. **端到端数值对齐**：用 PyTorch 参考实现跑一张图，导出每层/每步 logits，
    与 C++ 输出逐层对比；优先校准 DeepEncoder 与图像 token 布局。
 2. **CUDA 主路径**：把 `MoEDecoder` 的 `Linear::forward` / attention 分派到
