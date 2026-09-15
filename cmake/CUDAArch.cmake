@@ -22,10 +22,10 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
             "CUDA >= 12.8 required for sm_120, found ${CMAKE_CUDA_COMPILER_VERSION}")
     endif()
 
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
-        set(CMAKE_CUDA_ARCHITECTURES "120" CACHE STRING
-            "CUDA architectures (sm_120 = consumer Blackwell)" FORCE)
-    endif()
+    set(ENGINE_CUDA_ARCH "120" CACHE STRING
+        "CUDA architecture to target (sm_120 = consumer Blackwell)")
+    set(CMAKE_CUDA_ARCHITECTURES "${ENGINE_CUDA_ARCH}" CACHE STRING
+        "CUDA architectures" FORCE)
 
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)

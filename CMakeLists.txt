@@ -114,7 +114,7 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
     target_include_directories(uocr_cuda PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_link_libraries(uocr_cuda PUBLIC uocr_core)
+    target_link_libraries(uocr_cuda PUBLIC uocr_core CUDA::cudart)
     target_compile_options(uocr_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
     set_target_properties(uocr_cuda PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
