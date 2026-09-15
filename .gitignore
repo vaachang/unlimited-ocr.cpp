@@ -1,1 +1,12 @@
-preDocs/
+build/
+build-*/
+cmake-build-*/
+models/
+*.safetensors
+*.bin
+*.o
+*.so
+*.a
+*.log
+compile_commands.json
+.cache/
