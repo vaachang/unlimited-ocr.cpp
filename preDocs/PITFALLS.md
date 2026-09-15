@@ -46,20 +46,22 @@ cache 布局： [ prefill 区 (长度 P) ][ ring 区 (W=128) ]
 
 字段同时出现在顶层和 `language_config` 里，解析时以顶层为准（`config.cpp` 中做了合并）。
 
-## 3. DeepEncoder 的图像 token 数量矛盾（待解决）
+## 3. 视觉 token 数量（已澄清）
 
-参考实现的 `infer()` 对 base(1024) 模式：
+早期判断认为"文本侧 273 个 `<image>` 占位 vs 视觉侧 4161 个 embedding"存在矛盾。
+经 PyTorch 参考导出核实，**双方都是 273**，并不存在矛盾：
 
-- 文本中插入的 `<image>` 占位 token 数为 `(16+1)*16 + 1 = 273`；
-- 但 `UnlimitedOCRModel.forward` 实际生成的视觉 embedding 为
-  `64*65 + 1 = 4161`（SAM 4096 + 每行 newline + view_seperator）。
+- SAM 的 `net_2` / `net_3` 在 64×64 特征图上各做一次 stride2 下采样，
+  最终输出 `[1,1024,16,16]` = **256** 个 token（不是 4096）。
+- CLI-L 在 256 个 token 上运行，`[:,1:]` 得 256，与 SAM flatten 拼接后
+  经 projector 得到 `[256,1280]`。
+- 每行加 `image_newline`（16 行）→ 256+16=272，再加 `view_seperator` → **273**。
+- 文本侧 `(num_queries_base+1)*num_queries_base + 1 = (16+1)*16+1 = 273`。
 
-`masked_scatter_` 在 source 元素多于 mask 时**静默截断**，不会报错。这暗示：
-要么上游 `infer` 预处理与 `forward` 不一致（bug），要么还有我们未发现的降采样步骤。
+结论：`DeepEncoder::encode` 返回 `rows*(grid+1)+1 = 16*17+1 = 273`，与参考一致。
+详见 `ALIGNMENT.md`。
 
-**本项目当前按实际 embedding 数量生成视觉 token**（`DeepEncoder::encode` 返回
-`rows*(grid+1)+1`），并在后续计划中通过 PyTorch 逐层对齐来厘清。这是端到端 OCR
-正确性尚未验证的主要原因。
+（早期文档中"4161"是按 64×64=4096 计算所致，属误判。）
 
 ## 4. DeepEncoder 结构（容易理解错的地方）
 
@@ -105,3 +107,19 @@ cache 布局： [ prefill 区 (长度 P) ][ ring 区 (W=128) ]
 要等有请求结束腾出名额后才会被接纳。这是有意的（decode 优先、避免抢占），
 测试 `scheduler_continuous_batching` 按此语义编写。`min_batch_size` 目前仅作
 配置项保存，未强制合并小 batch。
+
+## 8. 网络与磁盘（安装 PyTorch 的坑）
+
+- 本机 `huggingface.co` 直连超时；`hf-mirror.com` 可用。
+  `pypi.org` 的 `simple` 索引可达，但大文件（torch wheel、nvidia-* 依赖）经常
+  中断，`mirrors.aliyun.com` 的 wheel 链接也慢。
+- **可用 HTTP 代理 `http://192.168.1.164:7897`**（用户提供）；经代理后
+  pypi 约 13 MB/s、download.pytorch.org 约 3.8 MB/s。安装 Python 依赖时需
+  设置 `https_proxy` / `http_proxy`。
+- PyTorch CUDA 版来自 `--index-url https://download.pytorch.org/whl/cu128`
+  （torch 2.10.0+cu128 能识别 sm_120）。
+- **`/tmp` 是 7.9 GB tmpfs（`usrquota`）**。pip 默认在 `/tmp` 解包大 wheel，
+  会填满 tmpfs 并报 `[Errno 122] Disk quota exceeded`。解决：设置
+  `TMPDIR=/home/admin/.pip-tmp`（位于 `/dev/sda2`），并清理 `/tmp/pip-*` 残留。
+- 本机仅 Python 3.14，`torch`/`torchvision` 需选 cp314 wheel；`tokenizers`
+  用 `cp39-abi3` wheel 可在 3.14 上工作。

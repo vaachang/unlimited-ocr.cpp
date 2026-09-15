@@ -42,7 +42,8 @@ public:
     //   `final_norm` applies the model's final RMSNorm (prefill may skip it).
     //   `logits` outputs the lm_head projection of the last token.
     void forward(const Tensor& inputs, const std::vector<int>& positions, RSWACache& cache,
-                 bool prefill, int q_start, bool final_norm, std::vector<float>& logits);
+                 bool prefill, int q_start, bool final_norm, std::vector<float>& logits,
+                 std::vector<Tensor>* layer_outputs = nullptr);
 
     // Convenience wrappers.
     void prefill(RSWACache& cache, const std::vector<int>& tokens, int start_pos,

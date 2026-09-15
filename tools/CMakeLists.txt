@@ -1,2 +1,6 @@
 add_executable(inspect_model inspect_model.cpp)
 target_link_libraries(inspect_model PRIVATE ${UOCR_ENGINE_LIB})
+add_executable(compare_reference compare_reference.cpp)
+target_link_libraries(compare_reference PRIVATE ${UOCR_ENGINE_LIB})
+add_executable(compare_vision compare_vision.cpp)
+target_link_libraries(compare_vision PRIVATE ${UOCR_ENGINE_LIB})

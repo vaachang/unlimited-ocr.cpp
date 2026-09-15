@@ -10,3 +10,4 @@ models/
 *.log
 compile_commands.json
 .cache/
+.venv/

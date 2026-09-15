@@ -160,16 +160,19 @@ void MoEDecoder::layer_forward(int layer_idx, const Tensor& x, const std::vector
 }
 
 void MoEDecoder::forward(const Tensor& inputs, const std::vector<int>& positions, RSWACache& cache,
-                         bool prefill, int q_start, bool final_norm, std::vector<float>& logits) {
+                         bool prefill, int q_start, bool final_norm, std::vector<float>& logits,
+                         std::vector<Tensor>* layer_outputs) {
     const int seq = static_cast<int>(inputs.dim(0));
     const int hidden = cfg_.hidden_size;
     UOCR_CHECK(static_cast<int>(positions.size()) == seq, "positions length mismatch");
 
+    if (layer_outputs) layer_outputs->clear();
     Tensor h = inputs;
     Tensor next;
     for (int li = 0; li < cfg_.num_hidden_layers; ++li) {
         layer_forward(li, h, positions, cache, prefill, q_start, next);
         h = std::move(next);
+        if (layer_outputs) layer_outputs->push_back(h);
     }
 
     // final norm on the last row only

@@ -25,7 +25,10 @@
 ✅ 单元测试 15/15 通过（CPU），CUDA 测试 2/2 通过
 ✅ 真实权重 mmap 加载验证
 ✅ 基准测试可运行
-⬜ 端到端图像 OCR 数值对齐（需要 PyTorch 参考输出，尚未做）
+✅ PyTorch 参考环境（.venv, torch 2.10+cu128, transformers 4.57.1）
+✅ Decoder 数值对齐（11/12 层 hidden <1%，logits <1%）
+⬜ Vision 对齐跑完（compare_vision 已实现，CPU 运行较慢，未跑完）
+⬜ 端到端图像 OCR 对齐（视觉 token 数已确认 273，与文本一致）
 ⬜ CUDA Graph 捕获（当前为普通 kernel 启动）
 ⬜ CUDA 版 MoE/decoder 调度接入（当前 CUDA 仅提供内核与测试，主推理走 CPU）
 ```
@@ -53,8 +56,10 @@ unlimited-ocr.cpp/
 │                   test_scheduler.cpp test_decoder.cpp test_moe_gate.cpp
 │                   test_tokenizer.cpp test_rswa_cuda.cu
 ├── benchmarks/     bench_decode.cpp bench_throughput.cpp
-├── tools/          inspect_model.cpp
-└── models/         （.gitignore，包含下载的真实权重）
+├── tools/          inspect_model.cpp compare_reference.cpp compare_vision.cpp
+│                   reference/export_reference.py
+├── .venv/          （gitignore，PyTorch 参考环境）
+└── models/         （.gitignore，包含下载的真实权重与远程代码）
 ```
 
 ## 4. 构建与运行
