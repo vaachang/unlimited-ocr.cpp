@@ -10,6 +10,7 @@ namespace ops {
 
 void matmul_t(const float* x, const float* w, const float* bias, float* y,
               int m, int n, int k) {
+#pragma omp parallel for schedule(static) if (static_cast<long long>(m) * n * k > 1 << 18)
     for (int i = 0; i < m; ++i) {
         const float* xrow = x + static_cast<std::size_t>(i) * k;
         float* yrow = y + static_cast<std::size_t>(i) * n;
@@ -24,6 +25,7 @@ void matmul_t(const float* x, const float* w, const float* bias, float* y,
 
 void matmul_t_bf16(const float* x, const std::uint16_t* w, const float* bias, float* y,
                    int m, int n, int k) {
+#pragma omp parallel for schedule(static) if (static_cast<long long>(m) * n * k > 1 << 18)
     for (int i = 0; i < m; ++i) {
         const float* xrow = x + static_cast<std::size_t>(i) * k;
         float* yrow = y + static_cast<std::size_t>(i) * n;
@@ -111,10 +113,13 @@ void silu_mul(const float* gate, const float* up, float* out, i64 n) {
 }
 
 void gelu(float* x, i64 n) {
-    constexpr float kAlpha = 0.7978845608028654f;  // sqrt(2/pi)
+    // Exact (erf-based) GELU, matching PyTorch nn.GELU() with the default
+    // approximate="none" used by the reference SAM ViT.
+    constexpr float kInvSqrt2 = 0.7071067811865476f;
+#pragma omp parallel for if (n > 4096)
     for (i64 i = 0; i < n; ++i) {
         const float v = x[i];
-        x[i] = 0.5f * v * (1.0f + std::tanh(kAlpha * (v + 0.044715f * v * v * v)));
+        x[i] = 0.5f * v * (1.0f + std::erff(v * kInvSqrt2));
     }
 }
 

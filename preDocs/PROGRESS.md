@@ -10,7 +10,7 @@
 | CUDA | 13.4（计划要求 ≥ 12.8） |
 | 编译器 | g++ 16.2.1（CUDA 主机编译器） |
 | CMake | 4.4.3 |
-| 依赖 | `nlohmann/json`（系统已安装，唯一第三方依赖；`spdlog` 未安装，改用自研 `uocr/log.h`） |
+| 依赖 | `nlohmann/json`（系统已安装，唯一第三方依赖；`spdlog` 未安装，改用自研 `uocr/log.h`）；OpenMP（g++ 自带，用于 CPU 内核并行，`find_package(OpenMP)`） |
 | 模型 | `baidu/Unlimited-OCR`（经 hf-mirror 下载，6.67 GB safetensors） |
 
 > 说明：`tAgent.md` 要求"需要安装第三方依赖时先询问"。本项目只用到系统已有的
@@ -27,7 +27,7 @@
 ✅ 基准测试可运行
 ✅ PyTorch 参考环境（.venv, torch 2.10+cu128, transformers 4.57.1）
 ✅ Decoder 数值对齐（11/12 层 hidden <1%，logits <1%）
-⬜ Vision 对齐跑完（compare_vision 已实现，CPU 运行较慢，未跑完）
+✅ Vision 对齐完成（对 f32 参考全链路 rel_l2 ≤ 6e-4；对 bf16 参考 3.2%）
 ⬜ 端到端图像 OCR 对齐（视觉 token 数已确认 273，与文本一致）
 ⬜ CUDA Graph 捕获（当前为普通 kernel 启动）
 ⬜ CUDA 版 MoE/decoder 调度接入（当前 CUDA 仅提供内核与测试，主推理走 CPU）
@@ -110,6 +110,20 @@ cmake --build build-cuda -j8
 |---|---|
 | R-SWA decode attention（kv_len=307, heads=10, hd=128） | max_err = 0.000000 |
 | INT4 MoE GEMM（8×64×256, group=128） | max_err = 0.000010 |
+
+### 5.4 DeepEncoder (Vision) 对齐
+
+`tools/compare_vision` 加载 `models/image.bin`（1024×1024，mean=std=0.5）跑
+`DeepEncoder::encode`，输出 `[273,1280]`：
+
+| 对比对象 | max_abs | rel_l2 |
+|---|---|---|
+| 对 f32 参考（逐段：patch/pos/12 blocks/neck/net2/net3/CLIP×24） | ≤ 2.5e-3 | **≤ 5.8e-4** |
+| 对 bf16 参考（真实推理） | 0.226 | **0.0324** |
+
+结论：C++ 的 f32 实现与 f32 参考等价；对 bf16 参考的 3.2% 差异来自参考端
+bf16 激活舍入。详见 `ALIGNMENT.md` §4、`PITFALLS.md` §9。CPU 完整编码约
+1–2 分钟（OpenMP 8 线程）。
 
 ## 6. 里程碑
 

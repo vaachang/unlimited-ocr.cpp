@@ -11,3 +11,5 @@ models/
 compile_commands.json
 .cache/
 .venv/
+__pycache__/
+*.pyc

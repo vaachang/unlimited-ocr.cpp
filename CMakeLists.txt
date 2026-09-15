@@ -58,6 +58,9 @@ endif()
 # Threads (scheduler / host runtime)
 find_package(Threads REQUIRED)
 
+# OpenMP parallelises the CPU reference kernels (vision encoder especially).
+find_package(OpenMP QUIET)
+
 # ---------------------------------------------------------------------------
 # Core library (runtime + scheduler + engine + CPU kernels)
 # ---------------------------------------------------------------------------
@@ -87,6 +90,11 @@ target_include_directories(uocr_core
 target_link_libraries(uocr_core
     PUBLIC nlohmann_json::nlohmann_json Threads::Threads
     PRIVATE uocr_warnings)
+
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(uocr_core PRIVATE OpenMP::OpenMP_CXX)
+    message(STATUS "OpenMP enabled for CPU kernels")
+endif()
 
 target_compile_definitions(uocr_core PUBLIC UOCR_CPU_BACKEND=1)
 if(ENGINE_BACKEND STREQUAL "CUDA")

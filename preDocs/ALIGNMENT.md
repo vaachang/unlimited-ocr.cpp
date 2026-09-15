@@ -77,7 +77,7 @@ Decoder 计算。
 3. 增加 `--decode-steps 140` 覆盖 ring 覆盖阶段（warmup 后 W=128 才发生覆写），
    验证环形覆写路径的数值一致性。
 
-## 4. Vision 对齐
+## 4. Vision 对齐（已完成）
 
 参考导出确认视觉 token 数为 **273**：
 
@@ -91,6 +91,57 @@ visual_embeddings = 16x16 (256) 个 SAM-CLIP 融合 token
 **纠正了 PITFALLS.md §3 中"273 vs 4161"的早期误判**：SAM 的 `net_2/net_3`
 在 64×64 上各做一次 stride2 下采样，最终为 16×16，而非 64×64。
 
-`tools/compare_vision.cpp` 已实现（加载 `image.bin` → `DeepEncoder::encode` →
-与 `visual_embeddings` 对比）。由于本机 CPU 参考实现运行完整 DeepEncoder 较慢
-（数分钟），该对比在本次会话中**未跑完**，列为下一阶段首要验证项。
+### 4.1 运行方式
+
+```bash
+# 参考（bf16，GPU）
+./.venv/bin/python tools/reference/export_reference.py --model models \
+    --out /tmp/opencode/ref_vision --mode vision
+# 参考（f32，用于隔离 bf16 舍入）
+./.venv/bin/python tools/reference/export_vision_stages.py --model models \
+    --out /tmp/opencode/dbg_sam_f32 --dtype float32
+# C++（CPU，OpenMP 并行，约 1–2 分钟）
+OMP_NUM_THREADS=8 ./build/tools/compare_vision --model models \
+    --ref /tmp/opencode/ref_vision [--dump-stages DIR]
+```
+
+`--dump-stages` 会把 `DeepEncoder::encode_stages` 记录的所有中间张量写到
+`DIR/*.bin`，配合 `export_vision_stages.py` 可逐段定位误差。
+
+### 4.2 结果
+
+C++ 输出的 `visual_embeddings` 为 `[273,1280]`，与参考形状一致。
+
+对 **f32** 参考（`--dtype float32`）：
+
+| 段 | rel_l2 |
+|---|---|
+| `sam_patch` / `sam_pos` | ~1e-6 |
+| SAM blocks 0–11 | ≤ 1e-5 |
+| `sam_neck` / `net_2` / `net_3` | ~3e-4 |
+| CLIP layers 0–23 | ~3e-4 … 6e-4 |
+| `visual_embeddings` | **≤ 5.8e-4** |
+
+对 **bf16** 参考（真实推理精度）：
+
+| 段 | max_abs | rel_l2 |
+|---|---|---|
+| `sam_features` (net_3) | 0.0031 | 0.0080 |
+| `clip_features` | 0.263 | 0.0377 |
+| `visual_embeddings` | 0.226 | **0.0324** |
+
+（`tools/compare_vision` 一次运行约 2 分钟，8 线程。）
+
+逐段（对 f32 参考）误差：`sam_patch/sam_pos ≈ 1e-6`，SAM 各 block `≤ 1e-5`，
+`sam_neck/net_2/net_3 ≈ 3e-4`，CLIP 各层 `≈ 3e-4…6e-4`。也就是说剩下的
+3.2% 完全来自参考端的 bf16 激活舍入，而 **C++ 的 f32 实现与 f32 参考在数值上
+等价**。
+
+### 4.3 修复的两个关键 bug（详见 PITFALLS §9）
+
+1. **SAM 分解式相对位置**：C++ 把 `sum_d (Rh_d + Rw_d)` 当成了偏置，正确为
+   `q · (Rh + Rw) = sum_d q_d * (Rh_d + Rw_d)`，漏乘 query。
+2. **CLIP attention 漏加 QKV 投影 bias**：`NoTPAttention.qkv_proj` 带 bias，
+   C++ 只做了 `qkv_w.matmul`，未加 `qkv_b`。
+
+修复后，Decode 阶段仍保持 <1% 的既有对齐（见第 3 节）。

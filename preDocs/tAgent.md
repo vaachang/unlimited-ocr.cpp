@@ -10,12 +10,13 @@
 
 进度与结果见 `PROGRESS.md`、`ALIGNMENT.md`、`PITFALLS.md`、`CORE_TECH.md`。
 
-### P0 视觉编码器数值对齐（收尾）
-- [ ] 跑完 `tools/compare_vision.cpp`（本机 CPU 慢，可加 `--threads` 或先只对
-      16×16 下采样后的特征对比）。确认 `DeepEncoder::encode` 输出 273×1280 与
-      参考的 `visual_embeddings` 的 rel-L2。
-- [ ] 若误差偏大，分段对比：SAM patch_embed → blocks(窗口/全局) → neck/net_2/net_3
-      → CLIP 24 层 → projector；在 `DeepEncoder` 增加中间量导出开关。
+### P0 视觉编码器数值对齐（已完成 2026-09-15）
+- [x] 跑完 `tools/compare_vision.cpp`。`DeepEncoder::encode` 输出 273×1280 与
+      参考 `visual_embeddings`：对 f32 参考 rel-L2 ≤ 5.8e-4，对 bf16 参考 3.2%。
+- [x] 分段对比：已加 `DeepEncoder::encode_stages` + `--dump-stages` +
+      `tools/reference/export_vision_stages.py`，定位并修复了 SAM 相对位置漏乘
+      query、CLIP 漏加 QKV bias 两个 bug。CPU 侧启用 OpenMP（8 线程约 2 分钟）。
+      详见 `ALIGNMENT.md` §4、`PITFALLS.md` §9。
 
 ### P0 端到端图像 OCR 对齐
 - [ ] 复刻参考 `infer()` 的预处理：`BasicImageTransform`、`ImageOps.pad`、

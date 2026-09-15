@@ -118,6 +118,7 @@ void conv2d(const float* x, int Cin, int H, int W, const float* w, const float* 
     Ho = (H + 2 * pad - Kh) / stride + 1;
     Wo = (W + 2 * pad - Kw) / stride + 1;
     out.assign(static_cast<std::size_t>(Cout) * Ho * Wo, 0.0f);
+#pragma omp parallel for schedule(static) if (static_cast<long long>(Cout) * Ho * Wo * Cin * Kh * Kw > 1 << 20)
     for (int co = 0; co < Cout; ++co) {
         const float b = bias ? bias[co] : 0.0f;
         for (int oh = 0; oh < Ho; ++oh) {
@@ -338,6 +339,7 @@ std::vector<float> sam_attention(const std::vector<float>& x, int B, int H, int 
     const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
     std::vector<float> out(static_cast<std::size_t>(B) * H * W * C, 0.0f);
 
+#pragma omp parallel for collapse(2) schedule(static)
     for (int b = 0; b < B; ++b) {
         for (int h = 0; h < heads; ++h) {
             for (int qi = 0; qi < H * W; ++qi) {
@@ -354,7 +356,9 @@ std::vector<float> sam_attention(const std::vector<float>& x, int B, int H, int 
                     float s = dot * scale;
                     const float* rhp = rh.data() + (static_cast<std::size_t>(qh) * H + kh) * hd;
                     const float* rwp = rw.data() + (static_cast<std::size_t>(qw) * W + kw) * hd;
-                    for (int d = 0; d < hd; ++d) s += rhp[d] + rwp[d];
+                    // Decomposed relative position: bias = q . (Rh + Rw), i.e. a
+                    // scalar per (query,key) pair, NOT a sum of raw components.
+                    for (int d = 0; d < hd; ++d) s += qp[d] * (rhp[d] + rwp[d]);
                     scores[static_cast<std::size_t>(ki)] = s;
                     m = std::max(m, s);
                 }
@@ -384,8 +388,13 @@ std::vector<float> sam_attention(const std::vector<float>& x, int B, int H, int 
 DeepEncoder::DeepEncoder(ModelConfig cfg, VisionWeights w, DecoderWeights projector_weights)
     : cfg_(std::move(cfg)), vw_(std::move(w)), pw_(std::move(projector_weights)) {}
 
-std::vector<float> DeepEncoder::sam_forward(const float* image_chw, int h, int w) const {
+std::vector<float> DeepEncoder::sam_forward(const float* image_chw, int h, int w,
+                                            std::vector<Stage>* stages) const {
+    auto record = [&](const std::string& name, const std::vector<float>& data) {
+        if (stages) stages->emplace_back(name, data);
+    };
     const int dim = cfg_.sam_embed_dim;  // 768
+
     // patch embed
     int Ho = 0, Wo = 0;
     std::vector<float> feat;
@@ -398,11 +407,13 @@ std::vector<float> DeepEncoder::sam_forward(const float* image_chw, int h, int w
             for (int c = 0; c < dim; ++c)
                 x[(static_cast<std::size_t>(hh) * Wo + ww) * dim + c] =
                     feat[(static_cast<std::size_t>(c) * Ho + hh) * Wo + ww];
+    record("sam_patch", x);
 
     // absolute positional embedding (already at the target 64x64 grid)
     for (int i = 0; i < Ho * Wo; ++i)
         for (int c = 0; c < dim; ++c)
             x[static_cast<std::size_t>(i) * dim + c] += vw_.sam.pos_embed[static_cast<std::size_t>(i) * dim + c];
+    record("sam_pos", x);
 
     const int heads = cfg_.sam_heads;
     for (int bi = 0; bi < cfg_.sam_depth; ++bi) {
@@ -453,6 +464,7 @@ std::vector<float> DeepEncoder::sam_forward(const float* image_chw, int h, int w
                 x[static_cast<std::size_t>(i) * dim + c] = x[static_cast<std::size_t>(i) * dim + c] +
                                                            mlp2[static_cast<std::size_t>(i) * dim + c] +
                                                            bw.mlp_lin2_b[c];
+        record("sam_block" + std::to_string(bi), x);
     }
 
     // neck: x [Ho*Wo, dim] -> CHW
@@ -487,10 +499,14 @@ std::vector<float> DeepEncoder::sam_forward(const float* image_chw, int h, int w
         for (int i = 0; i < nH * nW; ++i)
             neck4chw[static_cast<std::size_t>(c) * nH * nW + i] = hwc3[static_cast<std::size_t>(i) * 256 + c];
 
+    record("sam_neck", hwc3);
+
     int h2 = 0, w2 = 0, h3 = 0, w3 = 0;
     std::vector<float> x2, x3;
     conv2d(neck4chw.data(), 256, nH, nW, vw_.sam.net2_w.data(), nullptr, 512, 3, 3, 2, 1, x2, h2, w2);
+    record("sam_net2", x2);
     conv2d(x2.data(), 512, h2, w2, vw_.sam.net3_w.data(), nullptr, 1024, 3, 3, 2, 1, x3, h3, w3);
+    record("sam_net3", x3);
 
     // [1024, h3, w3] -> [h3*w3, 1024]
     std::vector<float> tokens(static_cast<std::size_t>(h3) * w3 * 1024);
@@ -502,7 +518,11 @@ std::vector<float> DeepEncoder::sam_forward(const float* image_chw, int h, int w
     return tokens;
 }
 
-std::vector<float> DeepEncoder::clip_forward(const std::vector<float>& sam_tokens, int tokens) const {
+std::vector<float> DeepEncoder::clip_forward(const std::vector<float>& sam_tokens, int tokens,
+                                             std::vector<Stage>* stages) const {
+    auto record = [&](const std::string& name, const std::vector<float>& data) {
+        if (stages) stages->emplace_back(name, data);
+    };
     const int hd = cfg_.clip_hidden_size;  // 1024
     const int grid = static_cast<int>(std::lround(std::sqrt(static_cast<double>(tokens))));
     UOCR_CHECK(grid * grid == tokens, "SAM token count is not a perfect square");
@@ -527,12 +547,15 @@ std::vector<float> DeepEncoder::clip_forward(const std::vector<float>& sam_token
         pos_new = vw_.clip.pos_embed;
     }
     for (std::size_t i = 0; i < x.size(); ++i) x[i] += pos_new[i];
+    record("clip_embeds", x);
     layernorm_rows(x, N, hd, vw_.clip.pre_ln_w.data(), vw_.clip.pre_ln_b.data(), 1e-5f);
+    record("clip_preln", x);
 
     const int heads = cfg_.clip_heads;
     const int chd = hd / heads;
     const float scale = 1.0f / std::sqrt(static_cast<float>(chd));
 
+    int clip_li = 0;
     for (const CLIPLayerWeights& L : vw_.clip.layers) {
         // attention
         std::vector<float> residual = x;
@@ -540,7 +563,12 @@ std::vector<float> DeepEncoder::clip_forward(const std::vector<float>& sam_token
         layernorm_rows(normed, N, hd, L.ln1_w.data(), L.ln1_b.data(), 1e-5f);
         std::vector<float> qkv(static_cast<std::size_t>(N) * 3 * hd);
         L.qkv_w.matmul(normed.data(), qkv.data(), N);
+        for (int n = 0; n < N; ++n) {
+            float* qr = qkv.data() + static_cast<std::size_t>(n) * 3 * hd;
+            for (int c = 0; c < 3 * hd; ++c) qr[c] += L.qkv_b[c];
+        }
         std::vector<float> out(static_cast<std::size_t>(N) * hd, 0.0f);
+#pragma omp parallel for schedule(static)
         for (int h = 0; h < heads; ++h) {
             for (int qi = 0; qi < N; ++qi) {
                 const float* qp = qkv.data() + static_cast<std::size_t>(qi) * 3 * hd + h * chd;
@@ -588,18 +616,28 @@ std::vector<float> DeepEncoder::clip_forward(const std::vector<float>& sam_token
                 x[static_cast<std::size_t>(n) * hd + c] =
                     residual[static_cast<std::size_t>(n) * hd + c] + fc2[static_cast<std::size_t>(n) * hd + c] +
                     L.fc2_b[c];
+        record("clip_layer" + std::to_string(clip_li++), x);
     }
 
     // drop the class token
     return std::vector<float>(x.begin() + hd, x.end());
 }
 
-void DeepEncoder::encode(const float* image_chw, int height, int width, Tensor& out) const {
-    std::vector<float> sam = sam_forward(image_chw, height, width);
+void DeepEncoder::encode(const float* image_chw, int height, int width, Tensor& out,
+                         std::vector<float>* sam_debug, std::vector<float>* clip_debug) const {
+    encode_stages(image_chw, height, width, out, nullptr, sam_debug, clip_debug);
+}
+
+void DeepEncoder::encode_stages(const float* image_chw, int height, int width, Tensor& out,
+                                std::vector<Stage>* stages, std::vector<float>* sam_debug,
+                                std::vector<float>* clip_debug) const {
+    std::vector<float> sam = sam_forward(image_chw, height, width, stages);
+    if (sam_debug) *sam_debug = sam;
     const int sam_dim = 1024;
     const int tokens = static_cast<int>(sam.size() / sam_dim);
 
-    std::vector<float> clip = clip_forward(sam, tokens);
+    std::vector<float> clip = clip_forward(sam, tokens, stages);
+    if (clip_debug) *clip_debug = clip;
     UOCR_CHECK(static_cast<int>(clip.size()) == tokens * cfg_.clip_hidden_size, "clip size mismatch");
 
     // concat(clip, sam) -> projector

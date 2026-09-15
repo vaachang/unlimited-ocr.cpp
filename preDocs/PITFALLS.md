@@ -123,3 +123,31 @@ cache 布局： [ prefill 区 (长度 P) ][ ring 区 (W=128) ]
   `TMPDIR=/home/admin/.pip-tmp`（位于 `/dev/sda2`），并清理 `/tmp/pip-*` 残留。
 - 本机仅 Python 3.14，`torch`/`torchvision` 需选 cp314 wheel；`tokenizers`
   用 `cp39-abi3` wheel 可在 3.14 上工作。
+
+## 9. Vision 对齐中踩的坑（2026-09-15）
+
+用 `tools/compare_vision` + `tools/reference/export_vision_stages.py` 逐段对比
+时发现并修复了 3 个问题，记录以备后人：
+
+1. **输入归一化遗漏**：参考 `run_vision` 在喂入 `sam_model` 前做
+   `(img-0.5)/0.5`（对应 `BasicImageTransform(mean=std=0.5)`），而
+   `compare_vision` 最初直接把 `[0,1]` 原图传给 `encode`。`DeepEncoder::encode`
+   期望已归一化输入，务必在调用方完成归一化。
+2. **SAM 分解式相对位置漏乘 query**：`add_decomposed_rel_pos` 里
+   `rel_h = q · Rh` 是标量（每个 query-key 对），而最初的 C++ 写成
+   `s += Rh_d + Rw_d`（对 head 维求和），少了 `q_d *`。修复为
+   `s += q_d*(Rh_d + Rw_d)`。对窗口块（14×14）影响较小、对全局块（64×64）
+   影响巨大。
+3. **CLIP attention 漏加 QKV bias**：`NoTPAttention.qkv_proj` 是带 bias 的
+   `nn.Linear`，C++ 只写了 `qkv_w.matmul`，忘了 `qkv_b`。SAM 侧的
+   `sam_attention` 加了这个 bias，所以只有 CLIP 出错。
+
+诊断经验：
+- **先跑 f32 参考**（`export_vision_stages.py --dtype float32`）可以把
+  "实现错误" 与 "bf16 舍入" 分开：f32 下若还差很多，就是实现 bug。
+- `--dump-stages` 导出的中间张量要保证**布局一致**再比较：例如 C++
+  `record("sam_attn")` 是 **pre-proj** 输出，而 Python hook `blk.attn` 抓的是
+  **post-proj** 输出，一开始误比得出"注意力全错"的结论。后来直接对
+  `block` 级输出（含 proj/residual/MLP）比较才定位准确。
+- C++ 的 `DeepEncoder` CPU 前向较慢，务必用 `OMP_NUM_THREADS=8`
+  （CMake 已启用 OpenMP），否则 1024×1024 编码要十几分钟。

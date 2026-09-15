@@ -13,6 +13,7 @@
 // This implementation targets the 1024x1024 input used by Unlimited-OCR.
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "uocr/config.h"
@@ -81,13 +82,25 @@ public:
 
     // image: CHW float32, normalized, size cfg.image_size x cfg.image_size.
     // Returns [num_visual_tokens, hidden_size] row-major embeddings.
-    void encode(const float* image_chw, int height, int width, Tensor& out) const;
+    // Optional debug outputs expose the SAM feature map ([1024,16,16] CHW) and
+    // the CLIP output without the class token ([256,1024]) for alignment.
+    void encode(const float* image_chw, int height, int width, Tensor& out,
+                std::vector<float>* sam_debug = nullptr,
+                std::vector<float>* clip_debug = nullptr) const;
+
+    // Alignment helper: additionally records named intermediate tensors.
+    using Stage = std::pair<std::string, std::vector<float>>;
+    void encode_stages(const float* image_chw, int height, int width, Tensor& out,
+                       std::vector<Stage>* stages, std::vector<float>* sam_debug = nullptr,
+                       std::vector<float>* clip_debug = nullptr) const;
 
     int num_tokens() const { return num_tokens_; }
 
 private:
-    std::vector<float> sam_forward(const float* image_chw, int h, int w) const;
-    std::vector<float> clip_forward(const std::vector<float>& sam_tokens, int tokens) const;
+    std::vector<float> sam_forward(const float* image_chw, int h, int w,
+                                   std::vector<Stage>* stages = nullptr) const;
+    std::vector<float> clip_forward(const std::vector<float>& sam_tokens, int tokens,
+                                    std::vector<Stage>* stages = nullptr) const;
 
     ModelConfig cfg_;
     VisionWeights vw_;
