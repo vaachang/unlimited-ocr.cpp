@@ -10,6 +10,7 @@
 #include <cstring>
 #include <functional>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "uocr/cuda_ops.h"
@@ -45,11 +46,13 @@ double time_us(std::function<void()> fn, int iters) {
 
 int main(int argc, char** argv) {
     int n = 896, k = 1280, group = 128, iters = 200;
+    int bn = 0;  // 0 = sweep
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--n") && i + 1 < argc) n = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--k") && i + 1 < argc) k = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--group") && i + 1 < argc) group = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--iters") && i + 1 < argc) iters = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--bn") && i + 1 < argc) bn = std::atoi(argv[++i]);
     }
     if (!uocr::cuda::available()) {
         std::printf("no CUDA device\n");
@@ -77,18 +80,33 @@ int main(int argc, char** argv) {
     cudaMemcpy(d_z, qm.zeros.data(), qm.zeros.size() * sizeof(float), cudaMemcpyHostToDevice);
 
     std::printf("INT4 GEMM n=%d k=%d group=%d iters=%d\n", n, k, group, iters);
-    std::printf("%6s %14s %14s %10s\n", "m", "scalar(us)", "tensorcore(us)", "TC TFLOPS");
-    for (int m : {1, 8, 32, 64, 128, 273}) {
+    const int bns[3] = {8, 16, 32};
+    std::printf("%6s %14s", "m", "scalar(us)");
+    for (int b : bns) std::printf(" %10s", (std::string("tc bn=") + std::to_string(b)).c_str());
+    std::printf("\n");
+    for (int m : {1, 8, 32, 64, 96, 128, 273}) {
         if (m > 273) continue;
         const double t_scalar = time_us([&] {
             uocr::cuda::moe_gemm_int4(d_x, d_p, d_s, d_z, m, n, k, group, d_y);
         }, iters);
-        const double t_tc = time_us([&] {
-            uocr::cuda::moe_gemm_int4_tc(d_x, d_p, d_s, d_z, m, n, k, group, d_y);
-        }, iters);
-        const double flop = 2.0 * m * n * k;
-        const double tflops = flop / (t_tc * 1e-6) / 1e12;
-        std::printf("%6d %14.1f %14.1f %10.3f\n", m, t_scalar, t_tc, tflops);
+        std::printf("%6d %14.1f", m, t_scalar);
+        for (int b : bns) {
+            const double t_tc = time_us([&] {
+                uocr::cuda::moe_gemm_int4_tc_n(d_x, d_p, d_s, d_z, m, n, k, group, d_y, b);
+            }, iters);
+            std::printf(" %10.1f", t_tc);
+        }
+        std::printf("\n");
+    }
+    if (bn > 0) {
+        std::printf("single bn=%d FLOP/TFLOPS check:\n", bn);
+        for (int m : {96, 273}) {
+            const double t = time_us([&] {
+                uocr::cuda::moe_gemm_int4_tc_n(d_x, d_p, d_s, d_z, m, n, k, group, d_y, bn);
+            }, iters);
+            const double flop = 2.0 * m * n * k;
+            std::printf("  m=%d %8.1f us  %6.3f TFLOPS\n", m, t, flop / (t * 1e-6) / 1e12);
+        }
     }
     return 0;
 }

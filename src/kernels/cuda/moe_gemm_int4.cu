@@ -51,23 +51,32 @@ __device__ __forceinline__ unsigned smem_addr(const void* p) {
 
 // W4A16 tensor-core kernel with shared-memory staging and `ldmatrix`.
 //
-// Block = 4 warps and computes a 64(m) x 8(n) tile: the dequantized INT4 weight
-// panel sW[8][16] is loaded once per k-step (coalesced) and shared by all four
-// warps, each of which handles a 16-row slice of the m dimension.  A (bf16
-// activations, 64x16) and B (bf16 weights, stored as W[n][k], i.e. col-major
-// relative to the mma) fragments are pulled from shared memory with
-// `ldmatrix`; the mma is `mma.m16n8k16.bf16.bf16.f32`.
+// Block = 4 warps and computes a 64(m) x BN(n) tile.  Each k-step dequantizes
+// the INT4 weight panel sW[BN][16] once into shared memory; every warp then
+// handles a 16-row slice of the m dimension and iterates the BN/8 n8
+// sub-tiles.  A and B fragments are pulled with `ldmatrix.x4`/`x2` and the mma
+// is `mma.m16n8k16.bf16.bf16.f32`.
+//
+// BN is a template parameter: wider tiles do more mma per staged panel but
+// reduce the block count, which matters for the small-N expert GEMMs
+// (N=896/1280, M~96) where too few blocks leaves SMs idle.  BN=8 is the
+// default; see `moe_gemm_int4_tc_n` for the tuning sweep.
+//
+// Warps whose 16-row slice is fully beyond `m` skip the mma loop but still
+// participate in `__syncthreads`, so small-M calls (decode) do not pay for the
+// full 64-row tile.
 //
 // Fragment layouts follow PTX ISA: A is 4x[2xb16] (a0..a3), B is 2x[2xb16]
-// (b0,b1), matching the values the previous scalar kernel packed by hand.
+// (b0,b1).
+template <int BN>
 __global__ void moe_gemm_int4_tc_kernel(const float* __restrict__ x,
                                         const std::uint8_t* __restrict__ packed,
                                         const float* __restrict__ scales,
                                         const float* __restrict__ zeros, int m, int n, int k,
                                         int group_size, float* __restrict__ y) {
-    constexpr int BM = 64;  // rows per block (4 warps x 16)
-    constexpr int BN = 8;   // columns per block
+    constexpr int BM = 64;      // rows per block (4 warps x 16)
     constexpr int BK = 16;
+    constexpr int NT = BN / 8;  // n8 sub-tiles per warp
     __shared__ __nv_bfloat16 sA[BM][BK];
     __shared__ __nv_bfloat16 sW[BN][BK];
 
@@ -78,13 +87,14 @@ __global__ void moe_gemm_int4_tc_kernel(const float* __restrict__ x,
     const int n0 = blockIdx.x * BN;
     const int packed_row = (k + 1) / 2;
     const int ng = (k + group_size - 1) / group_size;
+    const bool active = (m0 + warp * 16) < m;
 
     const int g = lane >> 2;
     const int tig = lane & 3;
-    float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float c[NT][4] = {};
 
     for (int k0 = 0; k0 < k; k0 += BK) {
-        // ---- stage activations [BM, BK] (coalesced; c fastest) ----
+        // ---- stage activations [BM, BK] as bf16 (coalesced; c fastest) ----
 #pragma unroll
         for (int l = 0; l < (BM * BK) / 128; ++l) {
             const int idx = tid + l * 128;
@@ -95,61 +105,66 @@ __global__ void moe_gemm_int4_tc_kernel(const float* __restrict__ x,
                             : __float2bfloat16(0.0f);
         }
         // ---- dequantize the INT4 weight panel into sW[n][k] ----
-        if (tid < BN * (BK / 2)) {
-            const int row = tid >> 3;        // n within the tile
-            const int byte_in_row = tid & 7; // 8 bytes = 16 nibbles
-            const int kk = k0 + byte_in_row * 2;
-            const int gn = n0 + row;
-            float lo = 0.0f, hi = 0.0f;
+#pragma unroll
+        for (int l = 0; l < (BN * BK) / 128; ++l) {
+            const int idx = tid + l * 128;
+            const int r = idx / BK, cc = idx % BK;
+            const int gn = n0 + r, kk = k0 + cc;
+            float wv = 0.0f;
             if (gn < n && kk < k) {
                 const std::uint8_t byte =
                     packed[static_cast<std::size_t>(gn) * packed_row + (kk >> 1)];
-                const int q0 = byte & 0x0f;
-                const int q1 = byte >> 4;
+                const int q = (kk & 1) ? (byte >> 4) : (byte & 0x0f);
                 const int gg = kk / group_size;
                 if (gg < ng) {
                     const float s = scales[static_cast<std::size_t>(gn) * ng + gg];
                     const float z = zeros[static_cast<std::size_t>(gn) * ng + gg];
-                    lo = (static_cast<float>(q0) - z) * s;
-                    hi = (kk + 1 < k) ? (static_cast<float>(q1) - z) * s : 0.0f;
+                    wv = (static_cast<float>(q) - z) * s;
                 }
             }
-            sW[row][byte_in_row * 2] = __float2bfloat16(lo);
-            sW[row][byte_in_row * 2 + 1] = __float2bfloat16(hi);
+            sW[r][cc] = __float2bfloat16(wv);
         }
         __syncthreads();
 
-        // ---- ldmatrix fragments ----
-        const __nv_bfloat16* a_ptr = &sA[warp * 16 + (lane & 15)][(lane >> 4) * 8];
-        unsigned a0, a1, a2, a3;
-        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                     : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
-                     : "r"(smem_addr(a_ptr)));
-        // x2 only consumes addresses from lanes 0-15; mirror them for the rest
-        // so no lane forms an out-of-bounds pointer.
-        const __nv_bfloat16* b_ptr = &sW[lane & 7][((lane >> 3) & 1) * 8];
-        unsigned b0, b1;
-        asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
-                     : "=r"(b0), "=r"(b1)
-                     : "r"(smem_addr(b_ptr)));
-
-        asm volatile(
-            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-            "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
-            : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+        if (active) {
+            // ---- ldmatrix fragments ----
+            const __nv_bfloat16* a_ptr = &sA[warp * 16 + (lane & 15)][(lane >> 4) * 8];
+            unsigned a0, a1, a2, a3;
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                         : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+                         : "r"(smem_addr(a_ptr)));
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+                // x2 only consumes addresses from lanes 0-15; mirror them for
+                // the rest so no lane forms an out-of-bounds pointer.
+                const __nv_bfloat16* b_ptr = &sW[nt * 8 + (lane & 7)][((lane >> 3) & 1) * 8];
+                unsigned b0, b1;
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                             : "=r"(b0), "=r"(b1)
+                             : "r"(smem_addr(b_ptr)));
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+                    : "+f"(c[nt][0]), "+f"(c[nt][1]), "+f"(c[nt][2]), "+f"(c[nt][3])
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            }
+        }
         __syncthreads();
     }
 
+    if (!active) return;
     const int r0 = m0 + warp * 16 + g, r1 = r0 + 8;
-    const int c0 = n0 + tig * 2, c1 = c0 + 1;
-    if (r0 < m) {
-        if (c0 < n) y[static_cast<std::size_t>(r0) * n + c0] = c[0];
-        if (c1 < n) y[static_cast<std::size_t>(r0) * n + c1] = c[1];
-    }
-    if (r1 < m) {
-        if (c0 < n) y[static_cast<std::size_t>(r1) * n + c0] = c[2];
-        if (c1 < n) y[static_cast<std::size_t>(r1) * n + c1] = c[3];
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+        const int c0 = n0 + nt * 8 + tig * 2, c1 = c0 + 1;
+        if (r0 < m) {
+            if (c0 < n) y[static_cast<std::size_t>(r0) * n + c0] = c[nt][0];
+            if (c1 < n) y[static_cast<std::size_t>(r0) * n + c1] = c[nt][1];
+        }
+        if (r1 < m) {
+            if (c0 < n) y[static_cast<std::size_t>(r1) * n + c0] = c[nt][2];
+            if (c1 < n) y[static_cast<std::size_t>(r1) * n + c1] = c[nt][3];
+        }
     }
 }
 
@@ -164,13 +179,35 @@ void moe_gemm_int4(const float* x, const std::uint8_t* packed, const float* scal
                                                      y);
 }
 
+void moe_gemm_int4_tc_n(const float* x, const std::uint8_t* packed, const float* scales,
+                        const float* zeros, int m, int n, int k, int group_size, float* y,
+                        int bn, cudaStream_t stream) {
+    const dim3 block(128);  // 4 warps -> 64 rows per block
+    const dim3 grid((n + bn - 1) / bn, (m + 63) / 64);
+    switch (bn) {
+        case 16:
+            moe_gemm_int4_tc_kernel<16><<<grid, block, 0, stream>>>(x, packed, scales, zeros, m, n,
+                                                                    k, group_size, y);
+            break;
+        case 32:
+            moe_gemm_int4_tc_kernel<32><<<grid, block, 0, stream>>>(x, packed, scales, zeros, m, n,
+                                                                    k, group_size, y);
+            break;
+        case 64:
+            moe_gemm_int4_tc_kernel<64><<<grid, block, 0, stream>>>(x, packed, scales, zeros, m, n,
+                                                                    k, group_size, y);
+            break;
+        default:
+            moe_gemm_int4_tc_kernel<8><<<grid, block, 0, stream>>>(x, packed, scales, zeros, m, n,
+                                                                   k, group_size, y);
+            break;
+    }
+}
+
 void moe_gemm_int4_tc(const float* x, const std::uint8_t* packed, const float* scales,
                       const float* zeros, int m, int n, int k, int group_size, float* y,
                       cudaStream_t stream) {
-    const dim3 block(128);  // 4 warps -> 64 rows per block
-    const dim3 grid((n + 7) / 8, (m + 63) / 64);
-    moe_gemm_int4_tc_kernel<<<grid, block, 0, stream>>>(x, packed, scales, zeros, m, n, k,
-                                                        group_size, y);
+    moe_gemm_int4_tc_n(x, packed, scales, zeros, m, n, k, group_size, y, 8, stream);
 }
 
 }  // namespace cuda

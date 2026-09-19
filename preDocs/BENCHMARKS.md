@@ -71,22 +71,32 @@ cmake --build build-cuda -j8
 | full Graph | 2.96 ms | 0.589 ms |
 | attn_dense Graph | 2.89 ms | 0.588 ms |
 
-## 2.5 INT4 W4A16 GEMM：标量 vs Tensor Core（`bench/bench_int4_gemm.txt`）
+## 2.5 INT4 W4A16 GEMM：标量 vs Tensor Core
+（`bench/bench_int4_gemm.txt`、`bench/bench_int4_gemm_down.txt`）
 
-n=896, k=1280, group=128, iters=200（单次 GEMM 调用；`2*m*n*k` 计 FLOP）：
+`bench_int4_gemm` 现在对每个 m 扫 `bn∈{8,16,32}`（块内 n 列宽）。gate/up 形状
+n=896, k=1280, group=128, iters=300（`2*m*n*k` 计 FLOP）：
 
-| m | scalar (µs) | tensor-core (µs) | TC 有效 TFLOPS | 加速 |
+| m | scalar (µs) | tc bn=8 | tc bn=16 | tc bn=32 |
 |---|---|---|---|---|
-| 1 | 66.4 | 37.1 | 0.062 | 1.8× |
-| 8 | 71.6 | 38.9 | 0.472 | 1.8× |
-| 32 | 206.0 | 41.3 | 1.776 | 5.0× |
-| 64 | 356.0 | 60.1 | 2.443 | 5.9× |
-| 128 | 653.4 | 70.9 | 4.140 | 9.2× |
-| 273 | 1371.7 | 135.6 | 4.619 | 10.1× |
+| 1 | 66.4 | **29.3** | 46.8 | 67.1 |
+| 8 | 71.6 | **30.7** | 48.8 | 67.9 |
+| 32 | 205.8 | **33.1** | 58.2 | 70.1 |
+| 64 | 354.9 | **43.2** | 95.1 | 81.0 |
+| 96 | 503.2 | **50.2** | 99.1 | 87.2 |
+| 128 | 652.0 | **51.3** | 101.8 | 93.3 |
+| 273 | 1370.9 | 110.1 | 115.3 | **110.0** |
 
-`moe_gemm_int4_tc` 现在用 shared-memory staging + `ldmatrix.x4/x2`：block=4 warps 计算
-64×8 tile，反量化后的权重 panel `sW[8][16]` 每 k-step 只加载一次并被 4 个 warp 共享。
-结果与标量路径 rel_l2 ≤ 0.0026（`uocr_cuda_tests`，含 ragged M/K）。
+down 形状 n=1280, k=896（`bench_int4_gemm_down.txt`）同样 bn=8 最优（m=96 时
+60.0µs，bn=16/32 为 71/64µs）。
+
+结论：**专家 GEMM 的小 N（896/1280）下 bn=8 最优**——更宽的 tile 会让 block 数
+掉到 36 个 SM 以下（例如 n=896、bn=64 只有 28 个 block），SM 空转比 mma 复用更重要。
+`moe_gemm_int4_tc` 默认 bn=8，并保留 `moe_gemm_int4_tc_n` 供调优。
+
+本轮同时把权重 panel 的反量化 staging 从“64 线程各处理一字节”改成“128 线程按元素
+循环”，bn=8 下 m=96 50.2µs（旧版同形状约 ~65µs）、m=273 110µs（旧 136µs），
+**约 +20%**。结果与标量路径 rel_l2 ≤ 0.0026（`uocr_cuda_tests`，含 ragged M/K）。
 
 ## 2.6 连续批处理吞吐（`bench/bench_batch_*.txt`）
 
@@ -141,27 +151,28 @@ lm_head 小 m 下 TC 利用率偏低。
    `generate_batch` 做 warmup（捕获 Graph 并复用分配），表中的数字是**稳态**，
    不含一次性捕获开销。`--no-graph` 关闭 Graph 做对照。
 
-prompt=64、steps=16、max_batch=16（tok/s 含整波 prefill；括号内为 `decode_ms`
-减去 prefill 墙钟得到的纯 decode 吞吐）：
+prompt=64、steps=16、max_batch=16，`graph=on` + warmup 稳态；tok/s 含整波 prefill，
+括号内为 `decode_ms` 减去 prefill 墙钟得到的纯 decode 吞吐。同命令加 `--no-graph`
+的对照差异在 run-to-run 噪声（±3%）内（`bench_batch_real_*_plain.txt`）。
 
-| batch | BF16 plain | BF16 graph | INT4 plain | INT4 graph |
-|---|---|---|---|---|
-| 1 | 146.8 (208) | 153.4 (221) | 126.2 (208) | 130.8 (221) |
-| 2 | 121.3 (153) | 120.9 (153) | 108.0 (156) | 107.2 (154) |
-| 4 | 165.1 (260) | 164.2 (257) | 171.8 (258) | 175.6 (260) |
-| 8 | 266.7 (411) | 271.5 (421) | 268.5 (405) | 268.7 (403) |
-| 16 | 417.0 (630) | **417.2 (630)** | 363.9 (538) | **374.1 (560)** |
+| batch | BF16 graph (tok/s) | INT4 graph (tok/s) |
+|---|---|---|
+| 1 | 149.4 (213) | 130.9 (220) |
+| 2 | 122.3 (155) | 107.3 (154) |
+| 4 | 162.6 (257) | 183.5 (261) |
+| 8 | 272.3 (423) | 275.1 (398) |
+| 16 | **415.9 (634)** | **386.8 (559)** |
 
-**与上一轮（无 TC、无 batched graph）对比**（同样命令、warmup 稳态，取 graph）：
+**与上一轮（无 TC、无 batched graph）对比**（同样命令、warmup 稳态）：
 
 | 配置 | 上一轮 | 现在 | 备注 |
 |---|---|---|---|
-| BF16 batch=16 整波 prefill | 367 ms | **207 ms** | TC GEMM −44% |
-| BF16 batch=16 tok/s | 298.0 | **417.2** | +40% |
-| INT4 batch=16 整波 prefill | 279 ms | **227 ms** | −19% |
-| INT4 batch=16 tok/s | 307.6 | **374.1** | +22% |
-| BF16 batch=1 tok/s | 99.4 | **153.4** | TC + matvec lm_head +54% |
-| INT4 batch=1 tok/s | 91.4 | **130.8** | +43% |
+| BF16 batch=16 整波 prefill | 367 ms | **212 ms** | bf16 TC GEMM −42% |
+| BF16 batch=16 tok/s | 298.0 | **415.9** | +40% |
+| INT4 batch=16 整波 prefill | 279 ms | **204 ms** | bf16 TC + INT4 专家 GEMM staging −27% |
+| INT4 batch=16 tok/s | 307.6 | **386.8** | +26% |
+| BF16 batch=1 tok/s | 99.4 | **149.4** | TC + matvec lm_head +50% |
+| INT4 batch=1 tok/s | 91.4 | **130.9** | +43% |
 
 结论：
 
@@ -241,9 +252,11 @@ CUDA Graph 确实把逐步发射压到常数级。
 
 - **prefill 的逐专家 `moe_gemm_int4_tc` 是最大头**：12096 次小 GEMM（avg 55µs）。
   每个 prefill 波对 11 层 × 64 专家 × {gate,up,down} 各发一次，M≈tokens/expert。
-  优化方向：把每专家 token 数很少的专家合并成一次 masked/分组调用，或做
-  persistent kernel，减少小 GEMM 发射与低占用。
-- decode 的 masked INT4 专家（gate_up+down 18.9%）是第二块；其权重读取受带宽限制。
+  **已做**：staging 重写 + bn=8 使 kernel 快 ~20%，整波 prefill 227→204ms
+  （§2.5/§2.7）。**剩余**：发射次数仍需 grouped GEMM（一层一次 launch，block 映射
+  到 (expert,n-tile)）或合并 gate/up 来消除。
+- decode 的 masked INT4 专家（gate_up+down 18.9%）是第二块；其权重读取受带宽限制，
+  但每专家仅 1–2 token 时也偏延迟受限，可考虑小批量 grouped GEMM。
 - `rswa_attn_ragged` 7%：prefill attention 的 grid=(total,heads)，total 大时较可观。
 
 

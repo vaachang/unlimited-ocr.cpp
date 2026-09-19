@@ -131,6 +131,12 @@ decode step 现在可以整体捕获成一个 CUDA Graph：
 scale/zero），显存从 9.2GB 降到 2.2GB。`moe_experts_masked_int4` 在 kernel 内
 按 group 反量化，权重读取同样是 warp-per-output 合并访存。
 
+prefill 的大批量专家计算走 `moe_gemm_int4_tc`（W4A16 TC GEMM，详见
+`BENCHMARKS.md` §2.5）：模板参数 `BN` 控制每 block 的 n 列宽，专家 GEMM 的
+N=896/1280 下经验最优是 **BN=8**（更宽的 tile 会让 block 数掉到 36 个 SM 以下）。
+权重 panel 的反量化 staging 由 128 线程按元素循环完成；`moe_gemm_int4_tc_n` 可扫
+bn∈{8,16,32,64}。
+
 ### 5.4 合并访存内核（P2 性能）
 
 `matvec_bf16`（warp-per-output，每 lane 向量化读 2 个 bf16）与 expert MLP 的

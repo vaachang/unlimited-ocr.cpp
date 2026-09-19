@@ -49,10 +49,10 @@
 3. **TC 进一步调优**（进行中）：小 m 变体已完成（m ≤ 16 沿 n 拆 warp，见
    `CORE_TECH.md` §5.5）；lm_head 大 n 仍 2–8 TFLOPS，剩余 `swizzle` 减 bank
    conflict、split-K、`cp.async` 双缓冲。参考 `BENCHMARKS.md` §2.8。
-4. **Prefill MoE 发射优化**（nsys 显示的最大头）：`forward_ragged` 对 11 层 × 64
-   专家 × 3 矩阵各发一次 `moe_gemm_int4_tc`（12096 次、avg 55µs、占 GPU kernel
-   时间 55%）。可把低 token 数的专家合并为一次 masked/分组调用，或用
-   persistent kernel。见 `BENCHMARKS.md` §2.9。
+4. **Prefill MoE 发射优化**（进行中）：已完成 INT4 专家 GEMM 的 bn 调优与 staging
+   重写（整波 prefill −10%，`BENCHMARKS.md` §2.5）。剩余大头：nsys 显示每层仍逐专家
+   发 3×64 个 `moe_gemm_int4_tc`（12096 次、占 55% kernel 时间），下一步做 grouped
+   GEMM（一层一次 launch）或合并 gate/up。
 5. **Prefill KV 分区写入优化**（prj.md 创新点三）：prefill 时按位置分区
    （视觉区/环形区/gap 丢弃），节省 ~70% prefill KV 写入带宽（当前按参考语义
    保留全部 prefill KV；注意与参考数值对齐的取舍）。
@@ -171,10 +171,16 @@
 
 ### P2 Tensor Core 性能优化（部分完成 2026-09-19）
 - [x] `moe_gemm_int4_tc` 改用 shared-memory staging + `ldmatrix.x4/x2`：block=4
-      warps 计算 64×8 tile，反量化权重 panel 每 k-step 只加载一次并被共享。
-      微基准（n=896,k=1280）：m=273 1372µs→136µs（10.1×），m=128 653µs→71µs（9.2×），
-      最高 4.6 TFLOPS。原始数据 `bench/bench_int4_gemm.txt`。
-- [ ] 剩余：`swizzle` 消除 shared bank conflict、split-K（小 m）、`cp.async` 双缓冲。
+      warps 计算 64×BN tile。**bn 调优结论：专家 GEMM 用 bn=8**（n=896/1280 时
+      block 数足够；bn≥16 会让 block 数掉到 SM 数以下）。反量化 staging 改为
+      128 线程按元素循环后，bn=8 下 m=96 50.2µs、m=273 110µs（旧版 ~65/~136µs，
+      **约 +20%**）。微基准 `bench/bench_int4_gemm{,_down}.txt`，`moe_gemm_int4_tc_n`
+      可扫 bn∈{8,16,32,64}。
+- [x] **prefill INT4 专家 GEMM 提速**（2026-09-19）：整波 prefill（B=16）
+      227→204ms（−10%），INT4 batch=16 374→387 tok/s。见 `BENCHMARKS.md` §2.5/§2.7。
+- [ ] 剩余：prefill 每层仍逐专家发 3×64 个 GEMM（nsys 12096 次、占 55% kernel
+      时间）——下一步做 grouped GEMM（一层一次 launch，block 映射到
+      (expert,n-tile)），或合并 gate/up。另 `swizzle`/split-K/`cp.async`。
 - [x] **bf16 tensor-core GEMM**（2026-09-19）：`matmul_t_bf16` 改为 block=4 warps、
       64(m)×64(n) tile、`ldmatrix.x4/x2` + `mma.m16n8k16.bf16`；m 不足 64 时越界
       warp 跳过 mma（小 m 不浪费）。保留 `matmul_t_bf16_ref` 做 A/B，单测

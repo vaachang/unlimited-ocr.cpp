@@ -155,6 +155,14 @@ void moe_gemm_int4_tc(const float* x, const std::uint8_t* packed, const float* s
                       const float* zeros, int m, int n, int k, int group_size, float* y,
                       cudaStream_t stream = 0);
 
+// Tile-width-parameterised variant for tuning (`bn` in {8,16,32,64}).  `bn`
+// controls the n columns per block; narrower tiles give more blocks (better SM
+// occupancy for the small-N expert GEMMs) at the cost of less mma per staged
+// panel.  The default `moe_gemm_int4_tc` uses bn=8.
+void moe_gemm_int4_tc_n(const float* x, const std::uint8_t* packed, const float* scales,
+                        const float* zeros, int m, int n, int k, int group_size, float* y,
+                        int bn, cudaStream_t stream = 0);
+
 // out[i] = silu(gate[i]) * up[i]
 void silu_mul(const float* gate, const float* up, float* out, int n, cudaStream_t stream = 0);
 
