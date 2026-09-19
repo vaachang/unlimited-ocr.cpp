@@ -63,8 +63,13 @@
       ≤ 0.03，decode logits rel_l2 ≤ 0.084。见 `ALIGNMENT.md` §6。）
 
 ### P1 CUDA 主路径接入（prj.md 要求 CUDA 生产构建）
-- [ ] 新增 `GpuTensor` / device KV cache；将 `MoEDecoder` 的 `Linear::forward`
-      与 `RSWACache::attention` 分派到 `uocr::cuda::*`。
+- [x] device KV cache + CUDA attention 调度（2026-09-19）：新增
+      `GpuRSWACache`（`include/uocr/gpu_cache.h`, `src/kernels/cuda/gpu_cache.cu`）
+      与通用 `cuda::rswa_attention`（causal prefill / decode）。
+      `tests/test_rswa_cuda.cu` 验证：环形覆写 cache K/V 完全一致、
+      decode 与 prefill causal 误差 ≤1e-6。
+- [ ] 将 `MoEDecoder` 的 `Linear::forward` / attention 分派到 `uocr::cuda::*`，
+      实现设备端完整前向（当前 attention 已可走 GPU，但 matmul/MoE 仍在 CPU）。
 - [ ] 权重常驻 device（bf16 + INT4），避免每步 H2D。
 - [ ] 提供 `Engine` 的 CUDA 执行分支；CPU 仍作为参考实现。
 
