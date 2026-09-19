@@ -6,7 +6,7 @@
 
 ---
 
-## 下一阶段任务计划（2026-09-19 三次更新）
+## 下一阶段任务计划（2026-09-19 四次更新）
 
 进度与结果见 `PROGRESS.md`、`ALIGNMENT.md`、`PITFALLS.md`、`CORE_TECH.md`、
 `BENCHMARKS.md`（含 `bench/` 原始输出）。
@@ -17,57 +17,55 @@
 → P2 CUDA Graph（device router + 固定调度掩码跳过）→ P2 device INT4 专家权重
 → P2 合并访存内核与分块 prefill GEMM → P1 attention 逐层残差定位
 → P2 TC `ldmatrix`/shared-memory staging → 连续批处理接入 device decoder
-→ **batched R-SWA attention/append 内核** → **ragged 多请求 prefill**
-→ **slot 映射 bug 修复** → **batched decode 纳入 CUDA Graph**
-→ **bf16 tensor-core GEMM（dense/shared + lm_head）**。
+→ batched R-SWA attention/append 内核 → ragged 多请求 prefill → slot 映射 bug 修复
+→ **batched decode 纳入 CUDA Graph** → **bf16 tensor-core GEMM（dense/shared + lm_head）**
+→ **bf16 小 m 变体** → **INT4 专家 GEMM bn 调优 / staging 重写**。
 
 最终回归：`compare_ocr` greedy **24/24**（CPU 参考路径）；`uocr_cuda_tests` 全过
-（含 batched 排列 / ragged prefill / slot 复用）；CPU 单测 20/20。
+（含 batched 排列 / ragged prefill / slot 复用 / batched graph / TC vs ref）；
+`uocr_tests` 20/20。
 
-**连续批处理性能（真实模型，prompt=64，batch=16，RTX 5060 Ti）**：
+**连续批处理性能（真实模型，prompt=64，steps=16，max_batch=16，warmup 稳态）**：
 
-| 配置 | 本轮优化前 | 现在 |
+| 配置 | 起始值 | 现在 |
 |---|---|---|
-| BF16 tok/s | 73.5 | **298.0** |
-| INT4 tok/s | 117.6 | **310.7** |
-| 整波 prefill（16 请求） | 16 × 88 ms 串行 | **279 ms** INT4 / 370 ms BF16 |
+| BF16 tok/s（batch=16） | 73.5 | **415.9** |
+| INT4 tok/s（batch=16） | 117.6 | **386.8** |
+| 整波 prefill（16 请求） | 16 × 88 ms 串行 | **204 ms** INT4 / **212 ms** BF16 |
+| BF16 / INT4 batch=1 tok/s | 99.4 / 91.4 | 149.4 / 130.9 |
 
-> 三项改动：① batched attention（O(B·L)→O(L) 发射）；② ragged prefill（整波一次
-> 变长前向，K/V 按 slot 散写，逐行 causal）；③ 按每专家 token 数选择 masked matvec /
-> TC GEMM。详见 `BENCHMARKS.md` §2.6、`CORE_TECH.md` §5.5。
+> 累计改动：① batched attention（O(B·L)→O(L)）；② ragged prefill；③ 按专家规模选
+> masked matvec / TC GEMM；④ batched decode CUDA Graph；⑤ bf16 TC GEMM（dense/shared
+> + lm_head，含小 m 变体）；⑥ INT4 专家 GEMM bn 调优 + staging 重写。
+> 详见 `BENCHMARKS.md` §2.5–2.9、`CORE_TECH.md` §5.5–5.7。
 
-**下一步优先级**（按收益/成本排序，详见文末各节）：
+**下一步优先级**（按收益/成本排序）：
 
-1. ~~**Batched CUDA Graph**~~（已完成 2026-09-19）：`forward_batch` 整步捕获，
-   按行数 B 缓存图，活跃 slot 变化靠设备端 slot 映射免重捕获；详见 `CORE_TECH.md`
-   §5.7。正确性 rel_l2=0；吞吐收益在带宽受限负载下有限（BF16 batch=16 纯 decode
-   479→511 tok/s，其余持平，见 `BENCHMARKS.md` §2.7）。
-2. ~~**dense/shared 投影上 tensor core**~~（已完成 2026-09-19）：`matmul_t_bf16`
-   改为 `ldmatrix`/`mma.m16n8k16` bf16 TC GEMM，并保留 CUDA-core 参考做 A/B
-   （rel_l2 ≤ 0.0018）。真实模型 BF16 batch=16 298→411 tok/s、整波 prefill
-   367→216ms，详见 `CORE_TECH.md` §5.5、`BENCHMARKS.md` §2.7–2.8。
-3. **TC 进一步调优**（进行中）：小 m 变体已完成（m ≤ 16 沿 n 拆 warp，见
-   `CORE_TECH.md` §5.5）；lm_head 大 n 仍 2–8 TFLOPS，剩余 `swizzle` 减 bank
-   conflict、split-K、`cp.async` 双缓冲。参考 `BENCHMARKS.md` §2.8。
-4. **Prefill MoE 发射优化**（进行中）：已完成 INT4 专家 GEMM 的 bn 调优与 staging
-   重写（整波 prefill −10%，`BENCHMARKS.md` §2.5）。剩余大头：nsys 显示每层仍逐专家
-   发 3×64 个 `moe_gemm_int4_tc`（12096 次、占 55% kernel 时间），下一步做 grouped
-   GEMM（一层一次 launch）或合并 gate/up。
-5. **Prefill KV 分区写入优化**（prj.md 创新点三）：prefill 时按位置分区
-   （视觉区/环形区/gap 丢弃），节省 ~70% prefill KV 写入带宽（当前按参考语义
-   保留全部 prefill KV；注意与参考数值对齐的取舍）。
-6. **精度评测**：OmniDocBench v1.6（AWQ vs BF16 综合分）、AWQ vs 朴素 INT4 消融。
-7. **性能记录补全**：GPU SM 利用率（nsys kernel 分解已完成，见 §2.9；SM 峰值
-   utilization 仍需 ncu）、KV Cache 碎片率。
-8. **权重加载优化**（prj.md 6.1）：`mmap` + `cudaHostRegister` pinned DMA 直通
+1. **高性能 TC GEMM 重写**（当前最大剩余项）：现有 TC 内核每个 warp 每 k-step 只发
+   1 个 mma + 2 次 `__syncthreads`，流水太短，实测仅 4–18 TFLOPS（硬件上限 ~80）。
+   做更大 tile（128×128 / 256×128）+ register tiling + `cp.async` 双缓冲 + swizzle。
+   收益覆盖：prefill 专家 GEMM（nsys 占 55% kernel 时间）、bf16 dense/shared、
+   lm_head（大 n 仅 1.5–8 TFLOPS）。可与第 2 项合并做。
+2. **Grouped expert GEMM**：`forward_ragged` 每层逐专家发 3×64 个
+   `moe_gemm_int4_tc`（12096 次/整轮、avg 55µs）。改为“一层一次 launch，block 映射到
+   (expert, m-tile, n-tile)”可去除 ~2000 次小发射；与第 1 项一起做收益最大。
+3. **Prefill KV 分区写入优化**（prj.md 创新点三）：按位置分区（视觉区/环形区/gap
+   丢弃），省 ~70% prefill KV 写入带宽。**注意**：参考实现并不丢弃 gap
+   （`PITFALLS.md` §1），改动会偏离参考数值，需先确认是否接受。
+4. **精度评测**：OmniDocBench v1.6（AWQ vs BF16 综合分）、AWQ vs 朴素 INT4 消融。
+5. **性能记录补全**：ncu 采 SM/DRAM 峰值利用率（nsys kernel 分解已完成，见
+   `BENCHMARKS.md` §2.9）、KV Cache 碎片率、纯 decode 的 TTFT/TPOT 分解。
+6. **权重加载优化**（prj.md 6.1）：`mmap` + `cudaHostRegister` pinned DMA 直通
    （nsys 显示权重上传 2.08GB H2D 占 host API 76%）。
 
 **已知遗留/技术债**：
-- `GpuDecoder::mlp_block` 的 host 路由分支（`dev_moe=false`）在每层做一次
-  router D2H；ragged prefill 现在也走该分支（批量大时值得把 top-k 也放设备端）。
+- `GpuDecoder::mlp_block` 的 host 路由分支（`dev_moe=false`，ragged 大批量 prefill
+  走此分支）每层做一次 router D2H + host top-k；可与 grouped GEMM 一起下放设备端。
 - `mlp_block_batch` 为未定义的空声明，可删除。
+- `batch_import_prefill` 已无调用者，可删除。
 - 真实 INT4 模型下 CUDA 端 greedy 尚未与参考 OCR 做端到端回归（当前 OCR 对齐
   走 CPU 参考路径）。
+- release 构建下 `matmul_t_bf16_ref` 仅用于单测 A/B，保留。
 
 ### P0 视觉编码器数值对齐（已完成 2026-09-15）
 - [x] 跑完 `tools/compare_vision.cpp`。`DeepEncoder::encode` 输出 273×1280 与
