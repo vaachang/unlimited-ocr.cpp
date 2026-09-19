@@ -108,9 +108,35 @@ dense MLP 或 MoE`。MoE 里 router logits 由 GPU 算出后拷回 host 做 top-
 `Engine(..., Backend::CUDA)` 内部持有 `GpuDecoder`，`generate` 与
 `generate_from_image` 自动分派；CPU 构建不编译 `.cu`、不包含该成员。
 
-> 该系统当前**不可直接 CUDA Graph 捕获**：每层 MoE 有 host 同步点（top-k），
-> 且专家 kernel 网格随分组动态变化。Graph 化需要 device router + 固定网格的
-> “全专家调度 + 掩码跳过”kernel（见 `tAgent.md` P2）。
+### 5.2 CUDA Graph 捕获（P2）
+
+decode step 现在可以整体捕获成一个 CUDA Graph：
+
+- **device router**（`moe_device.cu::moe_router_topk`）：softmax/sigmoid → greedy top-k →
+  用 `atomicAdd` 把 `(token, expert, weight)` 分组写入 `[n_experts, cap]`，去掉 host 同步。
+- **全专家固定调度 + 掩码跳过**（`moe_experts_masked` / `..._int4`）：`grid=(n_experts,
+  ceil(rows/warps))`，每个 warp 先检查 `count[e]`，为 0 直接返回。网格只依赖静态形状。
+- **设备端环形指针**（`rswa_append_decode`）：`len`/`ring_pos` 常驻 device，写入槽位在
+  kernel 内解析；`rswa_attention_devlen` 从 `*d_len` 读有效长度并掩码，避免把
+  warmup 期长度烘焙进图。
+- **Graph 范围**：`GraphScope::kFull`（默认）捕获整个 step；`kAttnDense`
+  逐层捕获 attention 子图、MoE 在图外发射（`EngineConfig.graph_scope="attn_dense"`）。
+- 每次 decode 前把一行 embedding 与 position 写入 pinned staging，Graph replay 时由
+  录制好的 H2D 读取；replay 后同步一次、跑 device lm_head、D2H logits。
+
+### 5.3 device INT4 专家权重（P2）
+
+`DecoderWeights::load(..., quantize_experts_int4=true)` 时专家权重是 AWQ INT4。
+`GpuDecoder` 把它们按 `[n_experts, rows, cols]` 连续上传（packed uint8 + per-group
+scale/zero），显存从 9.2GB 降到 2.2GB。`moe_experts_masked_int4` 在 kernel 内
+按 group 反量化，权重读取同样是 warp-per-output 合并访存。
+
+### 5.4 合并访存内核（P2 性能）
+
+`matvec_bf16`（warp-per-output，每 lane 向量化读 2 个 bf16）与 expert MLP 的
+gate_up/down 内核修复了“相邻线程按行 stride 读权重”导致的 ~16× 带宽浪费。
+prefill 的 `matmul_t_bf16` 改为 64×64 分块 + shared memory staging（panel 补 1 列
+避免 bank conflict）。
 
 ## 6. 与 `prj.md` 三大创新点的对应
 

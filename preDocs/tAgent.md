@@ -16,17 +16,14 @@
 
 **下一步优先级**（详见文末各节）：
 
-1. **CUDA Graph（P2，最大）**：需先把 MoE 改成 device router + “全专家固定
-   调度 + 掩码跳过”的静态 kernel 序列，再捕获 decode 稳态。当前 `GpuDecoder`
-   每层有 router D2H + host top-k 同步点、且专家 kernel 网格随分组变化，
-   无法直接捕获。三个子选项（需确认范围）：
-   - 3a 完整版：device router + 融合 masked-expert kernel + Graph 捕获；
-   - 3b 缩减版：只捕获 attention/dense 静态子图，MoE 留在图外；
-   - 3c 换方向：先做 device INT4 专家权重（省显存）+ 基准指标表。
-2. **P1 残留**：逐层对比 attention 的 q/k/v、O 投影输出，定位路由以外的残差。
-3. **P2 Tensor Core 性能**：`ldmatrix`/shared-memory staging + split-K。
-4. **P2 指标与回归**：补齐 prj.md §7.2 指标与 §7.3 ablation；对比工具纳入
-   可选 CTest。
+1. **P2 Tensor Core 性能**：`moe_gemm_int4_tc` 仍按标量读寄存器装入 mma，需
+   `ldmatrix`/shared-memory staging + split-K；prefill 已用 64×64 shared-memory
+   分块 GEMM，但 INT4 TC 路径未做。
+2. **P1 残留**：逐层对比 attention 的 q/k/v、O 投影输出，定位路由以外的残差
+   （需先扩展 `export_reference.py` 导出 attention 内部张量）。
+3. **批处理**：当前 `Engine` 为单请求，prj.md §7.2 的 batch=8/16 吞吐与显存
+   指标依赖连续批处理接入 device decoder。
+4. **精度评测**：OmniDocBench v1.6（AWQ vs BF16）尚未接入。
 
 ### P0 视觉编码器数值对齐（已完成 2026-09-15）
 - [x] 跑完 `tools/compare_vision.cpp`。`DeepEncoder::encode` 输出 273×1280 与
@@ -96,23 +93,25 @@
 - [x] `Engine` 的 CUDA 执行分支：`Engine(..., Backend::CUDA)` 构造 `GpuDecoder`，
       `generate` / `generate_from_image` 自动走设备路径；测试中 CPU/CUDA
       greedy token 一致。
-- [ ] device 端 INT4 专家权重（当前上传 bf16，显存占用偏大）与
-      resident KV / CUDA Graph。
+- [x] device 端 INT4 专家权重（2026-09-19）：`upload_expert_table` 上传 AWQ
+      打包权重（连续 `[n_experts,rows,cols]`），`moe_experts_masked_int4` 内核内
+      反量化。真实模型显存 9.2GB → **2.2GB**。
+- [x] resident KV / CUDA Graph（见下）。
 
 > 构建结构调整：CUDA 源文件直接并入 `uocr_core`（`UOCR_ENGINE_LIB` 恒为
 > `uocr_core`），避免 Engine 与 CUDA 静态库的循环依赖；CPU 构建不编译 `.cu`。
 
-### P2 CUDA Graph 与创新点落地（下一阶段重点，范围待确认）
-- [ ] **前置**：device 端 router + top-k kernel，去掉 `GpuDecoder` 每层的
-      router D2H / host top-k 同步点。
-- [ ] **前置**：实现 prj.md 的“全 expert 固定调度 + 路由掩码跳过”单个（或固定
-      序列）MoE kernel，网格静态，使 kernel 序列可被 Graph 捕获。
-- [ ] 按 prj.md 方案：路由 kernel 在 Graph 外、expert 计算在 Graph 内，捕获
-      解码稳态；对比捕获前后的 kernel launch 开销。
-- [ ] 持久化 R-SWA KV 索引 buffer，保证多次 replay 地址稳定。
-- [ ] 实现 prj.md 的 Prefill KV 分区写入优化（当前按参考语义保留全部 prefill KV）。
-- 决策点：完整版 / 缩减版（仅 attention+dense 子图）/ 先转 INT4 device 权重，
-  见开头“下一步优先级”。
+### P2 CUDA Graph 与创新点落地（已完成 2026-09-19）
+- [x] device 端 router + top-k kernel（`moe_router_topk`），去掉每层 D2H/host top-k。
+- [x] “全 expert 固定调度 + 路由掩码跳过”（`moe_experts_masked[_int4]`），网格静态。
+- [x] 捕获解码稳态：`GpuDecoder` 首次 decode 时捕获，之后 replay；对比见
+      `bench_cuda_decode`（plain 6.8ms → full graph 5.4ms / token，INT4）。
+- [x] 持久化 R-SWA KV 索引：`rswa_append_decode` 设备端推进 `len/ring_pos`，
+      `rswa_attention_devlen` 读设备长度，同一 Graph 覆盖 warmup→ring。
+- [x] `EngineConfig.graph_scope` 支持 `full` / `attn_dense` 两种范围（消融）。
+- [ ] Prefill KV 分区写入优化（当前按参考语义保留全部 prefill KV）。
+- 说明：`matvec_bf16` / expert MLP 改为 warp-per-output 合并访存后，TPOT 从
+  26.7ms 降到 5.4ms；详见 `PITFALLS.md` §11-12。
 
 ### P2 Tensor Core INT4 GEMM
 - [x] 补充张量核 W4A16 路径（2026-09-19）：`moe_gemm_int4_tc` 在寄存器内把

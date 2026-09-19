@@ -175,3 +175,38 @@ position_ids = arange(past_key_values_length, seq_length + past_key_values_lengt
 - C++ `Engine` 递增 `pos` 的语义是正确的，不要为了迁就该导出而去 clamp 位置。
 
 修正后 `--decode-steps 140`：ring 后 logits rel_l2 ≤ 0.036，final K/V ≤ 0.03。
+
+## 11. decode 性能的三个大坑（2026-09-19，P2）
+
+真实模型 TPOT 从 26.7ms 降到 5.4ms，过程中踩到三个问题：
+
+1. **host lm_head 主导 TPOT**：`final_logits` 原来把最后一层 hidden 拷回 host 再做
+   `lm_head.matvec`（[129280,1280]，每 token ~165M MAC），单线程 ~20ms，是当时 TPOT
+   的绝大部分。改为把 `lm_head` 上传 device，用 device matvec 后 D2H logits。
+2. **未合并访存（uncoalesced row reads）**：`matmul_t_bf16`（16×16 分块）与最初的
+   `matvec_bf16`（一线程一行）中，相邻线程读取权重行首地址相隔 `k` 个元素，一次 32B
+   事务只服务 1~2 个线程，有效带宽降到 ~1/16。改为
+   **warp-per-output + 每 lane 读 2 个连续 bf16（`uint32` 向量化）** 后，warp 内读取
+   连续 64 个元素，带宽恢复。expert MLP 同样改造为 gate_up/down 两个 warp-per-output
+   内核。BF16 真实模型 TPOT 26.7→13.6（plain），Graph 6.5→5.5。
+3. **非阻塞 stream 与 legacy default stream 不同步**：Graph 捕获用的 `stream_` 以
+   `cudaStreamNonBlocking` 创建。`final_logits_from_normed` 先在 `stream_` 上跑 matvec，
+   再用 **同步** `cudaMemcpy` 读回 logits —— 但 blocking memcpy 只与 legacy blocking
+   stream 同步，不与 non-blocking stream 同步，于是读到旧值。症状很隐蔽：
+   `CUDA_LAUNCH_BLOCKING=1` 时结果正确（rel_l2=0），正常运行随机偏差（rel_l2≈0.09）。
+   修复：readback 前显式 `cudaStreamSynchronize(stream_)`。
+
+## 12. CUDA Graph 捕获的前提（P2）
+
+要把 decode step 捕获成单个 Graph，必须同时满足：
+
+- **无 host 同步点**：每层 MoE 原来的 router D2H + host top-k 不可捕获，必须改成
+  device router（`moe_router_topk`）。
+- **固定网格**：expert kernel 不能按分组动态决定网格，改成
+  `grid = (n_experts, ceil(rows/warps))` 的“全专家固定调度 + 掩码跳过”。
+- **设备端状态**：环形 KV 的写入槽位原来在 host 上按 `ring_pos` 算好后当 kernel 参数
+  传入，捕获后地址会被钉死；必须改成 device 计数（`rswa_append_decode` 在设备端读
+  `len/ring_pos` 并推进），attention 通过 `rswa_attention_devlen` 读 `*d_len` 做掩码，
+  这样**同一个 Graph 能跨越 warmup→稳态**。
+- **设备地址稳定**：所有 scratch、router 分组 buffer、pinned staging 必须预分配，
+  捕获期间不能 `cudaMalloc`。

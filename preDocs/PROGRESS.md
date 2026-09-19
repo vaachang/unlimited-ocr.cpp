@@ -31,9 +31,37 @@
 ✅ 端到端图像 OCR 对齐（E0–E5：布局、预处理、视觉注入、greedy 24/24）
 ✅ CUDA 设备端 decoder + Engine CUDA 分支（GpuDecoder，bf16 权重常驻）
 ✅ Tensor Core W4A16 INT4 MoE GEMM
-⬜ CUDA Graph 捕获（当前为普通 kernel 启动）
-⬜ device 端 INT4 专家权重（当前上传 bf16）
+✅ CUDA Graph 捕获（device router + 全专家固定调度 + 掩码跳过；全图/attn_dense 两种范围）
+✅ device 端 INT4 专家权重（显存 9.2GB → 2.2GB）
+✅ 合并式 decode 内核（warp-per-output matvec / expert MLP）+ 分块 prefill GEMM
 ```
+
+### CUDA Graph 与性能（P2，2026-09-19）
+
+- **device router**：`moe_router_topk` 在设备端做 softmax/top-k + 按专家分组，去掉了每层
+  router D2H + host top-k 同步点。
+- **全专家固定调度 + 掩码跳过**：`moe_experts_masked` 以 `grid=(n_experts, rows)` 启动，
+  每个 block/warp 先读 `count[e]`，无 token 立即返回；网格只依赖静态形状，可被 Graph 捕获。
+- **device 环形指针**：`rswa_append_decode` 在设备端推进 `len/ring_pos`，写入槽位在 replay
+  时解析；`rswa_attention_devlen` 读取 `*d_len` 做掩码，因此**同一个 Graph 覆盖 warmup→ring**。
+- **持久化 buffer**：KV cache、router 分组 buffer、ping/pong、embed/pos pinned staging 全部
+  预分配，replay 地址稳定。
+- **Graph 范围**：`EngineConfig.graph_scope = "full" | "attn_dense"`。full 捕获整个 decode
+  step；attn_dense 只捕获 attention 子图，MoE 在图外发射（消融用）。
+- **device INT4 专家权重**：`Linear.weight` 为 INT4 时上传打包 AWQ 权重（连续
+  `[n_experts, rows, cols]` 布局），`moe_experts_masked_int4` 内核内反量化。
+
+实测（真实 `baidu/Unlimited-OCR`，prefill=128，batch=1，RTX 5060 Ti）：
+
+| 配置 | TTFT | TPOT(稳态) | 显存 |
+|---|---|---|---|
+| BF16 + plain（无 Graph，host 路由） | 193 ms | 6.76 ms | 9.2 GB |
+| BF16 + full Graph | 192 ms | **5.45 ms** | 9.2 GB |
+| INT4 + plain | 127 ms | 14.75 ms | 2.2 GB |
+| INT4 + full Graph | 127 ms | **5.43 ms** | 2.2 GB |
+
+> 合并式内核（warp-per-output、向量化合并访存）与 device lm_head 之前，BF16 full Graph 的
+> TPOT 为 26.7ms（其中 host lm_head matvec 占 ~20ms）。详见 `PITFALLS.md` §11。
 
 ### 端到端 OCR 对齐（E0–E5，2026-09-19）
 
@@ -69,11 +97,13 @@ unlimited-ocr.cpp/
 │   ├── engine/     moe_decoder.cpp deep_encoder.cpp sampler.cpp engine.cpp
 │   └── kernels/
 │       ├── cpu_ops.cpp
-│       └── cuda/   rmsnorm.cu rope_fused.cu rswa_attention.cu moe_gemm_int4.cu backend.cu
+│       └── cuda/   rmsnorm.cu rope_fused.cu rswa_attention.cu moe_gemm_int4.cu
+│                    backend.cu gpu_ops.cu gpu_cache.cu moe_device.cu
+│   engine/         gpu_decoder.cu（device decoder + CUDA Graph 捕获）
 ├── tests/          test_main.* test_kv_ring_buffer.cpp test_memory_budget.cpp
 │                   test_scheduler.cpp test_decoder.cpp test_moe_gate.cpp
 │                   test_tokenizer.cpp test_rswa_cuda.cu
-├── benchmarks/     bench_decode.cpp bench_throughput.cpp
+├── benchmarks/     bench_decode.cpp bench_throughput.cpp bench_cuda_decode.cu
 ├── tools/          inspect_model.cpp compare_reference.cpp compare_vision.cpp
 │                   compare_tokenizer.cpp compare_layout.cpp compare_image.cpp
 │                   compare_ocr.cpp gen_unicode_tables.py
@@ -136,9 +166,12 @@ cmake --build build-cuda -j8
 | INT4 MoE GEMM 标量（8×64×256, group=128） | max_err = 0.000010 |
 | INT4 MoE GEMM 张量核 W4A16（8×64×256） | rel_l2 = 0.0024 |
 | INT4 MoE GEMM 张量核 ragged（M=5,K=48） | rel_l2 = 0.0026 |
-| `GpuDecoder` vs CPU `MoEDecoder`（tiny，prefill） | rel_l2 = 0.0019 |
-| `GpuDecoder` vs CPU（tiny，6 步 decode） | worst rel_l2 = 0.0021 |
+| `GpuDecoder` vs CPU `MoEDecoder`（tiny，prefill） | rel_l2 = 0.0022 |
+| `GpuDecoder` vs CPU（tiny，6 步 decode） | worst rel_l2 = 0.0025 |
 | `Engine` CUDA vs CPU（tiny，greedy 4 步） | token 一致 |
+| Graph decode vs plain（W=4，20 步，含 ring 覆写） | rel_l2 = 0.00000（完全一致） |
+| attn_dense Graph vs plain | rel_l2 = 0.00000 |
+| device INT4 专家 vs CPU（plain / graph） | rel_l2 = 0.0025 / 0.0025 |
 
 ### 5.4 DeepEncoder (Vision) 对齐
 

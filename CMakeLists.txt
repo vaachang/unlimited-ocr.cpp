@@ -16,6 +16,10 @@ option(ENGINE_BUILD_BENCHMARKS "Build benchmarks" ON)
 option(ENGINE_BUILD_TOOLS "Build helper tools (weight converter)" ON)
 option(ENGINE_ENABLE_SANITIZERS "Build with ASan/UBSan (CPU only)" OFF)
 option(ENGINE_NATIVE "Compile CPU host code with -march=native" ON)
+# Optional: directory containing exported PyTorch reference tensors
+# (ref_decoder/, ref_vision/, ref_tokenizer/, ref_layout/, ref_image/, ref_ocr/).
+# When set, the compare_* tools are registered as CTest tests.  Empty -> skip.
+set(ENGINE_REFERENCE_DIR "" CACHE PATH "Reference tensor directory for compare_* CTest")
 
 # ---------------------------------------------------------------------------
 # Language / flags
@@ -151,6 +155,31 @@ endif()
 
 if(ENGINE_BUILD_TOOLS)
     add_subdirectory(tools)
+endif()
+
+# Optional reference-alignment tests.  These need the exported PyTorch tensors
+# (tools/reference/export_*.py) and, for the vision/OCR tools, the real model
+# weights; they are skipped unless ENGINE_REFERENCE_DIR is provided.
+if(ENGINE_BUILD_TOOLS AND ENGINE_REFERENCE_DIR AND ENGINE_BUILD_TESTS)
+    set(_ref ${ENGINE_REFERENCE_DIR})
+    add_test(NAME compare_reference
+             COMMAND compare_reference --model ${CMAKE_SOURCE_DIR}/models --ref ${_ref}/ref_decoder)
+    add_test(NAME compare_tokenizer
+             COMMAND compare_tokenizer --model ${CMAKE_SOURCE_DIR}/models
+                     --ref ${_ref}/ref_tokenizer/tokenizer_cases.json)
+    add_test(NAME compare_layout
+             COMMAND compare_layout --model ${CMAKE_SOURCE_DIR}/models
+                     --ref ${_ref}/ref_layout/layout_cases.json)
+    add_test(NAME compare_image
+             COMMAND compare_image --ref ${_ref}/ref_image)
+    add_test(NAME compare_vision
+             COMMAND compare_vision --model ${CMAKE_SOURCE_DIR}/models --ref ${_ref}/ref_vision)
+    set_tests_properties(compare_vision PROPERTIES ENVIRONMENT "OMP_NUM_THREADS=8")
+    add_test(NAME compare_ocr
+             COMMAND compare_ocr --model ${CMAKE_SOURCE_DIR}/models --ref ${_ref}/ref_ocr)
+    set_tests_properties(compare_ocr PROPERTIES ENVIRONMENT "OMP_NUM_THREADS=8")
+    set_tests_properties(compare_reference compare_tokenizer compare_layout compare_image
+                         compare_vision compare_ocr PROPERTIES LABELS reference)
 endif()
 
 message(STATUS "-------------------------------------------------------------")
