@@ -1,0 +1,14 @@
+[14:34:08][INFO] engine created (CUDA backend)  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:49)
+[14:34:08][INFO] batch done: 1 requests, 32 decode tokens, 17.8 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:386)
+[14:34:08][INFO] batch done: 2 requests, 64 decode tokens, 40.5 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:386)
+[14:34:08][INFO] batch done: 4 requests, 128 decode tokens, 59.5 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:386)
+[14:34:08][INFO] batch done: 8 requests, 256 decode tokens, 99.1 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:386)
+[14:34:08][INFO] batch done: 16 requests, 512 decode tokens, 180.4 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:386)
+device: NVIDIA GeForce RTX 5060 Ti (sm_120, 36 SMs, 15.6 GB)
+prompt=64 steps=32 max_batch=16 experts=BF16
+ batch   prefill_ms    decode_ms          tok/s       peakMB
+     1          4.6         17.9         1790.9         16.0
+     2          1.9         40.7         1572.3         18.0
+     4          2.0         59.8         2140.2         22.0
+     8          2.0         99.6         2569.6         30.0
+    16          2.1        181.0         2828.5         48.0

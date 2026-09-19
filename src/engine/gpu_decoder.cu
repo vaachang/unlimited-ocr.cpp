@@ -270,6 +270,13 @@ GpuDecoder::~GpuDecoder() {
     f(d_assign_w_);
     f(d_count_);
     f(d_act_);
+    for (float* p : batch_k_)
+        if (p) cudaFree(p);
+    for (float* p : batch_v_)
+        if (p) cudaFree(p);
+    f(d_batch_len_);
+    f(d_batch_ring_);
+    f(d_logits_batch_);
     invalidate_graph();
     if (ev_a_) cudaEventDestroy(ev_a_);
     if (ev_b_) cudaEventDestroy(ev_b_);
@@ -376,7 +383,7 @@ void GpuDecoder::ensure_scratch(int seq) {
     cu_check(cudaMalloc(&d_row_w_, static_cast<std::size_t>(seq) * k * sizeof(float)), "row_w");
     cu_check(cudaMalloc(&d_ping_, static_cast<std::size_t>(seq) * h * sizeof(float)), "ping");
     cu_check(cudaMalloc(&d_pong_, static_cast<std::size_t>(seq) * h * sizeof(float)), "pong");
-    cu_check(cudaMalloc(&d_normed_, static_cast<std::size_t>(h) * sizeof(float)), "normed");
+    cu_check(cudaMalloc(&d_normed_, static_cast<std::size_t>(seq) * h * sizeof(float)), "normed");
     cu_check(cudaMalloc(&d_hidden_, static_cast<std::size_t>(seq) * h * sizeof(float)), "hidden");
 }
 
@@ -757,6 +764,159 @@ void GpuDecoder::prefill_tokens(const std::vector<int>& tokens, std::vector<floa
     for (int t = 0; t < seq; ++t)
         host_weights_->embed_tokens.row(tokens[t], embeds.data() + static_cast<std::size_t>(t) * h);
     prefill_embeds(embeds.data(), seq, logits);
+}
+
+// ---------------------------------------------------------------------------
+// Continuous batching
+// ---------------------------------------------------------------------------
+
+void GpuDecoder::batch_configure(int slots, int capacity) {
+    for (float* p : batch_k_)
+        if (p) cudaFree(p);
+    for (float* p : batch_v_)
+        if (p) cudaFree(p);
+    if (d_batch_len_) { cudaFree(d_batch_len_); d_batch_len_ = nullptr; }
+    if (d_batch_ring_) { cudaFree(d_batch_ring_); d_batch_ring_ = nullptr; }
+    batch_slots_ = slots;
+    batch_cap_ = capacity;
+    batch_stride_ = cfg_.num_key_value_heads * cfg_.head_dim();
+    const std::size_t per_slot =
+        static_cast<std::size_t>(batch_cap_) * batch_stride_ * sizeof(float);
+    batch_k_.assign(cfg_.num_hidden_layers, nullptr);
+    batch_v_.assign(cfg_.num_hidden_layers, nullptr);
+    for (int l = 0; l < cfg_.num_hidden_layers; ++l) {
+        cu_check(cudaMalloc(&batch_k_[l], per_slot * slots), "batch k");
+        cu_check(cudaMalloc(&batch_v_[l], per_slot * slots), "batch v");
+        cu_check(cudaMemset(batch_k_[l], 0, per_slot * slots), "batch k zero");
+        cu_check(cudaMemset(batch_v_[l], 0, per_slot * slots), "batch v zero");
+    }
+    cu_check(cudaMalloc(&d_batch_len_, cfg_.num_hidden_layers * slots * sizeof(int)), "batch len");
+    cu_check(cudaMalloc(&d_batch_ring_, cfg_.num_hidden_layers * slots * sizeof(int)),
+             "batch ring");
+    cu_check(cudaMemset(d_batch_len_, 0, cfg_.num_hidden_layers * slots * sizeof(int)),
+             "batch len zero");
+    cu_check(cudaMemset(d_batch_ring_, 0, cfg_.num_hidden_layers * slots * sizeof(int)),
+             "batch ring zero");
+    slot_prefill_len_.assign(slots, 0);
+}
+
+void GpuDecoder::batch_import_prefill(int slot, int prefill_len) {
+    UOCR_CHECK(slot < batch_slots_, "batch slot out of range");
+    const int stride = batch_stride_;
+    const std::size_t bytes = static_cast<std::size_t>(prefill_len) * stride * sizeof(float);
+    for (int l = 0; l < cfg_.num_hidden_layers; ++l) {
+        float* dst_k = batch_k_[l] + static_cast<std::size_t>(slot) * batch_cap_ * stride;
+        float* dst_v = batch_v_[l] + static_cast<std::size_t>(slot) * batch_cap_ * stride;
+        cu_check(cudaMemcpy(dst_k, cache_.keys(l), bytes, cudaMemcpyDeviceToDevice), "batch k imp");
+        cu_check(cudaMemcpy(dst_v, cache_.values(l), bytes, cudaMemcpyDeviceToDevice),
+                 "batch v imp");
+        const int idx = l * batch_slots_ + slot;
+        const int zero = 0;
+        cu_check(cudaMemcpy(d_batch_len_ + idx, &prefill_len, sizeof(int),
+                            cudaMemcpyHostToDevice), "batch len imp");
+        cu_check(cudaMemcpy(d_batch_ring_ + idx, &zero, sizeof(int), cudaMemcpyHostToDevice),
+                 "batch ring imp");
+    }
+    slot_prefill_len_[slot] = prefill_len;
+}
+
+void GpuDecoder::attention_block_batch(int li, int batch, const float* x, const int* positions,
+                                       float* h1, float* normed2, cudaStream_t stream) {
+    const int h = cfg_.hidden_size;
+    const int heads = cfg_.num_attention_heads;
+    const int kv_heads = cfg_.num_key_value_heads;
+    const int hd = cfg_.head_dim();
+    DevLayer& L = layers_[li];
+    const int mi = std::max(cfg_.intermediate_size,
+                            cfg_.moe_intermediate_size * std::max(cfg_.n_shared_experts, 1));
+    LayerScratch s = layer_scratch(scratch_, batch, h, mi);
+
+    cuda::rmsnorm(x, L.in_ln, s.normed, batch, h, cfg_.rms_norm_eps, stream);
+    linear_forward(s.normed, L.q.w, L.q.bias, s.q, batch, h, h, stream);
+    linear_forward(s.normed, L.k.w, L.k.bias, s.k, batch, h, h, stream);
+    linear_forward(s.normed, L.v.w, L.v.bias, s.v, batch, h, h, stream);
+    cuda::rope(s.q, s.k, positions, batch, heads, kv_heads, hd, cfg_.rope_theta, stream);
+
+    const int stride = batch_stride_;
+    for (int b = 0; b < batch; ++b) {
+        const std::size_t off = static_cast<std::size_t>(b) * batch_cap_ * stride;
+        const std::size_t row = static_cast<std::size_t>(b) * h;
+        const int idx = li * batch_slots_ + b;
+        cuda::rswa_append_decode(s.k + row, s.v + row, batch_k_[li] + off, batch_v_[li] + off,
+                                 d_batch_len_ + idx, d_batch_ring_ + idx, slot_prefill_len_[b],
+                                 cfg_.sliding_window, kv_heads, hd, stream);
+        cuda::rswa_attention_devlen(s.q + row, batch_k_[li] + off, batch_v_[li] + off,
+                                    d_batch_len_ + idx, 1, 0, heads, kv_heads, hd, false,
+                                    s.ctx + row, stream);
+    }
+    linear_forward(s.ctx, L.o.w, L.o.bias, s.attn, batch, h, h, stream);
+
+    cu_check(cudaMemcpyAsync(h1, x, static_cast<std::size_t>(batch) * h * sizeof(float),
+                             cudaMemcpyDeviceToDevice, stream), "batch h1 copy");
+    cuda::add_scaled(h1, s.attn, 1.0f, batch * h, stream);
+    cuda::rmsnorm(h1, L.post_ln, normed2, batch, h, cfg_.rms_norm_eps, stream);
+}
+
+void GpuDecoder::forward_batch(const float* x, int batch, const int* positions, float* out,
+                               cudaStream_t stream) {
+    ensure_scratch(batch);
+    ensure_router_scratch(batch);
+    const int h = cfg_.hidden_size;
+    const int mi = std::max(cfg_.intermediate_size,
+                            cfg_.moe_intermediate_size * std::max(cfg_.n_shared_experts, 1));
+    const float* cur = x;
+    float* next = d_ping_;
+    for (int li = 0; li < cfg_.num_hidden_layers; ++li) {
+        LayerScratch s = layer_scratch(scratch_, batch, h, mi);
+        attention_block_batch(li, batch, cur, positions, s.h1, s.normed2, stream);
+        mlp_block(li, s.h1, s.normed2, batch, /*dev_moe=*/true, next, stream);
+        cur = next;
+        next = (next == d_ping_) ? d_pong_ : d_ping_;
+    }
+    cu_check(cudaMemcpyAsync(out, cur, static_cast<std::size_t>(batch) * h * sizeof(float),
+                             cudaMemcpyDeviceToDevice, stream), "batch out copy");
+}
+
+void GpuDecoder::batch_decode(const std::vector<int>& tokens, const std::vector<int>& positions,
+                              std::vector<std::vector<float>>& logits) {
+    const int batch = static_cast<int>(tokens.size());
+    UOCR_CHECK(batch > 0 && batch <= batch_slots_, "batch_decode size out of range");
+    UOCR_CHECK(static_cast<int>(positions.size()) == batch, "positions size mismatch");
+    const int h = cfg_.hidden_size;
+    const int V = cfg_.vocab_size;
+
+    ensure_scratch(batch);
+    ensure_router_scratch(batch);
+
+    std::vector<float> embeds(static_cast<std::size_t>(batch) * h);
+    for (int b = 0; b < batch; ++b)
+        host_weights_->embed_tokens.row(tokens[b], embeds.data() + static_cast<std::size_t>(b) * h);
+    cu_check(cudaMemcpy(d_xin_, embeds.data(), embeds.size() * sizeof(float),
+                        cudaMemcpyHostToDevice), "batch embeds");
+    cu_check(cudaMemcpy(d_pos_, positions.data(), batch * sizeof(int), cudaMemcpyHostToDevice),
+             "batch pos");
+
+    cu_check(cudaEventRecord(ev_a_, 0), "batch ev a");
+    forward_batch(d_xin_, batch, d_pos_, d_hidden_, 0);
+    cuda::rmsnorm(d_hidden_, final_norm_, d_normed_, batch, h, cfg_.rms_norm_eps, 0);
+    if (batch > batch_logits_cap_) {
+        if (d_logits_batch_) cudaFree(d_logits_batch_);
+        cu_check(cudaMalloc(&d_logits_batch_, static_cast<std::size_t>(batch) * V * sizeof(float)),
+                 "batch logits");
+        batch_logits_cap_ = batch;
+    }
+    cuda::matmul_t_bf16(d_normed_, lm_head_.w, nullptr, d_logits_batch_, batch, V, h, 0);
+    cu_check(cudaEventRecord(ev_b_, 0), "batch ev b");
+    cu_check(cudaStreamSynchronize(0), "batch sync");
+    cu_check(cudaEventElapsedTime(&last_forward_ms_, ev_a_, ev_b_), "batch elapsed");
+
+    std::vector<float> buf(static_cast<std::size_t>(batch) * V);
+    cu_check(cudaMemcpy(buf.data(), d_logits_batch_, buf.size() * sizeof(float),
+                        cudaMemcpyDeviceToHost), "batch logits D2H");
+    logits.resize(batch);
+    for (int b = 0; b < batch; ++b)
+        logits[b].assign(buf.begin() + static_cast<std::size_t>(b) * V,
+                         buf.begin() + static_cast<std::size_t>(b + 1) * V);
 }
 
 void GpuDecoder::decode_token(int token, int pos, std::vector<float>& logits) {

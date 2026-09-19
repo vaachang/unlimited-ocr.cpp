@@ -34,6 +34,8 @@
 ✅ CUDA Graph 捕获（device router + 全专家固定调度 + 掩码跳过；全图/attn_dense 两种范围）
 ✅ device 端 INT4 专家权重（显存 9.2GB → 2.2GB）
 ✅ 合并式 decode 内核（warp-per-output matvec / expert MLP）+ 分块 prefill GEMM
+✅ Tensor Core W4A16 `ldmatrix` + shared-memory staging
+✅ 连续批处理接入 device decoder（`Engine::generate_batch`，每 slot 独立 R-SWA KV）
 ```
 
 ### CUDA Graph 与性能（P2，2026-09-19）
@@ -172,6 +174,7 @@ cmake --build build-cuda -j8
 | Graph decode vs plain（W=4，20 步，含 ring 覆写） | rel_l2 = 0.00000（完全一致） |
 | attn_dense Graph vs plain | rel_l2 = 0.00000 |
 | device INT4 专家 vs CPU（plain / graph） | rel_l2 = 0.0025 / 0.0025 |
+| Engine batch（4 个不同长度 prompt）vs sequential / CPU | token 完全一致 |
 
 ### 5.4 DeepEncoder (Vision) 对齐
 

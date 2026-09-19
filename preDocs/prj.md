@@ -198,11 +198,11 @@ RTX 5060 Ti 的 448 GB/s 带宽意味着**每个 byte 都珍贵**。内核设计
 | **端到端** | 单页 TTFT P50 | 文本 128 token：BF16 192 ms / INT4 127 ms（未含视觉编码） |
 | | TPOT P50（decode 稳定态, batch=1） | **INT4 full graph 5.43 ms**（BF16 5.45 ms） |
 | | 解码第 40 页 vs 第 1 页 TPOT 比 | ≈1.0（R-SWA 常数缓存；`--steps 140` 验证 ring 覆写） |
-| **吞吐** | batch=8 输出 token 吞吐 | 未测（单请求实现） |
-| | batch=16 输出 token 吞吐 | 未测（单请求实现） |
+| **吞吐** | batch=8 输出 token 吞吐 | INT4 105.7 tok/s / BF16 74.3 tok/s（prompt64，含串行 prefill） |
+| | batch=16 输出 token 吞吐 | INT4 117.6 tok/s / BF16 73.5 tok/s |
 | | GPU SM 利用率（decode 阶段） | 未测（本机无 ncu/nsys） |
-| **显存** | batch=8 峰值显存（INT4） | 单请求 2.22 GB（权重常驻，含 lm_head bf16） |
-| | batch=16 峰值显存（INT4） | 未测 |
+| **显存** | batch=8 峰值显存（INT4） | 2456 MB（权重常驻，含 lm_head bf16） |
+| | batch=16 峰值显存（INT4） | 2656 MB |
 | | KV Cache 碎片率 | `MemoryPool` 可统计；当前 host 侧池为 0 碎片（偏移式 arena） |
 | **精度** | AWQ INT4 vs BF16 的 OmniDocBench v1.6 综合分下降 | 未测（无 OmniDocBench 工具链） |
 | | R-SWA Kernel 输出与 PyTorch 参考的最大绝对误差 | decode attention ≤ 1e-6；GpuDecoder vs CPU rel_l2 ≤ 2.5e-3 |

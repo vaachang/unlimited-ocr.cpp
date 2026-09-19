@@ -5,6 +5,8 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <numeric>
+#include <unordered_map>
 
 #include "uocr/log.h"
 #if defined(UOCR_CUDA_ENABLED)
@@ -25,14 +27,21 @@ Engine::Engine(ModelConfig mcfg, EngineConfig ecfg, DecoderWeights weights, Back
       backend_(backend) {
     decoder_ = std::make_unique<MoEDecoder>(mcfg_, weights_);
 
-    // Derive pool sizes from the configured budget if not provided.
-    const std::size_t per_req = kv_bytes_per_request(ecfg_.max_seq_len);
-    const std::size_t prefix_budget = ecfg_.memory_pool_bytes > 0
-                                          ? ecfg_.memory_pool_bytes / 2
-                                          : per_req * static_cast<std::size_t>(ecfg_.max_batch_size);
-    const std::size_t ring_budget = ecfg_.memory_pool_bytes > 0
-                                        ? ecfg_.memory_pool_bytes / 2
-                                        : per_req * static_cast<std::size_t>(ecfg_.max_batch_size);
+    // Derive pool sizes from the configured budget if not provided.  The CUDA
+    // path manages its own device KV cache, so the host block manager only
+    // needs a small bookkeeping arena there; sizing it from max_seq_len *
+    // max_batch_size would try to host-allocate tens of GB.
+    std::size_t pool_bytes = ecfg_.memory_pool_bytes;
+    if (pool_bytes == 0) {
+        if (backend_ == Backend::CUDA) {
+            pool_bytes = 64u << 20;
+        } else {
+            const std::size_t per_req = kv_bytes_per_request(ecfg_.max_seq_len);
+            pool_bytes = per_req * static_cast<std::size_t>(ecfg_.max_batch_size) * 2;
+        }
+    }
+    const std::size_t prefix_budget = pool_bytes / 2;
+    const std::size_t ring_budget = pool_bytes / 2;
     block_mgr_ = std::make_unique<BlockManager>(prefix_budget, ring_budget);
     scheduler_ = std::make_unique<ContinuousBatchScheduler>(ecfg_.max_batch_size, ecfg_.min_batch_size);
     sampler_ = std::make_unique<Sampler>(SamplingParams{ecfg_.temperature, ecfg_.top_p, ecfg_.top_k});
@@ -255,6 +264,143 @@ GenerationResult Engine::generate_from_image(const std::vector<int>& prompt,
 
     if (!doc_key.empty()) block_mgr_->release_prefix(doc_key);
     return res;
+}
+
+std::vector<GenerationResult> Engine::generate_batch(const std::vector<std::vector<int>>& prompts,
+                                                     int max_new_tokens) {
+    const int limit = max_new_tokens > 0 ? max_new_tokens : ecfg_.max_new_tokens;
+    std::vector<GenerationResult> results(prompts.size());
+    for (std::size_t i = 0; i < prompts.size(); ++i)
+        results[i].prefill_tokens = static_cast<int>(prompts[i].size());
+    if (prompts.empty()) return results;
+
+#if defined(UOCR_CUDA_ENABLED)
+    if (gpu_decoder_) {
+        const int slots = std::min<int>(ecfg_.max_batch_size,
+                                        static_cast<int>(prompts.size()));
+        int max_prompt = 1;
+        for (const auto& p : prompts) max_prompt = std::max(max_prompt, static_cast<int>(p.size()));
+        gpu_decoder_->batch_configure(slots, max_prompt + mcfg_.sliding_window);
+
+        scheduler_ = std::make_unique<ContinuousBatchScheduler>(slots, ecfg_.min_batch_size);
+        std::vector<int> ids;
+        ids.reserve(prompts.size());
+        for (const auto& p : prompts) {
+            Request r;
+            r.prompt_tokens = p;
+            r.max_new_tokens = limit;
+            ids.push_back(scheduler_->add_request(std::move(r)));
+        }
+
+        std::unordered_map<int, int> id_slot;
+        std::vector<int> free_slots(slots);
+        std::iota(free_slots.begin(), free_slots.end(), 0);
+        std::unordered_map<int, std::vector<int>> history;
+
+        auto release = [&](int id) {
+            auto it = id_slot.find(id);
+            if (it != id_slot.end()) {
+                free_slots.push_back(it->second);
+                id_slot.erase(it);
+            }
+        };
+        auto sample = [&](std::vector<float>& lg, std::vector<int>& hist) {
+            if (ecfg_.no_repeat_ngram_size > 0 &&
+                static_cast<int>(hist.size()) >= ecfg_.no_repeat_ngram_size)
+                Sampler::apply_no_repeat_ngram(lg.data(), mcfg_.vocab_size, hist,
+                                               ecfg_.no_repeat_ngram_size, ecfg_.ngram_window);
+            return sampler_->sample(lg.data(), mcfg_.vocab_size);
+        };
+
+        const double t0 = now_ms();
+        while (scheduler_->has_work()) {
+            Batch b = scheduler_->build_batch();
+            // Admit / prefill new requests (one at a time into the scratch cache).
+            for (int id : b.prefill) {
+                Request* r = scheduler_->get(id);
+                if (!r) continue;
+                UOCR_CHECK(!free_slots.empty(), "generate_batch: no free slot");
+                const int slot = free_slots.back();
+                free_slots.pop_back();
+                id_slot[id] = slot;
+                const int P = static_cast<int>(r->prompt_tokens.size());
+                std::vector<float> embeds(static_cast<std::size_t>(P) * mcfg_.hidden_size);
+                for (int t = 0; t < P; ++t)
+                    weights_.embed_tokens.row(r->prompt_tokens[t],
+                                              embeds.data() + static_cast<std::size_t>(t) *
+                                                                  mcfg_.hidden_size);
+                std::vector<float> lg;
+                const double p0 = now_ms();
+                gpu_decoder_->prefill_embeds(embeds.data(), P, lg);
+                gpu_decoder_->batch_import_prefill(slot, P);
+                results[id].ttft_ms = now_ms() - p0;
+                history[id] = r->prompt_tokens;
+                scheduler_->mark_prefilled(id);
+                const int tok = sample(lg, history[id]);
+                if (tok == mcfg_.eos_token_id) {
+                    scheduler_->finish(id);
+                    release(id);
+                    continue;
+                }
+                history[id].push_back(tok);
+                if (scheduler_->add_token(id, tok)) release(id);
+            }
+            // Decode every running request together.
+            if (!b.decode.empty()) {
+                std::vector<int> toks, poss;
+                toks.reserve(b.decode.size());
+                poss.reserve(b.decode.size());
+                for (int id : b.decode) {
+                    Request* r = scheduler_->get(id);
+                    if (!r || r->output_tokens.empty()) continue;
+                    toks.push_back(r->output_tokens.back());
+                    poss.push_back(static_cast<int>(r->prompt_tokens.size() +
+                                                    r->output_tokens.size() - 1));
+                }
+                if (!toks.empty()) {
+                    std::vector<std::vector<float>> lgs;
+                    gpu_decoder_->batch_decode(toks, poss, lgs);
+                    const std::size_t n = std::min(b.decode.size(), lgs.size());
+                    for (std::size_t k = 0; k < n; ++k) {
+                        const int id = b.decode[k];
+                        Request* r = scheduler_->get(id);
+                        if (!r) continue;
+                        const int tok = sample(lgs[k], history[id]);
+                        if (tok == mcfg_.eos_token_id) {
+                            scheduler_->finish(id);
+                            release(id);
+                            continue;
+                        }
+                        history[id].push_back(tok);
+                        if (scheduler_->add_token(id, tok)) release(id);
+                    }
+                }
+            }
+        }
+        const double t1 = now_ms();
+        auto stats = scheduler_->stats();
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            const Request* r = scheduler_->get(ids[i]);
+            if (!r) continue;
+            results[i].tokens = r->output_tokens;
+            results[i].decode_tokens = static_cast<int>(r->output_tokens.size());
+            results[i].prefill_tokens = static_cast<int>(r->prompt_tokens.size());
+            results[i].decode_ms = t1 - t0;
+            results[i].tpot_ms = r->output_tokens.empty()
+                                     ? 0.0
+                                     : (t1 - t0) / static_cast<double>(r->output_tokens.size());
+        }
+        UOCR_INFO("batch done: %llu requests, %llu decode tokens, %.1f ms",
+                  static_cast<unsigned long long>(stats.total_requests),
+                  static_cast<unsigned long long>(stats.decode_tokens), t1 - t0);
+        return results;
+    }
+#endif
+
+    // CPU fallback: sequential.
+    for (std::size_t i = 0; i < prompts.size(); ++i)
+        results[i] = generate(prompts[i], limit);
+    return results;
 }
 
 std::vector<float> Engine::image_embeddings(const ImageRGB& image, bool crop_mode, int base_size,

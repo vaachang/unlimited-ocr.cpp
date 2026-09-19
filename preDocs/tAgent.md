@@ -21,8 +21,11 @@
    分块 GEMM，但 INT4 TC 路径未做。
 2. **P1 残留**：逐层对比 attention 的 q/k/v、O 投影输出，定位路由以外的残差
    （需先扩展 `export_reference.py` 导出 attention 内部张量）。
-3. **批处理**：当前 `Engine` 为单请求，prj.md §7.2 的 batch=8/16 吞吐与显存
-   指标依赖连续批处理接入 device decoder。
+3. **批处理**：已完成（2026-09-19）。`Engine::generate_batch` 用
+   `ContinuousBatchScheduler` 驱动 device batched decoder（每 slot 独立 R-SWA KV）。
+   `bench_cuda_batch` 实测 INT4 batch=16 达 117.6 tok/s、显存 2.66GB；测试
+   `Engine batch` 验证 batch 与 sequential token 一致。**待优化**：batched attention
+   kernel（当前每 slot 循环发射）、batched/continuous prefill。
 4. **精度评测**：OmniDocBench v1.6（AWQ vs BF16）尚未接入。
 
 ### P0 视觉编码器数值对齐（已完成 2026-09-15）

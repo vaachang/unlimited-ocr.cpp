@@ -88,6 +88,26 @@ n=896, k=1280, group=128, iters=200（单次 GEMM 调用；`2*m*n*k` 计 FLOP）
 64×8 tile，反量化后的权重 panel `sW[8][16]` 每 k-step 只加载一次并被 4 个 warp 共享。
 结果与标量路径 rel_l2 ≤ 0.0026（`uocr_cuda_tests`，含 ragged M/K）。
 
+## 2.6 连续批处理吞吐（`bench/bench_batch_*.txt`）
+
+`Engine::generate_batch`（scheduler + device batched decoder），prompt=64，steps=16；
+吞吐按总生成 token / 总墙钟计（**含每个请求的串行 prefill**，因此偏保守）：
+
+| batch | BF16 tok/s | BF16 peak | INT4 tok/s | INT4 peak |
+|---|---|---|---|---|
+| 1 | 44.3 | 9274 MB | 75.0 | 2278 MB |
+| 2 | 52.5 | 9300 MB | 66.7 | 2304 MB |
+| 4 | 57.2 | 9352 MB | 83.1 | 2356 MB |
+| 8 | 74.3 | 9452 MB | 105.7 | 2456 MB |
+| 16 | 73.5 | 9652 MB | **117.6** | 2656 MB |
+
+正确性：`uocr_cuda_tests` 的 `Engine batch` 用例用 4 个不同长度 prompt 对比
+batch 与 sequential device decode，token 完全一致（并对 CPU 一致）。
+
+瓶颈：batch attention 目前对每个 slot 循环发射 `rswa_append_decode` +
+`rswa_attention_devlen`（每步 B×L 个 kernel），尚未做 batched attention kernel；
+prefill 也是逐请求串行（标准的 continuous batching 行为）。
+
 ## 3. 数值对齐
 
 ### 3.1 端到端 OCR（`bench/compare_ocr.txt`）

@@ -1,0 +1,5 @@
+# real BF16 batch throughput, prompt=64 steps=16
+[14:34:12][INFO] decoder weights loaded from models/model-00001-of-000001.safetensors  (/home/admin/MyDocs/unlimited-ocr.cpp/src/runtime/weights.cpp:214)
+terminate called after throwing an instance of 'std::bad_alloc'
+  what():  std::bad_alloc
+/usr/bin/bash: line 1: 30639 Aborted                    (core dumped) ./build-cuda/benchmarks/bench_cuda_batch --real --prompt 64 --steps 16 --max-batch 16

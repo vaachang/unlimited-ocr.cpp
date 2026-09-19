@@ -69,6 +69,13 @@ public:
                                          const std::vector<float>& visual_embeddings, int hidden,
                                          int max_new_tokens = 64, const std::string& doc_key = "");
 
+    // Continuous batching: run several text prompts concurrently, driving the
+    // scheduler and the device batched decoder.  Returns one result per prompt
+    // (in input order).  On the CPU backend this falls back to sequential
+    // `generate` calls.
+    std::vector<GenerationResult> generate_batch(const std::vector<std::vector<int>>& prompts,
+                                                 int max_new_tokens = 64);
+
     // Assemble the visual embeddings for one image exactly like the reference:
     // global view, plus Gundam local crops when crop_mode and the dynamic grid
     // is larger than 1x1.  Requires `set_vision()`.

@@ -59,6 +59,16 @@ public:
     double last_forward_ms() const { return last_forward_ms_; }
     double last_logits_ms() const { return last_logits_ms_; }
 
+    // ---- continuous batching ----
+    // Each slot owns an independent R-SWA KV cache (capacity = max_seq_len).
+    // Prefill a slot from the single-request path with `batch_import_prefill`,
+    // then advance all active slots together with `batch_decode`.
+    void batch_configure(int slots, int capacity);
+    void batch_import_prefill(int slot, int prefill_len);
+    void batch_decode(const std::vector<int>& tokens, const std::vector<int>& positions,
+                      std::vector<std::vector<float>>& logits);
+    int batch_slots() const { return batch_slots_; }
+
     const ModelConfig& config() const { return cfg_; }
 
 private:
@@ -124,6 +134,14 @@ private:
     void run_graph_decode(int token, int pos, std::vector<float>& logits);
     void run_graph_decode_attn_dense(int token, int pos, std::vector<float>& logits);
 
+    // Batched layer pieces (device MoE, per-slot R-SWA attention).
+    void attention_block_batch(int li, int batch, const float* x, const int* positions, float* h1,
+                               float* normed2, cudaStream_t stream);
+    void mlp_block_batch(int li, int batch, const float* h1, const float* normed2, float* out,
+                         cudaStream_t stream);
+    void forward_batch(const float* x, int batch, const int* positions, float* out,
+                       cudaStream_t stream);
+
     ModelConfig cfg_;
     const DecoderWeights* host_weights_ = nullptr;
     GpuRSWACache cache_;
@@ -169,6 +187,15 @@ private:
     int* h_pos_pinned_ = nullptr;
     cudaEvent_t ev_a_ = nullptr, ev_b_ = nullptr, ev_c_ = nullptr;
     float last_forward_ms_ = 0.0f, last_logits_ms_ = 0.0f;
+
+    // batched (continuous) decode state
+    int batch_slots_ = 0, batch_cap_ = 0, batch_stride_ = 0;
+    std::vector<float*> batch_k_, batch_v_;  // [num_layers] -> [slots, cap, kvh*hd]
+    int* d_batch_len_ = nullptr;             // [num_layers * slots]
+    int* d_batch_ring_ = nullptr;            // [num_layers * slots]
+    std::vector<int> slot_prefill_len_;      // [slots]
+    float* d_logits_batch_ = nullptr;
+    int batch_logits_cap_ = 0;
 };
 
 }  // namespace cuda

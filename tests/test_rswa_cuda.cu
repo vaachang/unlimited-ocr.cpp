@@ -635,6 +635,76 @@ int main() {
                     (worst_plain <= 0.1f && worst_graph <= 0.1f) ? "OK" : "FAIL");
     }
 
+    // ---- continuous batching vs sequential device decode ----
+    {
+        ModelConfig cfg;
+        cfg.vocab_size = 256;
+        cfg.hidden_size = 64;
+        cfg.intermediate_size = 128;
+        cfg.moe_intermediate_size = 32;
+        cfg.num_hidden_layers = 2;
+        cfg.num_attention_heads = 4;
+        cfg.num_key_value_heads = 4;
+        cfg.first_k_dense_replace = 1;
+        cfg.n_routed_experts = 8;
+        cfg.n_shared_experts = 1;
+        cfg.num_experts_per_tok = 2;
+        cfg.norm_topk_prob = true;
+        cfg.sliding_window = 8;
+        cfg.max_position_embeddings = 256;
+        cfg.projector_input_dim = 2048;
+        cfg.projector_n_embed = 64;
+
+        EngineConfig ecfg;
+        ecfg.memory_pool_bytes = 1 << 20;
+        ecfg.max_seq_len = 64;
+        ecfg.max_batch_size = 4;
+        ecfg.min_batch_size = 1;
+        ecfg.use_int4_experts = false;
+        ecfg.no_repeat_ngram_size = 0;
+        ecfg.use_cuda_graph = true;
+
+        DecoderWeights w = DecoderWeights::random(cfg, 31337);
+        std::vector<std::vector<int>> prompts = {
+            {1, 2, 3, 4, 5}, {6, 7, 8, 9, 10, 11}, {1, 2, 3}, {4, 5, 6, 7, 8, 9, 10}};
+
+        Engine gpu_seq(cfg, ecfg, w, Backend::CUDA);
+        Engine gpu_batch(cfg, ecfg, w, Backend::CUDA);
+        Engine cpu(cfg, ecfg, w, Backend::CPU);
+
+        std::vector<int> seq_flatten, batch_flatten, cpu_flatten;
+        for (const auto& p : prompts) {
+            auto rs = gpu_seq.generate(p, 6);
+            for (int t : rs.tokens) seq_flatten.push_back(t);
+            seq_flatten.push_back(-1);
+        }
+        auto rb = gpu_batch.generate_batch(prompts, 6);
+        bool order_ok = true;
+        for (std::size_t i = 0; i < prompts.size(); ++i) {
+            if (rb[i].prefill_tokens != static_cast<int>(prompts[i].size())) order_ok = false;
+            for (int t : rb[i].tokens) batch_flatten.push_back(t);
+            batch_flatten.push_back(-1);
+        }
+        for (const auto& p : prompts) {
+            auto rc = cpu.generate(p, 6);
+            for (int t : rc.tokens) cpu_flatten.push_back(t);
+            cpu_flatten.push_back(-1);
+        }
+        const bool same_seq = seq_flatten == batch_flatten;
+        const bool same_cpu = cpu_flatten == batch_flatten;
+        std::printf("Engine batch (%zu prompts):", prompts.size());
+        for (std::size_t i = 0; i < rb.size(); ++i) {
+            std::printf(" [");
+            for (int t : rb[i].tokens) std::printf("%d ", t);
+            std::printf("]");
+        }
+        std::printf("\n");
+        std::printf("  batch_vs_sequential=%s batch_vs_cpu=%s order=%s %s\n",
+                    same_seq ? "OK" : "DIFF", same_cpu ? "OK" : "DIFF", order_ok ? "OK" : "BAD",
+                    (same_seq && same_cpu && order_ok) ? "OK" : "FAIL");
+        if (!same_seq || !order_ok) ++failures;
+    }
+
     std::printf("%s\n", failures == 0 ? "all CUDA tests passed" : "CUDA tests FAILED");
     return failures == 0 ? 0 : 1;
 }
