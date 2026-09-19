@@ -493,18 +493,22 @@ int main() {
         MoEDecoder cpu(cfg, w);
         cuda::GpuDecoder g_plain(cfg, w);
         cuda::GpuDecoder g_graph(cfg, w);
+        cuda::GpuDecoder g_attn(cfg, w);
         g_plain.set_use_graph(false);
         g_graph.set_use_graph(true);
+        g_attn.set_use_graph(true);
+        g_attn.set_graph_scope(cuda::GpuDecoder::GraphScope::kAttnDense);
 
         std::vector<int> prompt(6);
         for (int i = 0; i < 6; ++i) prompt[i] = i + 1;
 
         RSWACache cache(cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim(),
                         cfg.sliding_window);
-        std::vector<float> cpu_logits, p_logits, q_logits;
+        std::vector<float> cpu_logits, p_logits, q_logits, a_logits;
         cpu.prefill(cache, prompt, 0, cpu_logits);
         g_plain.prefill_tokens(prompt, p_logits);
         g_graph.prefill_tokens(prompt, q_logits);
+        g_attn.prefill_tokens(prompt, a_logits);
 
         auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
             double num = 0, den = 0;
@@ -517,7 +521,7 @@ int main() {
         };
 
         int pos = static_cast<int>(prompt.size());
-        float worst = 0.0f, worst_cpu = 0.0f;
+        float worst = 0.0f, worst_cpu = 0.0f, worst_attn = 0.0f;
         const int steps = 20;  // P+W = 10: warmup, ring fill and wrap
         for (int step = 0; step < steps; ++step) {
             int tok = 0;
@@ -527,18 +531,21 @@ int main() {
             cpu.decode(cache, tok, pos, cpu_logits);
             g_plain.decode_token(tok, pos, p_logits);
             g_graph.decode_token(tok, pos, q_logits);
+            g_attn.decode_token(tok, pos, a_logits);
             ++pos;
             const float gd = static_cast<float>(rel(q_logits, p_logits));
             const float cd = static_cast<float>(rel(q_logits, cpu_logits));
+            const float ad = static_cast<float>(rel(a_logits, p_logits));
             worst = std::max(worst, gd);
             worst_cpu = std::max(worst_cpu, cd);
-            if (gd > 0.05f || cd > 0.05f) ++failures;
+            worst_attn = std::max(worst_attn, ad);
+            if (gd > 0.05f || cd > 0.05f || ad > 0.05f) ++failures;
         }
         std::printf("GpuDecoder graph decode (%d steps, W=%d): graph_vs_plain rel_l2=%.5f "
-                    "graph_vs_cpu rel_l2=%.5f %s\n",
-                    steps, cfg.sliding_window, worst, worst_cpu,
-                    (worst <= 0.05f && worst_cpu <= 0.05f) ? "OK" : "FAIL");
-        if (!g_graph.graph_ready()) {
+                    "graph_vs_cpu rel_l2=%.5f attn_dense_vs_plain rel_l2=%.5f %s\n",
+                    steps, cfg.sliding_window, worst, worst_cpu, worst_attn,
+                    (worst <= 0.05f && worst_cpu <= 0.05f && worst_attn <= 0.05f) ? "OK" : "FAIL");
+        if (!g_graph.graph_ready() || !g_attn.graph_ready()) {
             std::printf("  FAIL: graph was not captured\n");
             ++failures;
         }

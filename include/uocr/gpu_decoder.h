@@ -39,12 +39,20 @@ public:
     void prefill_embeds(const float* host_embeds, int seq, std::vector<float>& logits);
     void decode_token(int token, int pos, std::vector<float>& logits);
 
+    // CUDA-Graph capture scope for the decode step.
+    enum class GraphScope {
+        kFull,        // attention + dense + MoE all inside one captured graph
+        kAttnDense,   // only attention/dense subgraphs captured; MoE issued outside
+    };
+
     // Enable the CUDA-Graph decode path.  Routing moves to the device and the
     // steady decode step is captured once, then replayed.  Requires a CUDA
     // device and is a no-op elsewhere.
     void set_use_graph(bool v) { use_graph_ = v; }
     bool use_graph() const { return use_graph_; }
     bool graph_ready() const { return graph_ready_; }
+    void set_graph_scope(GraphScope s) { graph_scope_ = s; }
+    GraphScope graph_scope() const { return graph_scope_; }
 
     const ModelConfig& config() const { return cfg_; }
 
@@ -75,6 +83,13 @@ private:
                  float* out_dev, cudaStream_t stream);
     void layer_forward(int li, const float* x, int seq, const int* positions, bool prefill,
                        int q_start, float* out, cudaStream_t stream);
+    // Split layer pieces, used by both the full forward and the graph-scope
+    // variants.  attention_block writes h1 / normed2; mlp_block turns those
+    // into the layer output.
+    void attention_block(int li, const float* x, int seq, const int* positions, bool prefill,
+                         int q_start, float* h1, float* normed2, cudaStream_t stream);
+    void mlp_block(int li, const float* h1, const float* normed2, int seq, bool dev_moe, float* out,
+                   cudaStream_t stream);
     void ensure_scratch(int seq);
     void ensure_router_scratch(int seq);
     void final_logits(const float* hidden_dev, int seq, std::vector<float>& logits);
@@ -83,7 +98,9 @@ private:
     // CUDA-Graph decode path.
     void invalidate_graph();
     void capture_decode_graph();
+    void capture_attn_dense_graphs();
     void run_graph_decode(int token, int pos, std::vector<float>& logits);
+    void run_graph_decode_attn_dense(int token, int pos, std::vector<float>& logits);
 
     ModelConfig cfg_;
     const DecoderWeights* host_weights_ = nullptr;
@@ -116,10 +133,13 @@ private:
     // CUDA-Graph state
     bool use_graph_ = false;
     bool graph_ready_ = false;
+    GraphScope graph_scope_ = GraphScope::kFull;
     int graph_prefill_len_ = -1;
     cudaStream_t stream_ = nullptr;
     cudaGraph_t graph_ = nullptr;
     cudaGraphExec_t graph_exec_ = nullptr;
+    std::vector<cudaGraph_t> attn_graphs_;
+    std::vector<cudaGraphExec_t> attn_graph_execs_;
     float* h_embed_pinned_ = nullptr;
     int* h_pos_pinned_ = nullptr;
 };

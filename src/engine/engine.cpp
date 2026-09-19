@@ -40,6 +40,8 @@ Engine::Engine(ModelConfig mcfg, EngineConfig ecfg, DecoderWeights weights, Back
     if (backend_ == Backend::CUDA) {
         gpu_decoder_ = std::make_unique<cuda::GpuDecoder>(mcfg_, weights_);
         gpu_decoder_->set_use_graph(ecfg_.use_cuda_graph);
+        if (ecfg_.graph_scope == "attn_dense")
+            gpu_decoder_->set_graph_scope(cuda::GpuDecoder::GraphScope::kAttnDense);
     }
 #endif
     UOCR_INFO("engine created (%s backend)", backend_ == Backend::CUDA ? "CUDA" : "CPU");

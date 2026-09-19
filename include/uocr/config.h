@@ -96,6 +96,10 @@ struct EngineConfig {
 
     // execution
     bool use_cuda_graph = true;
+    // CUDA-Graph capture scope: "full" captures the whole decode step (device
+    // routing + fused expert kernel); "attn_dense" captures only the attention
+    // subgraphs and issues the MoE outside the graph (ablation).
+    std::string graph_scope = "full";
     bool use_int4_experts = true;
     int int4_group_size = 128;
 
