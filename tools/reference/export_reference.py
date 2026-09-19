@@ -105,9 +105,13 @@ def run_decoder(args, model):
         tok = int(torch.argmax(logits).item())
         cur = torch.tensor([[tok]], dtype=torch.long, device=model.device)
         gate_out.clear()
+        # Pass explicit (increasing) position_ids: the direct forward would
+        # otherwise derive them from the ring cache length, which stops growing
+        # once the ring is full (real `generate` uses the growing mask instead).
+        pos_ids = torch.tensor([[pos]], dtype=torch.long, device=model.device)
         with torch.no_grad():
             out = model(input_ids=cur, past_key_values=cache, use_cache=True,
-                        output_hidden_states=True, return_dict=True)
+                        position_ids=pos_ids, output_hidden_states=True, return_dict=True)
         if step < 2:
             save_routers(f"decode{step}")
         cache = out.past_key_values
@@ -348,9 +352,10 @@ def run_ocr(args, model):
         tokid = int(torch.argmax(logits).item())
         all_ids.append(tokid)
         cur = torch.tensor([[tokid]], dtype=torch.long, device=model.device)
+        pos_ids = torch.tensor([[pos]], dtype=torch.long, device=model.device)
         with torch.no_grad():
             res = model(input_ids=cur, past_key_values=cache, use_cache=True,
-                        output_hidden_states=True, return_dict=True)
+                        position_ids=pos_ids, output_hidden_states=True, return_dict=True)
         cache = res.past_key_values
         manifest["tensors"][f"decode_token_{step}"] = save_np(
             out, f"decode_token_{step}", torch.tensor([tokid]))

@@ -109,10 +109,12 @@ int main(int argc, char** argv) {
     std::string model_dir = "models";
     std::string ref_dir = "/tmp/opencode/ref_decoder";
     bool show = false;
+    bool bf16 = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--model") && i + 1 < argc) model_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--ref") && i + 1 < argc) ref_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--traces")) show = true;
+        else if (!std::strcmp(argv[i], "--bf16")) bf16 = true;
     }
 
     std::ifstream mf(ref_dir + "/manifest.json");
@@ -129,6 +131,8 @@ int main(int argc, char** argv) {
     DecoderWeights weights = DecoderWeights::load(
         model_dir + "/model-00001-of-000001.safetensors", cfg, false, 128);
     MoEDecoder dec(cfg, weights);
+    dec.set_bf16_rounding(bf16);
+    std::printf("bf16 activation rounding: %s\n", bf16 ? "on" : "off");
 
     // ---- prefill ----
     const int seq = manifest.at("seq").get<int>();
@@ -205,6 +209,8 @@ int main(int argc, char** argv) {
     std::printf("\n== decode steps ==\n");
     const json& steps = manifest.at("decode_steps");
     int pos = seq;
+    double worst_dec_hidden = 0, worst_dec_logits = 0;
+    std::size_t worst_dec_step = 0;
     for (std::size_t s = 0; s < steps.size(); ++s) {
         const int tok = steps[s].at("token").get<int>();
         Tensor in = dec.embed({tok});
@@ -219,6 +225,8 @@ int main(int argc, char** argv) {
         Diff dh = diff(tr.back().data(), refh.data(), static_cast<i64>(refh.size()));
         std::vector<float> refl = load_bin(ref_dir, tensors.at("decode_logits_" + std::to_string(s)));
         Diff dl = diff(lg.data(), refl.data(), static_cast<i64>(refl.size()));
+        if (dh.rel_l2 > worst_dec_hidden) { worst_dec_hidden = dh.rel_l2; worst_dec_step = s; }
+        worst_dec_logits = std::max(worst_dec_logits, dl.rel_l2);
         std::printf("  step %zu tok=%6d pos=%3d  hidden rel_l2=%.5f max_abs=%.4f | "
                     "logits rel_l2=%.5f\n",
                     s, tok, steps[s].at("position").get<int>(), dh.rel_l2, dh.max_abs, dl.rel_l2);
@@ -229,6 +237,36 @@ int main(int argc, char** argv) {
                         rd.total, rd.set_mismatch, rd.weight_max_abs);
         }
         dec.clear_router_trace();
+    }
+    std::printf("== decode worst: hidden rel_l2=%.5f (step %zu), logits rel_l2=%.5f\n",
+                worst_dec_hidden, worst_dec_step, worst_dec_logits);
+
+    // ---- final cache comparison (ring wraparound) ----
+    if (tensors.contains("final_k_0")) {
+        const int kv_heads = cfg.num_key_value_heads;
+        const int hd = cfg.head_dim();
+        double worst_k = 0, worst_v = 0;
+        for (int li = 0; li < cfg.num_hidden_layers; ++li) {
+            for (int which = 0; which < 2; ++which) {
+                std::vector<float> ref = load_bin(
+                    ref_dir, tensors.at((which ? "final_v_" : "final_k_") + std::to_string(li)));
+                const int len = static_cast<int>(ref.size()) / (kv_heads * hd);
+                std::vector<float> ours(static_cast<std::size_t>(len) * kv_heads * hd);
+                const float* cc = which ? cache.values(li) : cache.keys(li);
+                for (int t = 0; t < len; ++t)
+                    for (int h = 0; h < kv_heads; ++h)
+                        for (int d = 0; d < hd; ++d)
+                            ours[(static_cast<std::size_t>(h) * len + t) * hd + d] =
+                                cc[(static_cast<std::size_t>(t) * kv_heads + h) * hd + d];
+                Diff d = diff(ours.data(), ref.data(), static_cast<i64>(ref.size()));
+                if (which)
+                    worst_v = std::max(worst_v, d.rel_l2);
+                else
+                    worst_k = std::max(worst_k, d.rel_l2);
+            }
+        }
+        std::printf("== final cache: worst K rel_l2=%.5f, worst V rel_l2=%.5f (len=%d)\n",
+                    worst_k, worst_v, cache.len(0));
     }
 
     return 0;

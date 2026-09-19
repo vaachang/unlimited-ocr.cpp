@@ -34,6 +34,12 @@ void rmsnorm_rows(const float* x, const float* w, float* out, int rows, int cols
     ops::rmsnorm(x, w, out, rows, cols, eps);
 }
 
+// Round a buffer to bf16 precision (round-to-nearest-even), emulating the
+// reference's bf16 autocast activations.
+void round_bf16(float* p, i64 n) {
+    for (i64 i = 0; i < n; ++i) p[i] = bf16_to_f32(f32_to_bf16(p[i]));
+}
+
 }  // namespace
 
 void MoEDecoder::mlp_forward(const MLPWeights& mlp, const Tensor& x, Tensor& out) {
@@ -148,6 +154,7 @@ void MoEDecoder::layer_forward(int layer_idx, const Tensor& x, const std::vector
     Tensor normed2({seq, hidden});
     rmsnorm_rows(h1.data(), L.post_attention_layernorm.data(), normed2.data(), seq, hidden,
                  cfg_.rms_norm_eps);
+    if (bf16_rounding_) round_bf16(normed2.data(), normed2.numel());
 
     Tensor mlp_out;
     if (L.is_moe)

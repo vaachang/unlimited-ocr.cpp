@@ -62,6 +62,12 @@ public:
     void clear_router_trace() { router_trace_.clear(); }
     void set_trace_router(bool v) { trace_router_ = v; }
 
+    // Round the MLP/MoE block input (post_attention_layernorm output) to bf16,
+    // emulating the reference gate's `hidden_states.type(torch.float32)` on a
+    // bf16 autocast activation.  Off by default; experiments show it does not
+    // measurably reduce router flips (see ALIGNMENT.md 5.2).
+    void set_bf16_rounding(bool v) { bf16_rounding_ = v; }
+
 private:
     void layer_forward(int layer_idx, const Tensor& x, const std::vector<int>& positions,
                        RSWACache& cache, bool prefill, int q_start, Tensor& out);
@@ -75,6 +81,7 @@ private:
     // scratch buffers (reused between calls to avoid allocations)
     mutable std::vector<float> scratch_;
     bool trace_router_ = false;
+    bool bf16_rounding_ = false;
     std::vector<std::vector<RouterTrace>> router_trace_;
 };
 

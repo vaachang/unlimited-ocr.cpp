@@ -61,6 +61,7 @@ public:
                    int heads, bool causal) const;
 
     // Raw accessors (used by tests / CUDA upload).
+    int len(int layer) const { return len_[layer]; }
     const float* keys(int layer) const { return k_[layer].data(); }
     const float* values(int layer) const { return v_[layer].data(); }
     float* mutable_keys(int layer) { return k_[layer].data(); }
