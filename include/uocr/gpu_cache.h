@@ -38,6 +38,15 @@ public:
     // Append/overwrite one decode token (device K/V of [kv_heads, head_dim]).
     void append_decode(int layer, const float* d_k, const float* d_v, cudaStream_t stream = 0);
 
+    // Device-resident variant used by the CUDA-Graph path.  `len` and the ring
+    // cursor live on the device, so a captured append kernel resolves its write
+    // slot at replay time.  `reset_device_state` initialises them for a prefill
+    // of `prefill_len`; `len_dev` is fed to `rswa_attention_devlen`.
+    void reset_device_state(int prefill_len, cudaStream_t stream = 0);
+    void append_decode_device(int layer, const float* d_k, const float* d_v,
+                              cudaStream_t stream = 0);
+    const int* len_dev(int layer) const { return d_len_ + layer; }
+
     // q/out: device [seq, heads, head_dim].
     void attention(int layer, const float* d_q, int seq, int q_start, float* d_out, int heads,
                    bool causal, cudaStream_t stream = 0) const;
@@ -57,6 +66,8 @@ private:
     std::vector<float*> k_, v_;
     std::vector<int> len_, ring_pos_;
     std::vector<char> ring_started_;
+    int* d_len_ = nullptr;       // [num_layers]
+    int* d_ring_pos_ = nullptr;  // [num_layers]
     bool configured_ = false;
 };
 

@@ -124,6 +124,7 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
         src/kernels/cuda/moe_gemm_int4.cu
         src/kernels/cuda/gpu_ops.cu
         src/kernels/cuda/gpu_cache.cu
+        src/kernels/cuda/moe_device.cu
         src/kernels/cuda/backend.cu
         src/engine/gpu_decoder.cu)
     target_link_libraries(uocr_core PUBLIC CUDA::cudart)

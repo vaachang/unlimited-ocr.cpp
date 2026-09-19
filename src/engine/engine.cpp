@@ -37,8 +37,10 @@ Engine::Engine(ModelConfig mcfg, EngineConfig ecfg, DecoderWeights weights, Back
     scheduler_ = std::make_unique<ContinuousBatchScheduler>(ecfg_.max_batch_size, ecfg_.min_batch_size);
     sampler_ = std::make_unique<Sampler>(SamplingParams{ecfg_.temperature, ecfg_.top_p, ecfg_.top_k});
 #if defined(UOCR_CUDA_ENABLED)
-    if (backend_ == Backend::CUDA)
+    if (backend_ == Backend::CUDA) {
         gpu_decoder_ = std::make_unique<cuda::GpuDecoder>(mcfg_, weights_);
+        gpu_decoder_->set_use_graph(ecfg_.use_cuda_graph);
+    }
 #endif
     UOCR_INFO("engine created (%s backend)", backend_ == Backend::CUDA ? "CUDA" : "CPU");
 }

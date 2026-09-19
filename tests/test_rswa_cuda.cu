@@ -469,6 +469,81 @@ int main() {
         if (!same) ++failures;
     }
 
+    // ---- CUDA Graph decode vs non-graph decode across the ring overwrite ----
+    {
+        ModelConfig cfg;
+        cfg.vocab_size = 256;
+        cfg.hidden_size = 64;
+        cfg.intermediate_size = 128;
+        cfg.moe_intermediate_size = 32;
+        cfg.num_hidden_layers = 2;
+        cfg.num_attention_heads = 4;
+        cfg.num_key_value_heads = 4;
+        cfg.first_k_dense_replace = 1;
+        cfg.n_routed_experts = 4;
+        cfg.n_shared_experts = 1;
+        cfg.num_experts_per_tok = 2;
+        cfg.norm_topk_prob = true;
+        cfg.sliding_window = 4;  // tiny window: ring wraps quickly
+        cfg.max_position_embeddings = 256;
+        cfg.projector_input_dim = 2048;
+        cfg.projector_n_embed = 64;
+
+        DecoderWeights w = DecoderWeights::random(cfg, 2024);
+        MoEDecoder cpu(cfg, w);
+        cuda::GpuDecoder g_plain(cfg, w);
+        cuda::GpuDecoder g_graph(cfg, w);
+        g_plain.set_use_graph(false);
+        g_graph.set_use_graph(true);
+
+        std::vector<int> prompt(6);
+        for (int i = 0; i < 6; ++i) prompt[i] = i + 1;
+
+        RSWACache cache(cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim(),
+                        cfg.sliding_window);
+        std::vector<float> cpu_logits, p_logits, q_logits;
+        cpu.prefill(cache, prompt, 0, cpu_logits);
+        g_plain.prefill_tokens(prompt, p_logits);
+        g_graph.prefill_tokens(prompt, q_logits);
+
+        auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+            double num = 0, den = 0;
+            for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+                const double e = static_cast<double>(a[i]) - b[i];
+                num += e * e;
+                den += static_cast<double>(b[i]) * b[i];
+            }
+            return std::sqrt(num / (den + 1e-30));
+        };
+
+        int pos = static_cast<int>(prompt.size());
+        float worst = 0.0f, worst_cpu = 0.0f;
+        const int steps = 20;  // P+W = 10: warmup, ring fill and wrap
+        for (int step = 0; step < steps; ++step) {
+            int tok = 0;
+            float best = -1e30f;
+            for (std::size_t i = 0; i < cpu_logits.size(); ++i)
+                if (cpu_logits[i] > best) { best = cpu_logits[i]; tok = static_cast<int>(i); }
+            cpu.decode(cache, tok, pos, cpu_logits);
+            g_plain.decode_token(tok, pos, p_logits);
+            g_graph.decode_token(tok, pos, q_logits);
+            ++pos;
+            const float gd = static_cast<float>(rel(q_logits, p_logits));
+            const float cd = static_cast<float>(rel(q_logits, cpu_logits));
+            worst = std::max(worst, gd);
+            worst_cpu = std::max(worst_cpu, cd);
+            if (gd > 0.05f || cd > 0.05f) ++failures;
+        }
+        std::printf("GpuDecoder graph decode (%d steps, W=%d): graph_vs_plain rel_l2=%.5f "
+                    "graph_vs_cpu rel_l2=%.5f %s\n",
+                    steps, cfg.sliding_window, worst, worst_cpu,
+                    (worst <= 0.05f && worst_cpu <= 0.05f) ? "OK" : "FAIL");
+        if (!g_graph.graph_ready()) {
+            std::printf("  FAIL: graph was not captured\n");
+            ++failures;
+        }
+    }
+
     std::printf("%s\n", failures == 0 ? "all CUDA tests passed" : "CUDA tests FAILED");
     return failures == 0 ? 0 : 1;
 }

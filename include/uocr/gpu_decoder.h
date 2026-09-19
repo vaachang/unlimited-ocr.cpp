@@ -39,6 +39,13 @@ public:
     void prefill_embeds(const float* host_embeds, int seq, std::vector<float>& logits);
     void decode_token(int token, int pos, std::vector<float>& logits);
 
+    // Enable the CUDA-Graph decode path.  Routing moves to the device and the
+    // steady decode step is captured once, then replayed.  Requires a CUDA
+    // device and is a no-op elsewhere.
+    void set_use_graph(bool v) { use_graph_ = v; }
+    bool use_graph() const { return use_graph_; }
+    bool graph_ready() const { return graph_ready_; }
+
     const ModelConfig& config() const { return cfg_; }
 
 private:
@@ -57,15 +64,26 @@ private:
         std::uint16_t* router = nullptr;  // [n_experts, hidden]
         std::vector<DevLinear> experts;   // each .w is one expert matrix
         DevLinear shared_gate, shared_up, shared_down;
+        // Device arrays of per-expert weight pointers for the fused kernel.
+        const std::uint16_t** gate_ptrs = nullptr;
+        const std::uint16_t** up_ptrs = nullptr;
+        const std::uint16_t** down_ptrs = nullptr;
     };
 
     void upload_linear(const Linear& src, DevLinear& dst);
     void forward(const float* x_dev, int seq, const int* positions_dev, bool prefill, int q_start,
-                 float* out_dev);
+                 float* out_dev, cudaStream_t stream);
     void layer_forward(int li, const float* x, int seq, const int* positions, bool prefill,
-                       int q_start, float* out);
+                       int q_start, float* out, cudaStream_t stream);
     void ensure_scratch(int seq);
+    void ensure_router_scratch(int seq);
     void final_logits(const float* hidden_dev, int seq, std::vector<float>& logits);
+    void final_logits_from_normed(std::vector<float>& logits);
+
+    // CUDA-Graph decode path.
+    void invalidate_graph();
+    void capture_decode_graph();
+    void run_graph_decode(int token, int pos, std::vector<float>& logits);
 
     ModelConfig cfg_;
     const DecoderWeights* host_weights_ = nullptr;
@@ -85,6 +103,25 @@ private:
     float* d_pong_ = nullptr;
     float* d_normed_ = nullptr;
     float* d_hidden_ = nullptr;
+
+    // device router scratch
+    int* d_router_ids_ = nullptr;
+    float* d_router_w_ = nullptr;
+    int* d_assign_token_ = nullptr;
+    float* d_assign_w_ = nullptr;
+    int* d_count_ = nullptr;
+    int router_seq_ = 0;
+    int router_cap_ = 0;
+
+    // CUDA-Graph state
+    bool use_graph_ = false;
+    bool graph_ready_ = false;
+    int graph_prefill_len_ = -1;
+    cudaStream_t stream_ = nullptr;
+    cudaGraph_t graph_ = nullptr;
+    cudaGraphExec_t graph_exec_ = nullptr;
+    float* h_embed_pinned_ = nullptr;
+    int* h_pos_pinned_ = nullptr;
 };
 
 }  // namespace cuda

@@ -18,11 +18,14 @@ template <int MAX_HD>
 __global__ void rswa_decode_kernel(const float* __restrict__ q, const float* __restrict__ kcache,
                                    const float* __restrict__ vcache, int kv_len, int heads,
                                    int kv_heads, int head_dim, float scale,
-                                   float* __restrict__ out) {
+                                   float* __restrict__ out, const int* __restrict__ d_len) {
     const int head = blockIdx.x;
     const int tid = threadIdx.x;
     const int group = heads / kv_heads;
     const int kvh = head / group;
+    // The effective length is either baked at capture time (d_len == nullptr) or
+    // read on device so a captured graph can replay across the warmup boundary.
+    if (d_len != nullptr) kv_len = *d_len;
 
     __shared__ float q_sh[MAX_HD];
     __shared__ float acc[MAX_HD];
@@ -168,13 +171,69 @@ void rswa_attention_decode(const float* q, const float* kcache, const float* vca
     const int threads = 256;
     if (head_dim <= 64)
         rswa_decode_kernel<64><<<heads, threads, 0, stream>>>(q, kcache, vcache, kv_len, heads,
-                                                              kv_heads, head_dim, scale, out);
+                                                              kv_heads, head_dim, scale, out,
+                                                              nullptr);
     else if (head_dim <= 128)
         rswa_decode_kernel<128><<<heads, threads, 0, stream>>>(q, kcache, vcache, kv_len, heads,
-                                                               kv_heads, head_dim, scale, out);
+                                                               kv_heads, head_dim, scale, out,
+                                                               nullptr);
     else
         rswa_decode_kernel<256><<<heads, threads, 0, stream>>>(q, kcache, vcache, kv_len, heads,
-                                                               kv_heads, head_dim, scale, out);
+                                                               kv_heads, head_dim, scale, out,
+                                                               nullptr);
+}
+
+void rswa_attention_devlen(const float* q, const float* kcache, const float* vcache,
+                           const int* d_len, int seq, int q_start, int heads, int kv_heads,
+                           int head_dim, bool causal, float* out, cudaStream_t stream) {
+    const float scale = rsqrtf(static_cast<float>(head_dim));
+    const int threads = 256;
+    const int blocks = seq * heads;
+    if (head_dim <= 64)
+        rswa_decode_kernel<64><<<blocks, threads, 0, stream>>>(q, kcache, vcache, 0, heads,
+                                                               kv_heads, head_dim, scale, out,
+                                                               d_len);
+    else if (head_dim <= 128)
+        rswa_decode_kernel<128><<<blocks, threads, 0, stream>>>(q, kcache, vcache, 0, heads,
+                                                                kv_heads, head_dim, scale, out,
+                                                                d_len);
+    else
+        rswa_decode_kernel<256><<<blocks, threads, 0, stream>>>(q, kcache, vcache, 0, heads,
+                                                                kv_heads, head_dim, scale, out,
+                                                                d_len);
+}
+
+namespace {
+
+// Single block writes one row of K/V and advances the device ring pointer.
+__global__ void rswa_append_kernel(const float* __restrict__ k, const float* __restrict__ v,
+                                   float* __restrict__ kcache, float* __restrict__ vcache,
+                                   int* __restrict__ d_len, int* __restrict__ d_ring_pos,
+                                   int prefill_len, int window, int stride) {
+    int len = *d_len;
+    int slot;
+    if (len < prefill_len + window) {
+        slot = len;
+        *d_len = len + 1;
+        if (len + 1 >= prefill_len + window) *d_ring_pos = 0;
+    } else {
+        slot = prefill_len + *d_ring_pos;
+        *d_ring_pos = (*d_ring_pos + 1) % window;
+    }
+    for (int i = threadIdx.x; i < stride; i += blockDim.x) {
+        kcache[static_cast<std::size_t>(slot) * stride + i] = k[i];
+        vcache[static_cast<std::size_t>(slot) * stride + i] = v[i];
+    }
+}
+
+}  // namespace
+
+void rswa_append_decode(const float* k, const float* v, float* kcache, float* vcache, int* d_len,
+                        int* d_ring_pos, int prefill_len, int window, int kv_heads, int head_dim,
+                        cudaStream_t stream) {
+    const int stride = kv_heads * head_dim;
+    rswa_append_kernel<<<1, 256, 0, stream>>>(k, v, kcache, vcache, d_len, d_ring_pos, prefill_len,
+                                              window, stride);
 }
 
 }  // namespace cuda

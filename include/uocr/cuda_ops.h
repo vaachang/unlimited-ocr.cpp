@@ -47,6 +47,39 @@ void rswa_attention(const float* q, const float* kcache, const float* vcache, in
                     int q_start, int heads, int kv_heads, int head_dim, bool causal, float* out,
                     cudaStream_t stream = 0);
 
+// Device-length aware decode attention: the effective length is read from
+// `d_len` at kernel execution time and slots >= *d_len are masked out.  This
+// keeps a single captured graph valid across the warmup -> ring transition.
+// q/out: [seq, heads, head_dim].
+void rswa_attention_devlen(const float* q, const float* kcache, const float* vcache,
+                           const int* d_len, int seq, int q_start, int heads, int kv_heads,
+                           int head_dim, bool causal, float* out, cudaStream_t stream = 0);
+
+// Device-side R-SWA append.  Advances a device-resident `len` / `ring_pos`
+// pair so the recorded kernel sequence is replayable inside a CUDA Graph
+// (the write slot is resolved on device, not baked at capture time).
+void rswa_append_decode(const float* k, const float* v, float* kcache, float* vcache, int* d_len,
+                        int* d_ring_pos, int prefill_len, int window, int kv_heads, int head_dim,
+                        cudaStream_t stream = 0);
+
+// MoE router on device: softmax/sigmoid -> greedy top-k -> per-expert grouping.
+// `d_ids` / `d_weights` are [seq, top_k]; `d_assign_token` / `d_assign_w` are
+// [n_experts, cap] and `d_count` is [n_experts] (must be zeroed by the caller).
+void moe_router_topk(const float* router_logits, int seq, int n_experts, int top_k,
+                     bool norm_topk_prob, float routed_scaling_factor, bool scoring_sigmoid,
+                     int* d_ids, float* d_weights, int* d_assign_token, float* d_assign_w,
+                     int* d_count, int cap, cudaStream_t stream = 0);
+
+// Fused "all experts, masked skip" MLP.  Grid = n_experts: each block loops
+// over the tokens assigned to its expert (at most `cap`) and scatter-adds the
+// weighted expert output into `out` [seq, hidden].  Gate/up/down weight tables
+// are device pointer arrays of length n_experts.
+void moe_experts_masked(const float* x, int seq, const std::uint16_t* const* gate_w,
+                        const std::uint16_t* const* up_w, const std::uint16_t* const* down_w,
+                        const int* assign_token, const float* assign_w, const int* count,
+                        int n_experts, int cap, int hidden, int inter, float* out,
+                        cudaStream_t stream = 0);
+
 // MoE INT4 GEMM: y[m,n] = x[m,k] * dequant(W_int4[n,k]); W is packed 2-per-byte
 // with per-group affine scale/zero.  Scalar reference (correctness baseline).
 void moe_gemm_int4(const float* x, const std::uint8_t* packed, const float* scales,

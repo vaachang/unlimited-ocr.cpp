@@ -109,11 +109,28 @@ GpuDecoder::GpuDecoder(ModelConfig cfg, const DecoderWeights& weights)
             cu_check(cudaMemcpy(dl.router, router.data(), router.size() * sizeof(std::uint16_t),
                                 cudaMemcpyHostToDevice), "router copy");
             dl.experts.resize(static_cast<std::size_t>(cfg_.n_routed_experts) * 3);
+            std::vector<const std::uint16_t*> gp(cfg_.n_routed_experts);
+            std::vector<const std::uint16_t*> up(cfg_.n_routed_experts);
+            std::vector<const std::uint16_t*> dp(cfg_.n_routed_experts);
             for (int e = 0; e < cfg_.n_routed_experts; ++e) {
                 upload_linear(lw.experts[e].gate, dl.experts[static_cast<std::size_t>(e) * 3 + 0]);
                 upload_linear(lw.experts[e].up, dl.experts[static_cast<std::size_t>(e) * 3 + 1]);
                 upload_linear(lw.experts[e].down, dl.experts[static_cast<std::size_t>(e) * 3 + 2]);
+                gp[e] = dl.experts[static_cast<std::size_t>(e) * 3 + 0].w;
+                up[e] = dl.experts[static_cast<std::size_t>(e) * 3 + 1].w;
+                dp[e] = dl.experts[static_cast<std::size_t>(e) * 3 + 2].w;
             }
+            const std::size_t pbytes =
+                static_cast<std::size_t>(cfg_.n_routed_experts) * sizeof(std::uint16_t*);
+            cu_check(cudaMalloc(reinterpret_cast<void**>(&dl.gate_ptrs), pbytes), "gate_ptrs");
+            cu_check(cudaMalloc(reinterpret_cast<void**>(&dl.up_ptrs), pbytes), "up_ptrs");
+            cu_check(cudaMalloc(reinterpret_cast<void**>(&dl.down_ptrs), pbytes), "down_ptrs");
+            cu_check(cudaMemcpy(dl.gate_ptrs, gp.data(), pbytes, cudaMemcpyHostToDevice),
+                     "gate_ptrs copy");
+            cu_check(cudaMemcpy(dl.up_ptrs, up.data(), pbytes, cudaMemcpyHostToDevice),
+                     "up_ptrs copy");
+            cu_check(cudaMemcpy(dl.down_ptrs, dp.data(), pbytes, cudaMemcpyHostToDevice),
+                     "down_ptrs copy");
             upload_linear(lw.shared.gate, dl.shared_gate);
             upload_linear(lw.shared.up, dl.shared_up);
             upload_linear(lw.shared.down, dl.shared_down);
@@ -122,6 +139,12 @@ GpuDecoder::GpuDecoder(ModelConfig cfg, const DecoderWeights& weights)
     cu_check(cudaMalloc(&final_norm_, h * sizeof(float)), "final_norm");
     cu_check(cudaMemcpy(final_norm_, weights.final_norm.data(), h * sizeof(float),
                         cudaMemcpyHostToDevice), "final_norm copy");
+    cu_check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream");
+    cu_check(cudaMallocHost(&h_embed_pinned_, static_cast<std::size_t>(h) * sizeof(float)),
+             "pinned embed");
+    cu_check(cudaMallocHost(&h_pos_pinned_, sizeof(int)), "pinned pos");
+    *h_pos_pinned_ = 0;
+    for (int i = 0; i < h; ++i) h_embed_pinned_[i] = 0.0f;
 }
 
 GpuDecoder::~GpuDecoder() {
@@ -154,6 +177,9 @@ GpuDecoder::~GpuDecoder() {
         f(L.shared_up.bias);
         f(L.shared_down.w);
         f(L.shared_down.bias);
+        f(const_cast<std::uint16_t**>(L.gate_ptrs));
+        f(const_cast<std::uint16_t**>(L.up_ptrs));
+        f(const_cast<std::uint16_t**>(L.down_ptrs));
     }
     f(final_norm_);
     f(scratch_);
@@ -165,6 +191,16 @@ GpuDecoder::~GpuDecoder() {
     f(d_pong_);
     f(d_normed_);
     f(d_hidden_);
+    f(d_router_ids_);
+    f(d_router_w_);
+    f(d_assign_token_);
+    f(d_assign_w_);
+    f(d_count_);
+    if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
+    if (graph_) cudaGraphDestroy(graph_);
+    if (stream_) cudaStreamDestroy(stream_);
+    if (h_embed_pinned_) cudaFreeHost(h_embed_pinned_);
+    if (h_pos_pinned_) cudaFreeHost(h_pos_pinned_);
 }
 
 void GpuDecoder::upload_linear(const Linear& src, DevLinear& dst) {
@@ -224,14 +260,49 @@ void GpuDecoder::ensure_scratch(int seq) {
     cu_check(cudaMalloc(&d_hidden_, static_cast<std::size_t>(seq) * h * sizeof(float)), "hidden");
 }
 
-void GpuDecoder::reset(int prefill_len) { cache_.reset(prefill_len); }
+void GpuDecoder::ensure_router_scratch(int seq) {
+    if (seq <= router_seq_ && d_count_ != nullptr) return;
+    auto f = [](void* p) { if (p) cudaFree(p); };
+    f(d_router_ids_);
+    f(d_router_w_);
+    f(d_assign_token_);
+    f(d_assign_w_);
+    f(d_count_);
+    d_router_ids_ = nullptr;
+    d_router_w_ = nullptr;
+    d_assign_token_ = nullptr;
+    d_assign_w_ = nullptr;
+    d_count_ = nullptr;
+
+    router_seq_ = seq;
+    router_cap_ = seq < 1 ? 1 : seq;
+    const int ne = cfg_.n_routed_experts;
+    const int kt = cfg_.num_experts_per_tok;
+    cu_check(cudaMalloc(&d_router_ids_, static_cast<std::size_t>(seq) * kt * sizeof(int)),
+             "router ids");
+    cu_check(cudaMalloc(&d_router_w_, static_cast<std::size_t>(seq) * kt * sizeof(float)),
+             "router weights");
+    cu_check(cudaMalloc(&d_assign_token_, static_cast<std::size_t>(ne) * router_cap_ * sizeof(int)),
+             "assign token");
+    cu_check(cudaMalloc(&d_assign_w_, static_cast<std::size_t>(ne) * router_cap_ * sizeof(float)),
+             "assign weight");
+    cu_check(cudaMalloc(&d_count_, static_cast<std::size_t>(ne) * sizeof(int)), "expert count");
+}
+
+void GpuDecoder::reset(int prefill_len) {
+    if (graph_ready_ && graph_prefill_len_ != prefill_len) invalidate_graph();
+    cache_.reset(prefill_len);
+}
 
 void GpuDecoder::layer_forward(int li, const float* x, int seq, const int* positions, bool prefill,
-                               int q_start, float* out) {
+                               int q_start, float* out, cudaStream_t stream) {
     const int h = cfg_.hidden_size;
     const int heads = cfg_.num_attention_heads;
     const int kv_heads = cfg_.num_key_value_heads;
     const int hd = cfg_.head_dim();
+    // Decode steps run the device-resident MoE path (device router + fused
+    // expert kernel) so that the whole step is CUDA-Graph capturable.
+    const bool dev_moe = use_graph_ && !prefill;
     DevLayer& L = layers_[li];
 
     float* base = static_cast<float*>(scratch_);
@@ -255,107 +326,126 @@ void GpuDecoder::layer_forward(int li, const float* x, int seq, const int* posit
     float* act = up + static_cast<std::size_t>(seq) * mi;
     float* router = act + static_cast<std::size_t>(seq) * mi;
 
-    cuda::rmsnorm(x, L.in_ln, normed, seq, h, cfg_.rms_norm_eps);
-    cuda::matmul_t_bf16(normed, L.q.w, L.q.bias, q, seq, h, h);
-    cuda::matmul_t_bf16(normed, L.k.w, L.k.bias, k, seq, h, h);
-    cuda::matmul_t_bf16(normed, L.v.w, L.v.bias, v, seq, h, h);
-    cuda::rope(q, k, positions, seq, heads, kv_heads, hd, cfg_.rope_theta);
-    if (prefill)
-        cache_.write_prefill(li, k, v, seq);
-    else
-        cache_.append_decode(li, k, v);
-    cache_.attention(li, q, seq, q_start, ctx, heads, prefill);
-    cuda::matmul_t_bf16(ctx, L.o.w, L.o.bias, attn, seq, h, h);
+    cuda::rmsnorm(x, L.in_ln, normed, seq, h, cfg_.rms_norm_eps, stream);
+    cuda::matmul_t_bf16(normed, L.q.w, L.q.bias, q, seq, h, h, stream);
+    cuda::matmul_t_bf16(normed, L.k.w, L.k.bias, k, seq, h, h, stream);
+    cuda::matmul_t_bf16(normed, L.v.w, L.v.bias, v, seq, h, h, stream);
+    cuda::rope(q, k, positions, seq, heads, kv_heads, hd, cfg_.rope_theta, stream);
+    if (prefill) {
+        cache_.write_prefill(li, k, v, seq, stream);
+        cache_.attention(li, q, seq, q_start, ctx, heads, /*causal=*/true, stream);
+    } else if (dev_moe) {
+        cache_.append_decode_device(li, k, v, stream);
+        cuda::rswa_attention_devlen(q, cache_.keys(li), cache_.values(li), cache_.len_dev(li), seq,
+                                    q_start, heads, kv_heads, hd, /*causal=*/false, ctx, stream);
+    } else {
+        cache_.append_decode(li, k, v, stream);
+        cache_.attention(li, q, seq, q_start, ctx, heads, /*causal=*/false, stream);
+    }
+    cuda::matmul_t_bf16(ctx, L.o.w, L.o.bias, attn, seq, h, h, stream);
 
     cu_check(cudaMemcpyAsync(h1, x, static_cast<std::size_t>(seq) * h * sizeof(float),
-                             cudaMemcpyDeviceToDevice), "h1 copy");
-    cuda::add_scaled(h1, attn, 1.0f, seq * h);
-    cuda::rmsnorm(h1, L.post_ln, normed2, seq, h, cfg_.rms_norm_eps);
+                             cudaMemcpyDeviceToDevice, stream), "h1 copy");
+    cuda::add_scaled(h1, attn, 1.0f, seq * h, stream);
+    cuda::rmsnorm(h1, L.post_ln, normed2, seq, h, cfg_.rms_norm_eps, stream);
 
     if (!L.is_moe) {
         const int inter = cfg_.intermediate_size;
-        cuda::matmul_t_bf16(normed2, L.dense_gate.w, L.dense_gate.bias, gate, seq, inter, h);
-        cuda::matmul_t_bf16(normed2, L.dense_up.w, L.dense_up.bias, up, seq, inter, h);
-        cuda::silu_mul(gate, up, act, seq * inter);
-        cuda::matmul_t_bf16(act, L.dense_down.w, L.dense_down.bias, mlp, seq, h, inter);
+        cuda::matmul_t_bf16(normed2, L.dense_gate.w, L.dense_gate.bias, gate, seq, inter, h, stream);
+        cuda::matmul_t_bf16(normed2, L.dense_up.w, L.dense_up.bias, up, seq, inter, h, stream);
+        cuda::silu_mul(gate, up, act, seq * inter, stream);
+        cuda::matmul_t_bf16(act, L.dense_down.w, L.dense_down.bias, mlp, seq, h, inter, stream);
         cu_check(cudaMemcpyAsync(out, h1, static_cast<std::size_t>(seq) * h * sizeof(float),
-                                 cudaMemcpyDeviceToDevice), "out copy");
-        cuda::add_scaled(out, mlp, 1.0f, seq * h);
+                                 cudaMemcpyDeviceToDevice, stream), "out copy");
+        cuda::add_scaled(out, mlp, 1.0f, seq * h, stream);
         return;
     }
 
     const int ne = cfg_.n_routed_experts;
     const int kt = cfg_.num_experts_per_tok;
     const int inter = cfg_.moe_intermediate_size;
-    cuda::matmul_t_bf16(normed2, L.router, nullptr, router, seq, ne, h);
-    std::vector<float> rlog(static_cast<std::size_t>(seq) * ne);
-    cu_check(cudaMemcpy(rlog.data(), router, rlog.size() * sizeof(float),
-                        cudaMemcpyDeviceToHost), "router D2H");
-    std::vector<int> ids;
-    std::vector<float> ws;
-    host_topk(rlog.data(), seq, ne, cfg_, ids, ws);
 
-    cu_check(cudaMemsetAsync(moe_out, 0, static_cast<std::size_t>(seq) * h * sizeof(float)),
-             "moe_out zero");
+    if (dev_moe) {
+        cuda::matmul_t_bf16(normed2, L.router, nullptr, router, seq, ne, h, stream);
+        cu_check(cudaMemsetAsync(d_count_, 0, static_cast<std::size_t>(ne) * sizeof(int), stream),
+                 "count zero");
+        cuda::moe_router_topk(router, seq, ne, kt, cfg_.norm_topk_prob, cfg_.routed_scaling_factor,
+                              cfg_.scoring_func == "sigmoid", d_router_ids_, d_router_w_,
+                              d_assign_token_, d_assign_w_, d_count_, router_cap_, stream);
+        cu_check(cudaMemsetAsync(moe_out, 0, static_cast<std::size_t>(seq) * h * sizeof(float),
+                                 stream), "moe_out zero");
+        cuda::moe_experts_masked(normed2, seq, L.gate_ptrs, L.up_ptrs, L.down_ptrs, d_assign_token_,
+                                 d_assign_w_, d_count_, ne, router_cap_, h, inter, moe_out, stream);
+    } else {
+        cuda::matmul_t_bf16(normed2, L.router, nullptr, router, seq, ne, h, stream);
+        std::vector<float> rlog(static_cast<std::size_t>(seq) * ne);
+        cu_check(cudaMemcpy(rlog.data(), router, rlog.size() * sizeof(float),
+                            cudaMemcpyDeviceToHost), "router D2H");
+        std::vector<int> ids;
+        std::vector<float> ws;
+        host_topk(rlog.data(), seq, ne, cfg_, ids, ws);
 
-    std::vector<std::vector<int>> e_tokens(ne);
-    std::vector<std::vector<float>> e_weights(ne);
-    for (int t = 0; t < seq; ++t)
-        for (int j = 0; j < kt; ++j) {
-            const int e = ids[static_cast<std::size_t>(t) * kt + j];
-            e_tokens[e].push_back(t);
-            e_weights[e].push_back(ws[static_cast<std::size_t>(t) * kt + j]);
+        cu_check(cudaMemsetAsync(moe_out, 0, static_cast<std::size_t>(seq) * h * sizeof(float),
+                                 stream), "moe_out zero");
+
+        std::vector<std::vector<int>> e_tokens(ne);
+        std::vector<std::vector<float>> e_weights(ne);
+        for (int t = 0; t < seq; ++t)
+            for (int j = 0; j < kt; ++j) {
+                const int e = ids[static_cast<std::size_t>(t) * kt + j];
+                e_tokens[e].push_back(t);
+                e_weights[e].push_back(ws[static_cast<std::size_t>(t) * kt + j]);
+            }
+
+        for (int e = 0; e < ne; ++e) {
+            const int rows = static_cast<int>(e_tokens[e].size());
+            if (rows == 0) continue;
+            cu_check(cudaMemcpy(d_row_idx_, e_tokens[e].data(), rows * sizeof(int),
+                                cudaMemcpyHostToDevice), "row_idx");
+            cu_check(cudaMemcpy(d_row_w_, e_weights[e].data(), rows * sizeof(float),
+                                cudaMemcpyHostToDevice), "row_w");
+            cuda::gather_rows(xg, normed2, d_row_idx_, rows, h, stream);
+            DevLinear& g = L.experts[static_cast<std::size_t>(e) * 3 + 0];
+            DevLinear& u = L.experts[static_cast<std::size_t>(e) * 3 + 1];
+            DevLinear& d = L.experts[static_cast<std::size_t>(e) * 3 + 2];
+            cuda::matmul_t_bf16(xg, g.w, g.bias, gate, rows, inter, h, stream);
+            cuda::matmul_t_bf16(xg, u.w, u.bias, up, rows, inter, h, stream);
+            cuda::silu_mul(gate, up, act, rows * inter, stream);
+            cuda::matmul_t_bf16(act, d.w, d.bias, yg, rows, h, inter, stream);
+            cuda::scatter_add_scaled(moe_out, yg, d_row_idx_, d_row_w_, rows, h, stream);
         }
-
-    for (int e = 0; e < ne; ++e) {
-        const int rows = static_cast<int>(e_tokens[e].size());
-        if (rows == 0) continue;
-        cu_check(cudaMemcpy(d_row_idx_, e_tokens[e].data(), rows * sizeof(int),
-                            cudaMemcpyHostToDevice), "row_idx");
-        cu_check(cudaMemcpy(d_row_w_, e_weights[e].data(), rows * sizeof(float),
-                            cudaMemcpyHostToDevice), "row_w");
-        cuda::gather_rows(xg, normed2, d_row_idx_, rows, h);
-        DevLinear& g = L.experts[static_cast<std::size_t>(e) * 3 + 0];
-        DevLinear& u = L.experts[static_cast<std::size_t>(e) * 3 + 1];
-        DevLinear& d = L.experts[static_cast<std::size_t>(e) * 3 + 2];
-        cuda::matmul_t_bf16(xg, g.w, g.bias, gate, rows, inter, h);
-        cuda::matmul_t_bf16(xg, u.w, u.bias, up, rows, inter, h);
-        cuda::silu_mul(gate, up, act, rows * inter);
-        cuda::matmul_t_bf16(act, d.w, d.bias, yg, rows, h, inter);
-        cuda::scatter_add_scaled(moe_out, yg, d_row_idx_, d_row_w_, rows, h);
     }
 
     const int sinter = cfg_.moe_intermediate_size * std::max(cfg_.n_shared_experts, 1);
-    cuda::matmul_t_bf16(normed2, L.shared_gate.w, L.shared_gate.bias, gate, seq, sinter, h);
-    cuda::matmul_t_bf16(normed2, L.shared_up.w, L.shared_up.bias, up, seq, sinter, h);
-    cuda::silu_mul(gate, up, act, seq * sinter);
-    cuda::matmul_t_bf16(act, L.shared_down.w, L.shared_down.bias, shared_out, seq, h, sinter);
+    cuda::matmul_t_bf16(normed2, L.shared_gate.w, L.shared_gate.bias, gate, seq, sinter, h, stream);
+    cuda::matmul_t_bf16(normed2, L.shared_up.w, L.shared_up.bias, up, seq, sinter, h, stream);
+    cuda::silu_mul(gate, up, act, seq * sinter, stream);
+    cuda::matmul_t_bf16(act, L.shared_down.w, L.shared_down.bias, shared_out, seq, h, sinter,
+                        stream);
 
     cu_check(cudaMemcpyAsync(out, h1, static_cast<std::size_t>(seq) * h * sizeof(float),
-                             cudaMemcpyDeviceToDevice), "out copy");
-    cuda::add_scaled(out, moe_out, 1.0f, seq * h);
-    cuda::add_scaled(out, shared_out, 1.0f, seq * h);
+                             cudaMemcpyDeviceToDevice, stream), "out copy");
+    cuda::add_scaled(out, moe_out, 1.0f, seq * h, stream);
+    cuda::add_scaled(out, shared_out, 1.0f, seq * h, stream);
 }
 
 void GpuDecoder::forward(const float* x_dev, int seq, const int* positions_dev, bool prefill,
-                         int q_start, float* out_dev) {
+                         int q_start, float* out_dev, cudaStream_t stream) {
     ensure_scratch(seq);
     const int h = cfg_.hidden_size;
     const float* cur = x_dev;
     float* next = d_ping_;
     for (int li = 0; li < cfg_.num_hidden_layers; ++li) {
-        layer_forward(li, cur, seq, positions_dev, prefill, q_start, next);
+        layer_forward(li, cur, seq, positions_dev, prefill, q_start, next, stream);
         cur = next;
         next = (next == d_ping_) ? d_pong_ : d_ping_;
     }
     cu_check(cudaMemcpyAsync(out_dev, cur, static_cast<std::size_t>(seq) * h * sizeof(float),
-                             cudaMemcpyDeviceToDevice), "forward out");
+                             cudaMemcpyDeviceToDevice, stream), "forward out");
 }
 
-void GpuDecoder::final_logits(const float* hidden_dev, int seq, std::vector<float>& logits) {
+void GpuDecoder::final_logits_from_normed(std::vector<float>& logits) {
     const int h = cfg_.hidden_size;
-    cuda::rmsnorm(hidden_dev + static_cast<std::size_t>(seq - 1) * h, final_norm_, d_normed_, 1, h,
-                  cfg_.rms_norm_eps);
     std::vector<float> normed(h);
     cu_check(cudaMemcpy(normed.data(), d_normed_, h * sizeof(float), cudaMemcpyDeviceToHost),
              "normed D2H");
@@ -363,7 +453,54 @@ void GpuDecoder::final_logits(const float* hidden_dev, int seq, std::vector<floa
     host_weights_->lm_head.matvec(normed.data(), logits.data());
 }
 
+void GpuDecoder::final_logits(const float* hidden_dev, int seq, std::vector<float>& logits) {
+    const int h = cfg_.hidden_size;
+    cuda::rmsnorm(hidden_dev + static_cast<std::size_t>(seq - 1) * h, final_norm_, d_normed_, 1, h,
+                  cfg_.rms_norm_eps);
+    final_logits_from_normed(logits);
+}
+
+void GpuDecoder::invalidate_graph() {
+    if (graph_exec_) {
+        cudaGraphExecDestroy(graph_exec_);
+        graph_exec_ = nullptr;
+    }
+    if (graph_) {
+        cudaGraphDestroy(graph_);
+        graph_ = nullptr;
+    }
+    graph_ready_ = false;
+    graph_prefill_len_ = -1;
+}
+
+void GpuDecoder::capture_decode_graph() {
+    const int h = cfg_.hidden_size;
+    ensure_scratch(1);
+    ensure_router_scratch(1);
+    cu_check(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal), "begin capture");
+    cu_check(cudaMemcpyAsync(d_xin_, h_embed_pinned_, static_cast<std::size_t>(h) * sizeof(float),
+                             cudaMemcpyHostToDevice, stream_), "capture embed");
+    cu_check(cudaMemcpyAsync(d_pos_, h_pos_pinned_, sizeof(int), cudaMemcpyHostToDevice, stream_),
+             "capture pos");
+    forward(d_xin_, 1, d_pos_, /*prefill=*/false, 0, d_hidden_, stream_);
+    cuda::rmsnorm(d_hidden_, final_norm_, d_normed_, 1, h, cfg_.rms_norm_eps, stream_);
+    cu_check(cudaStreamEndCapture(stream_, &graph_), "end capture");
+    cu_check(cudaGraphInstantiate(&graph_exec_, graph_, nullptr, nullptr, 0), "instantiate graph");
+    graph_ready_ = true;
+    graph_prefill_len_ = cache_.prefill_len();
+}
+
+void GpuDecoder::run_graph_decode(int token, int pos, std::vector<float>& logits) {
+    host_weights_->embed_tokens.row(token, h_embed_pinned_);
+    *h_pos_pinned_ = pos;
+    if (!graph_ready_) capture_decode_graph();
+    cu_check(cudaGraphLaunch(graph_exec_, stream_), "graph launch");
+    cu_check(cudaStreamSynchronize(stream_), "graph sync");
+    final_logits_from_normed(logits);
+}
+
 void GpuDecoder::prefill_embeds(const float* host_embeds, int seq, std::vector<float>& logits) {
+    if (graph_ready_ && graph_prefill_len_ != seq) invalidate_graph();
     cache_.reset(seq);
     ensure_scratch(seq);
     const int h = cfg_.hidden_size;
@@ -372,7 +509,7 @@ void GpuDecoder::prefill_embeds(const float* host_embeds, int seq, std::vector<f
     std::vector<int> pos(seq);
     for (int i = 0; i < seq; ++i) pos[i] = i;
     cu_check(cudaMemcpy(d_pos_, pos.data(), seq * sizeof(int), cudaMemcpyHostToDevice), "pos H2D");
-    forward(d_xin_, seq, d_pos_, /*prefill=*/true, 0, d_hidden_);
+    forward(d_xin_, seq, d_pos_, /*prefill=*/true, 0, d_hidden_, 0);
     final_logits(d_hidden_, seq, logits);
 }
 
@@ -386,13 +523,17 @@ void GpuDecoder::prefill_tokens(const std::vector<int>& tokens, std::vector<floa
 }
 
 void GpuDecoder::decode_token(int token, int pos, std::vector<float>& logits) {
+    if (use_graph_) {
+        run_graph_decode(token, pos, logits);
+        return;
+    }
     const int h = cfg_.hidden_size;
     std::vector<float> embed(h);
     host_weights_->embed_tokens.row(token, embed.data());
     ensure_scratch(1);
     cu_check(cudaMemcpy(d_xin_, embed.data(), h * sizeof(float), cudaMemcpyHostToDevice), "embed H2D");
     cu_check(cudaMemcpy(d_pos_, &pos, sizeof(int), cudaMemcpyHostToDevice), "pos H2D");
-    forward(d_xin_, 1, d_pos_, /*prefill=*/false, pos, d_hidden_);
+    forward(d_xin_, 1, d_pos_, /*prefill=*/false, pos, d_hidden_, 0);
     final_logits(d_hidden_, 1, logits);
 }
 
