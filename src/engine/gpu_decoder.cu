@@ -138,29 +138,40 @@ GpuDecoder::GpuDecoder(ModelConfig cfg, const DecoderWeights& weights)
             cu_check(cudaMalloc(&dl.router, router.size() * sizeof(std::uint16_t)), "router");
             cu_check(cudaMemcpy(dl.router, router.data(), router.size() * sizeof(std::uint16_t),
                                 cudaMemcpyHostToDevice), "router copy");
-            dl.experts.resize(static_cast<std::size_t>(cfg_.n_routed_experts) * 3);
-            std::vector<const std::uint16_t*> gp(cfg_.n_routed_experts);
-            std::vector<const std::uint16_t*> up(cfg_.n_routed_experts);
-            std::vector<const std::uint16_t*> dp(cfg_.n_routed_experts);
-            for (int e = 0; e < cfg_.n_routed_experts; ++e) {
-                upload_linear(lw.experts[e].gate, dl.experts[static_cast<std::size_t>(e) * 3 + 0]);
-                upload_linear(lw.experts[e].up, dl.experts[static_cast<std::size_t>(e) * 3 + 1]);
-                upload_linear(lw.experts[e].down, dl.experts[static_cast<std::size_t>(e) * 3 + 2]);
-                gp[e] = dl.experts[static_cast<std::size_t>(e) * 3 + 0].w;
-                up[e] = dl.experts[static_cast<std::size_t>(e) * 3 + 1].w;
-                dp[e] = dl.experts[static_cast<std::size_t>(e) * 3 + 2].w;
+            dl.int4_experts =
+                !lw.experts.empty() && lw.experts[0].gate.weight.fmt == WeightFormat::INT4;
+            if (dl.int4_experts) {
+                upload_expert_table(lw.experts, 0, dl.gate_i4);
+                upload_expert_table(lw.experts, 1, dl.up_i4);
+                upload_expert_table(lw.experts, 2, dl.down_i4);
+            } else {
+                dl.experts.resize(static_cast<std::size_t>(cfg_.n_routed_experts) * 3);
+                std::vector<const std::uint16_t*> gp(cfg_.n_routed_experts);
+                std::vector<const std::uint16_t*> up(cfg_.n_routed_experts);
+                std::vector<const std::uint16_t*> dp(cfg_.n_routed_experts);
+                for (int e = 0; e < cfg_.n_routed_experts; ++e) {
+                    upload_linear(lw.experts[e].gate,
+                                  dl.experts[static_cast<std::size_t>(e) * 3 + 0]);
+                    upload_linear(lw.experts[e].up,
+                                  dl.experts[static_cast<std::size_t>(e) * 3 + 1]);
+                    upload_linear(lw.experts[e].down,
+                                  dl.experts[static_cast<std::size_t>(e) * 3 + 2]);
+                    gp[e] = dl.experts[static_cast<std::size_t>(e) * 3 + 0].w;
+                    up[e] = dl.experts[static_cast<std::size_t>(e) * 3 + 1].w;
+                    dp[e] = dl.experts[static_cast<std::size_t>(e) * 3 + 2].w;
+                }
+                const std::size_t pbytes =
+                    static_cast<std::size_t>(cfg_.n_routed_experts) * sizeof(std::uint16_t*);
+                cu_check(cudaMalloc(reinterpret_cast<void**>(&dl.gate_ptrs), pbytes), "gate_ptrs");
+                cu_check(cudaMalloc(reinterpret_cast<void**>(&dl.up_ptrs), pbytes), "up_ptrs");
+                cu_check(cudaMalloc(reinterpret_cast<void**>(&dl.down_ptrs), pbytes), "down_ptrs");
+                cu_check(cudaMemcpy(dl.gate_ptrs, gp.data(), pbytes, cudaMemcpyHostToDevice),
+                         "gate_ptrs copy");
+                cu_check(cudaMemcpy(dl.up_ptrs, up.data(), pbytes, cudaMemcpyHostToDevice),
+                         "up_ptrs copy");
+                cu_check(cudaMemcpy(dl.down_ptrs, dp.data(), pbytes, cudaMemcpyHostToDevice),
+                         "down_ptrs copy");
             }
-            const std::size_t pbytes =
-                static_cast<std::size_t>(cfg_.n_routed_experts) * sizeof(std::uint16_t*);
-            cu_check(cudaMalloc(reinterpret_cast<void**>(&dl.gate_ptrs), pbytes), "gate_ptrs");
-            cu_check(cudaMalloc(reinterpret_cast<void**>(&dl.up_ptrs), pbytes), "up_ptrs");
-            cu_check(cudaMalloc(reinterpret_cast<void**>(&dl.down_ptrs), pbytes), "down_ptrs");
-            cu_check(cudaMemcpy(dl.gate_ptrs, gp.data(), pbytes, cudaMemcpyHostToDevice),
-                     "gate_ptrs copy");
-            cu_check(cudaMemcpy(dl.up_ptrs, up.data(), pbytes, cudaMemcpyHostToDevice),
-                     "up_ptrs copy");
-            cu_check(cudaMemcpy(dl.down_ptrs, dp.data(), pbytes, cudaMemcpyHostToDevice),
-                     "down_ptrs copy");
             upload_linear(lw.shared.gate, dl.shared_gate);
             upload_linear(lw.shared.up, dl.shared_up);
             upload_linear(lw.shared.down, dl.shared_down);
@@ -210,6 +221,15 @@ GpuDecoder::~GpuDecoder() {
         f(const_cast<std::uint16_t**>(L.gate_ptrs));
         f(const_cast<std::uint16_t**>(L.up_ptrs));
         f(const_cast<std::uint16_t**>(L.down_ptrs));
+        f(L.gate_i4.packed);
+        f(L.gate_i4.scales);
+        f(L.gate_i4.zeros);
+        f(L.up_i4.packed);
+        f(L.up_i4.scales);
+        f(L.up_i4.zeros);
+        f(L.down_i4.packed);
+        f(L.down_i4.scales);
+        f(L.down_i4.zeros);
     }
     f(final_norm_);
     f(scratch_);
@@ -244,6 +264,50 @@ void GpuDecoder::upload_linear(const Linear& src, DevLinear& dst) {
         cu_check(cudaMalloc(&dst.bias, src.bias.size() * sizeof(float)), "linear bias");
         cu_check(cudaMemcpy(dst.bias, src.bias.data(), src.bias.size() * sizeof(float),
                             cudaMemcpyHostToDevice), "linear bias copy");
+    }
+}
+
+void GpuDecoder::upload_expert_table(const std::vector<ExpertWeights>& experts, int which,
+                                     DevExpertTable& dst) {
+    if (experts.empty()) return;
+    auto select = [&](const ExpertWeights& x) -> const Linear& {
+        return which == 0 ? x.gate : (which == 1 ? x.up : x.down);
+    };
+    const Linear& first = select(experts[0]);
+    if (first.weight.fmt != WeightFormat::INT4) return;
+    const int rows = first.weight.rows;
+    const int cols = first.weight.cols;
+    const int group = first.weight.q.group_size;
+    const int gpr = (cols + 1) / 2;
+    const int ng = (cols + group - 1) / group;
+    const int ne = static_cast<int>(experts.size());
+
+    dst.rows = rows;
+    dst.cols = cols;
+    dst.group = group;
+    dst.ng = ng;
+    dst.pstride = rows * gpr;
+    dst.sstride = rows * ng;
+    cu_check(cudaMalloc(&dst.packed, static_cast<std::size_t>(ne) * dst.pstride), "i4 packed");
+    cu_check(cudaMalloc(&dst.scales, static_cast<std::size_t>(ne) * dst.sstride * sizeof(float)),
+             "i4 scales");
+    cu_check(cudaMalloc(&dst.zeros, static_cast<std::size_t>(ne) * dst.sstride * sizeof(float)),
+             "i4 zeros");
+    for (int e = 0; e < ne; ++e) {
+        const QuantizedMatrix& q = select(experts[e]).weight.q;
+        UOCR_CHECK(static_cast<int>(q.packed.size()) == dst.pstride,
+                   "INT4 expert packed size mismatch");
+        UOCR_CHECK(static_cast<int>(q.scales.size()) == dst.sstride,
+                   "INT4 expert scale size mismatch");
+        cu_check(cudaMemcpy(dst.packed + static_cast<std::size_t>(e) * dst.pstride, q.packed.data(),
+                            q.packed.size(), cudaMemcpyHostToDevice),
+                 "i4 packed copy");
+        cu_check(cudaMemcpy(dst.scales + static_cast<std::size_t>(e) * dst.sstride, q.scales.data(),
+                            q.scales.size() * sizeof(float), cudaMemcpyHostToDevice),
+                 "i4 scales copy");
+        cu_check(cudaMemcpy(dst.zeros + static_cast<std::size_t>(e) * dst.sstride, q.zeros.data(),
+                            q.zeros.size() * sizeof(float), cudaMemcpyHostToDevice),
+                 "i4 zeros copy");
     }
 }
 
@@ -395,9 +459,19 @@ void GpuDecoder::mlp_block(int li, const float* h1, const float* normed2, int se
                               router_cap_, stream);
         cu_check(cudaMemsetAsync(s.moe_out, 0, static_cast<std::size_t>(seq) * h * sizeof(float),
                                  stream), "moe_out zero");
-        cuda::moe_experts_masked(normed2, seq, L.gate_ptrs, L.up_ptrs, L.down_ptrs, d_assign_token_,
-                                 d_assign_w_, d_count_, ne, router_cap_, h, inter, s.moe_out,
-                                 stream);
+        if (L.int4_experts) {
+            cuda::moe_experts_masked_int4(
+                normed2, seq, L.gate_i4.packed, L.gate_i4.scales, L.gate_i4.zeros,
+                L.gate_i4.pstride, L.gate_i4.sstride, L.gate_i4.ng, L.up_i4.packed,
+                L.up_i4.scales, L.up_i4.zeros, L.up_i4.pstride, L.up_i4.sstride, L.up_i4.ng,
+                L.down_i4.packed, L.down_i4.scales, L.down_i4.zeros, L.down_i4.pstride,
+                L.down_i4.sstride, L.down_i4.ng, d_assign_token_, d_assign_w_, d_count_, ne,
+                router_cap_, h, inter, L.gate_i4.group, s.moe_out, stream);
+        } else {
+            cuda::moe_experts_masked(normed2, seq, L.gate_ptrs, L.up_ptrs, L.down_ptrs,
+                                     d_assign_token_, d_assign_w_, d_count_, ne, router_cap_, h,
+                                     inter, s.moe_out, stream);
+        }
     } else {
         cuda::matmul_t_bf16(normed2, L.router, nullptr, s.router, seq, ne, h, stream);
         std::vector<float> rlog(static_cast<std::size_t>(seq) * ne);
@@ -427,13 +501,30 @@ void GpuDecoder::mlp_block(int li, const float* h1, const float* normed2, int se
             cu_check(cudaMemcpy(d_row_w_, e_weights[e].data(), rows * sizeof(float),
                                 cudaMemcpyHostToDevice), "row_w");
             cuda::gather_rows(s.xg, normed2, d_row_idx_, rows, h, stream);
-            DevLinear& g = L.experts[static_cast<std::size_t>(e) * 3 + 0];
-            DevLinear& u = L.experts[static_cast<std::size_t>(e) * 3 + 1];
-            DevLinear& d = L.experts[static_cast<std::size_t>(e) * 3 + 2];
-            cuda::matmul_t_bf16(s.xg, g.w, g.bias, s.gate, rows, inter, h, stream);
-            cuda::matmul_t_bf16(s.xg, u.w, u.bias, s.up, rows, inter, h, stream);
-            cuda::silu_mul(s.gate, s.up, s.act, rows * inter, stream);
-            cuda::matmul_t_bf16(s.act, d.w, d.bias, s.yg, rows, h, inter, stream);
+            if (L.int4_experts) {
+                const std::size_t ep = static_cast<std::size_t>(e);
+                cuda::moe_gemm_int4_tc(s.xg, L.gate_i4.packed + ep * L.gate_i4.pstride,
+                                       L.gate_i4.scales + ep * L.gate_i4.sstride,
+                                       L.gate_i4.zeros + ep * L.gate_i4.sstride, rows, inter, h,
+                                       L.gate_i4.group, s.gate, stream);
+                cuda::moe_gemm_int4_tc(s.xg, L.up_i4.packed + ep * L.up_i4.pstride,
+                                       L.up_i4.scales + ep * L.up_i4.sstride,
+                                       L.up_i4.zeros + ep * L.up_i4.sstride, rows, inter, h,
+                                       L.up_i4.group, s.up, stream);
+                cuda::silu_mul(s.gate, s.up, s.act, rows * inter, stream);
+                cuda::moe_gemm_int4_tc(s.act, L.down_i4.packed + ep * L.down_i4.pstride,
+                                       L.down_i4.scales + ep * L.down_i4.sstride,
+                                       L.down_i4.zeros + ep * L.down_i4.sstride, rows, h, inter,
+                                       L.down_i4.group, s.yg, stream);
+            } else {
+                DevLinear& g = L.experts[static_cast<std::size_t>(e) * 3 + 0];
+                DevLinear& u = L.experts[static_cast<std::size_t>(e) * 3 + 1];
+                DevLinear& d = L.experts[static_cast<std::size_t>(e) * 3 + 2];
+                cuda::matmul_t_bf16(s.xg, g.w, g.bias, s.gate, rows, inter, h, stream);
+                cuda::matmul_t_bf16(s.xg, u.w, u.bias, s.up, rows, inter, h, stream);
+                cuda::silu_mul(s.gate, s.up, s.act, rows * inter, stream);
+                cuda::matmul_t_bf16(s.act, d.w, d.bias, s.yg, rows, h, inter, stream);
+            }
             cuda::scatter_add_scaled(s.moe_out, s.yg, d_row_idx_, d_row_w_, rows, h, stream);
         }
     }

@@ -63,6 +63,17 @@ private:
         int rows = 0;
         int cols = 0;
     };
+    // One concatenated INT4 expert table [n_experts, rows, cols] (AWQ layout).
+    struct DevExpertTable {
+        std::uint8_t* packed = nullptr;
+        float* scales = nullptr;
+        float* zeros = nullptr;
+        int rows = 0, cols = 0, group = 128;
+        int pstride = 0;  // bytes per expert
+        int sstride = 0;  // scales/zeros per expert
+        int ng = 0;       // groups per row
+    };
+
     struct DevLayer {
         float* in_ln = nullptr;
         float* post_ln = nullptr;
@@ -76,9 +87,15 @@ private:
         const std::uint16_t** gate_ptrs = nullptr;
         const std::uint16_t** up_ptrs = nullptr;
         const std::uint16_t** down_ptrs = nullptr;
+        // INT4 expert tables (populated instead of `experts` when the host
+        // weights are quantized).
+        bool int4_experts = false;
+        DevExpertTable gate_i4, up_i4, down_i4;
     };
 
     void upload_linear(const Linear& src, DevLinear& dst);
+    void upload_expert_table(const std::vector<ExpertWeights>& experts, int which,
+                             DevExpertTable& dst);
     void forward(const float* x_dev, int seq, const int* positions_dev, bool prefill, int q_start,
                  float* out_dev, cudaStream_t stream);
     void layer_forward(int li, const float* x, int seq, const int* positions, bool prefill,

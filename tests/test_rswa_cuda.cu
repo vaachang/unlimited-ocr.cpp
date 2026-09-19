@@ -551,6 +551,90 @@ int main() {
         }
     }
 
+    // ---- device INT4 expert weights vs CPU (both plain and graph paths) ----
+    {
+        ModelConfig cfg;
+        cfg.vocab_size = 256;
+        cfg.hidden_size = 64;
+        cfg.intermediate_size = 128;
+        cfg.moe_intermediate_size = 32;
+        cfg.num_hidden_layers = 2;
+        cfg.num_attention_heads = 4;
+        cfg.num_key_value_heads = 4;
+        cfg.first_k_dense_replace = 1;
+        cfg.n_routed_experts = 8;
+        cfg.n_shared_experts = 1;
+        cfg.num_experts_per_tok = 2;
+        cfg.norm_topk_prob = true;
+        cfg.sliding_window = 4;
+        cfg.max_position_embeddings = 256;
+        cfg.projector_input_dim = 2048;
+        cfg.projector_n_embed = 64;
+
+        DecoderWeights w = DecoderWeights::random(cfg, 4242);
+        auto quantize_linear = [](Linear& lin, int group) {
+            const int rows = lin.weight.rows, cols = lin.weight.cols;
+            if (lin.weight.fmt != WeightFormat::F32_OWNED) return;
+            lin.weight.q = quantize_int4_awq(lin.weight.f32.data(), rows, cols, group);
+            lin.weight.fmt = WeightFormat::INT4;
+            lin.weight.f32.clear();
+        };
+        for (auto& L : w.layers)
+            if (L.is_moe)
+                for (auto& ex : L.experts) {
+                    quantize_linear(ex.gate, 32);
+                    quantize_linear(ex.up, 32);
+                    quantize_linear(ex.down, 32);
+                }
+
+        MoEDecoder cpu(cfg, w);
+        cuda::GpuDecoder g_plain(cfg, w);
+        cuda::GpuDecoder g_graph(cfg, w);
+        g_plain.set_use_graph(false);
+        g_graph.set_use_graph(true);
+
+        std::vector<int> prompt(6);
+        for (int i = 0; i < 6; ++i) prompt[i] = i + 1;
+
+        RSWACache cache(cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim(),
+                        cfg.sliding_window);
+        std::vector<float> cpu_logits, p_logits, q_logits;
+        cpu.prefill(cache, prompt, 0, cpu_logits);
+        g_plain.prefill_tokens(prompt, p_logits);
+        g_graph.prefill_tokens(prompt, q_logits);
+
+        auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+            double num = 0, den = 0;
+            for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+                const double e = static_cast<double>(a[i]) - b[i];
+                num += e * e;
+                den += static_cast<double>(b[i]) * b[i];
+            }
+            return std::sqrt(num / (den + 1e-30));
+        };
+
+        int pos = static_cast<int>(prompt.size());
+        float worst_plain = 0.0f, worst_graph = 0.0f;
+        for (int step = 0; step < 16; ++step) {
+            int tok = 0;
+            float best = -1e30f;
+            for (std::size_t i = 0; i < cpu_logits.size(); ++i)
+                if (cpu_logits[i] > best) { best = cpu_logits[i]; tok = static_cast<int>(i); }
+            cpu.decode(cache, tok, pos, cpu_logits);
+            g_plain.decode_token(tok, pos, p_logits);
+            g_graph.decode_token(tok, pos, q_logits);
+            ++pos;
+            const float cp = static_cast<float>(rel(p_logits, cpu_logits));
+            const float cq = static_cast<float>(rel(q_logits, cpu_logits));
+            worst_plain = std::max(worst_plain, cp);
+            worst_graph = std::max(worst_graph, cq);
+            if (cp > 0.1f || cq > 0.1f) ++failures;
+        }
+        std::printf("GpuDecoder INT4 experts: plain_vs_cpu rel_l2=%.5f graph_vs_cpu rel_l2=%.5f %s\n",
+                    worst_plain, worst_graph,
+                    (worst_plain <= 0.1f && worst_graph <= 0.1f) ? "OK" : "FAIL");
+    }
+
     std::printf("%s\n", failures == 0 ? "all CUDA tests passed" : "CUDA tests FAILED");
     return failures == 0 ? 0 : 1;
 }

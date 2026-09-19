@@ -142,6 +142,74 @@ __global__ void moe_experts_masked_kernel(
     }
 }
 
+// INT4 variant: activations stay f32, weights are AWQ INT4 group-quantized.
+__global__ void moe_experts_masked_int4_kernel(
+    const float* __restrict__ x, const std::uint8_t* __restrict__ gate_packed,
+    const float* __restrict__ gate_scales, const float* __restrict__ gate_zeros,
+    int gate_pstride, int gate_sstride, int gate_ng, const std::uint8_t* __restrict__ up_packed,
+    const float* __restrict__ up_scales, const float* __restrict__ up_zeros, int up_pstride,
+    int up_sstride, int up_ng, const std::uint8_t* __restrict__ down_packed,
+    const float* __restrict__ down_scales, const float* __restrict__ down_zeros, int down_pstride,
+    int down_sstride, int down_ng, const int* __restrict__ assign_token,
+    const float* __restrict__ assign_w, const int* __restrict__ count, int cap, int hidden,
+    int inter, int group, float* __restrict__ out) {
+    extern __shared__ float act[];
+    const int e = blockIdx.x;
+    const int n = count[e];
+    if (n <= 0) return;
+
+    const std::uint8_t* gp = gate_packed + static_cast<std::size_t>(e) * gate_pstride;
+    const float* gs = gate_scales + static_cast<std::size_t>(e) * gate_sstride;
+    const float* gz = gate_zeros + static_cast<std::size_t>(e) * gate_sstride;
+    const std::uint8_t* up_p = up_packed + static_cast<std::size_t>(e) * up_pstride;
+    const float* us = up_scales + static_cast<std::size_t>(e) * up_sstride;
+    const float* uz = up_zeros + static_cast<std::size_t>(e) * up_sstride;
+    const std::uint8_t* dp = down_packed + static_cast<std::size_t>(e) * down_pstride;
+    const float* ds = down_scales + static_cast<std::size_t>(e) * down_sstride;
+    const float* dz = down_zeros + static_cast<std::size_t>(e) * down_sstride;
+
+    const int gpr = (hidden + 1) / 2;  // gate/up packed row stride (bytes)
+    const int dpr = (inter + 1) / 2;   // down packed row stride (bytes)
+
+    for (int s = 0; s < n; ++s) {
+        const int t = assign_token[static_cast<std::size_t>(e) * cap + s];
+        const float w = assign_w[static_cast<std::size_t>(e) * cap + s];
+        const float* xr = x + static_cast<std::size_t>(t) * hidden;
+
+        for (int i = threadIdx.x; i < inter; i += blockDim.x) {
+            const std::uint8_t* grow = gp + static_cast<std::size_t>(i) * gpr;
+            const std::uint8_t* urow = up_p + static_cast<std::size_t>(i) * gpr;
+            float gv = 0.0f, uv = 0.0f;
+            for (int c = 0; c < hidden; ++c) {
+                const int gg = c / group;
+                const std::uint8_t gb = grow[c >> 1];
+                const int gq = (c & 1) ? (gb >> 4) : (gb & 0x0f);
+                const std::uint8_t ub = urow[c >> 1];
+                const int uq = (c & 1) ? (ub >> 4) : (ub & 0x0f);
+                const float xv = xr[c];
+                gv += (static_cast<float>(gq) - gz[i * gate_ng + gg]) * gs[i * gate_ng + gg] * xv;
+                uv += (static_cast<float>(uq) - uz[i * up_ng + gg]) * us[i * up_ng + gg] * xv;
+            }
+            act[i] = (gv / (1.0f + __expf(-gv))) * uv;
+        }
+        __syncthreads();
+
+        for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
+            const std::uint8_t* drow = dp + static_cast<std::size_t>(j) * dpr;
+            float acc = 0.0f;
+            for (int c = 0; c < inter; ++c) {
+                const int gg = c / group;
+                const std::uint8_t db = drow[c >> 1];
+                const int dq = (c & 1) ? (db >> 4) : (db & 0x0f);
+                acc += (static_cast<float>(dq) - dz[j * down_ng + gg]) * ds[j * down_ng + gg] *
+                       act[c];
+            }
+            atomicAdd(&out[static_cast<std::size_t>(t) * hidden + j], w * acc);
+        }
+        __syncthreads();
+    }
+}
+
 }  // namespace
 
 void moe_router_topk(const float* router_logits, int seq, int n_experts, int top_k,
@@ -166,6 +234,25 @@ void moe_experts_masked(const float* x, int seq, const std::uint16_t* const* gat
     const std::size_t shmem = static_cast<std::size_t>(inter) * sizeof(float);
     moe_experts_masked_kernel<<<n_experts, threads, shmem, stream>>>(
         x, gate_w, up_w, down_w, assign_token, assign_w, count, cap, hidden, inter, out);
+    (void)seq;
+}
+
+void moe_experts_masked_int4(
+    const float* x, int seq, const std::uint8_t* gate_packed, const float* gate_scales,
+    const float* gate_zeros, int gate_pstride, int gate_sstride, int gate_ng,
+    const std::uint8_t* up_packed, const float* up_scales, const float* up_zeros, int up_pstride,
+    int up_sstride, int up_ng, const std::uint8_t* down_packed, const float* down_scales,
+    const float* down_zeros, int down_pstride, int down_sstride, int down_ng,
+    const int* assign_token, const float* assign_w, const int* count, int n_experts, int cap,
+    int hidden, int inter, int group, float* out, cudaStream_t stream) {
+    if (n_experts == 0) return;
+    const int threads = 256;
+    const std::size_t shmem = static_cast<std::size_t>(inter) * sizeof(float);
+    moe_experts_masked_int4_kernel<<<n_experts, threads, shmem, stream>>>(
+        x, gate_packed, gate_scales, gate_zeros, gate_pstride, gate_sstride, gate_ng, up_packed,
+        up_scales, up_zeros, up_pstride, up_sstride, up_ng, down_packed, down_scales, down_zeros,
+        down_pstride, down_sstride, down_ng, assign_token, assign_w, count, cap, hidden, inter,
+        group, out);
     (void)seq;
 }
 

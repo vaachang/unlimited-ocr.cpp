@@ -80,6 +80,18 @@ void moe_experts_masked(const float* x, int seq, const std::uint16_t* const* gat
                         int n_experts, int cap, int hidden, int inter, float* out,
                         cudaStream_t stream = 0);
 
+// INT4 (AWQ) variant of `moe_experts_masked`.  Weight tables are concatenated
+// per expert (strides `*_pstride` in bytes and `*_sstride` in floats); weights
+// are dequantized on the fly inside the kernel.
+void moe_experts_masked_int4(
+    const float* x, int seq, const std::uint8_t* gate_packed, const float* gate_scales,
+    const float* gate_zeros, int gate_pstride, int gate_sstride, int gate_ng,
+    const std::uint8_t* up_packed, const float* up_scales, const float* up_zeros, int up_pstride,
+    int up_sstride, int up_ng, const std::uint8_t* down_packed, const float* down_scales,
+    const float* down_zeros, int down_pstride, int down_sstride, int down_ng,
+    const int* assign_token, const float* assign_w, const int* count, int n_experts, int cap,
+    int hidden, int inter, int group, float* out, cudaStream_t stream = 0);
+
 // MoE INT4 GEMM: y[m,n] = x[m,k] * dequant(W_int4[n,k]); W is packed 2-per-byte
 // with per-group affine scale/zero.  Scalar reference (correctness baseline).
 void moe_gemm_int4(const float* x, const std::uint8_t* packed, const float* scales,
