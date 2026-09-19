@@ -26,6 +26,11 @@ public:
     std::vector<int> encode(const std::string& text, bool add_bos = false, bool add_eos = false) const;
     std::string decode(const std::vector<int>& ids, bool skip_special = false) const;
 
+    // DeepSeek BPE pre-tokenization (3 Split regexes + ByteLevel mapping),
+    // exposed for alignment/debugging.  Special/added tokens are not extracted
+    // here (matches HuggingFace `pre_tokenizer.pre_tokenize_str`).
+    std::vector<std::string> pretokenize(const std::string& text) const;
+
     int token_to_id(const std::string& token) const;
     const std::string& id_to_token(int id) const;
     bool is_special(int id) const;
@@ -39,6 +44,7 @@ private:
     std::unordered_map<std::string, int> ranks_;  // "a b" -> merge rank
     std::vector<std::pair<std::string, std::string>> merges_;
     std::vector<std::pair<std::string, int>> specials_;  // content -> id
+    std::vector<std::vector<int>> special_by_first_;     // first byte -> specials_ idx
     std::vector<bool> special_flag_;
     int bos_id_ = 0;
     int eos_id_ = 1;

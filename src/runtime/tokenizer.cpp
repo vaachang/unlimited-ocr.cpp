@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -9,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include "uocr/log.h"
+#include "uocr/unicode_tables.h"
 
 namespace uocr {
 
@@ -85,8 +87,6 @@ void build_byte_maps(std::string byte_to_char[256], std::unordered_map<std::uint
     }
 }
 
-const std::string kContractions[] = {"'s", "'t", "'re", "'ve", "'m", "'ll", "'d"};
-
 // DeepSeek special tokens (fullwidth vertical bar U+FF5C, lower one eighth
 // block U+2581).  Kept as UTF-8 literals to avoid hex-escape parsing pitfalls.
 const std::string kBosToken = u8"<｜begin▁of▁sentence｜>";
@@ -94,6 +94,223 @@ const std::string kEosToken = u8"<｜end▁of▁sentence｜>";
 
 bool starts_with(const std::string& s, std::size_t pos, const std::string& p) {
     return pos + p.size() <= s.size() && std::equal(p.begin(), p.end(), s.begin() + static_cast<long>(pos));
+}
+
+// ---------------------------------------------------------------------------
+// Unicode general-category classification (generated tables).
+// ---------------------------------------------------------------------------
+
+enum : std::uint8_t { kCatL = 1, kCatM = 2, kCatN = 4, kCatP = 8, kCatS = 16 };
+
+std::uint8_t unicode_cat_mask(std::uint32_t cp) {
+    const UocrUnicodeRange* tab = kUnicodeCategoryRanges;
+    std::size_t lo = 0, hi = sizeof(kUnicodeCategoryRanges) / sizeof(UocrUnicodeRange);
+    while (lo < hi) {
+        const std::size_t mid = lo + (hi - lo) / 2;
+        if (cp < tab[mid].lo)
+            hi = mid;
+        else if (cp > tab[mid].hi)
+            lo = mid + 1;
+        else
+            return tab[mid].mask;
+    }
+    return 0;
+}
+
+bool unicode_is_whitespace(std::uint32_t cp) {
+    const UocrUnicodeRange* tab = kWhitespaceRanges;
+    std::size_t lo = 0, hi = sizeof(kWhitespaceRanges) / sizeof(UocrUnicodeRange);
+    while (lo < hi) {
+        const std::size_t mid = lo + (hi - lo) / 2;
+        if (cp < tab[mid].lo)
+            hi = mid;
+        else if (cp > tab[mid].hi)
+            lo = mid + 1;
+        else
+            return true;
+    }
+    return false;
+}
+
+bool is_cjk(std::uint32_t cp) {
+    return (cp >= 0x4E00 && cp <= 0x9FA5) || (cp >= 0x3040 && cp <= 0x309F) ||
+           (cp >= 0x30A0 && cp <= 0x30FF);
+}
+
+bool is_ascii_alpha(std::uint32_t cp) {
+    return (cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z');
+}
+
+// First alternative of the third Split regex:
+//   [!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+
+bool is_pattern_punct(std::uint32_t cp) {
+    if (cp > 0x7F) return false;
+    static const char kPunct[] = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+    return std::strchr(kPunct, static_cast<int>(cp)) != nullptr;
+}
+
+// Decode UTF-8 into code points + byte offsets (offs has n+1 entries).
+void decode_utf8_offsets(const std::string& s, std::vector<std::uint32_t>& cps,
+                         std::vector<std::size_t>& offs) {
+    cps.clear();
+    offs.clear();
+    std::size_t i = 0;
+    const std::size_t n = s.size();
+    while (i < n) {
+        offs.push_back(i);
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        std::uint32_t cp = 0;
+        int extra = 0;
+        if (c < 0x80) {
+            cp = c;
+        } else if ((c & 0xE0) == 0xC0) {
+            cp = c & 0x1F;
+            extra = 1;
+        } else if ((c & 0xF0) == 0xE0) {
+            cp = c & 0x0F;
+            extra = 2;
+        } else if ((c & 0xF8) == 0xF0) {
+            cp = c & 0x07;
+            extra = 3;
+        } else {
+            cp = c;
+        }
+        ++i;
+        for (int k = 0; k < extra && i < n; ++k, ++i)
+            cp = (cp << 6) | (static_cast<unsigned char>(s[i]) & 0x3F);
+        cps.push_back(cp);
+    }
+    offs.push_back(n);
+}
+
+using CpVec = std::vector<std::uint32_t>;
+
+// Match `\p{N}{1,3}` at code-point index i, returns length (0 = no match).
+int match_numbers(const CpVec& cp, int n, int i) {
+    if (i >= n || !(unicode_cat_mask(cp[i]) & kCatN)) return 0;
+    int j = i + 1;
+    while (j < n && (j - i) < 3 && (unicode_cat_mask(cp[j]) & kCatN)) ++j;
+    return j - i;
+}
+
+// Match `[一-龥぀-ゟ゠-ヿ]+`.
+int match_cjk(const CpVec& cp, int n, int i) {
+    if (i >= n || !is_cjk(cp[i])) return 0;
+    int j = i + 1;
+    while (j < n && is_cjk(cp[j])) ++j;
+    return j - i;
+}
+
+// Match the third (and most complex) Split regex.  See the HuggingFace
+// `tokenizer.json` pre_tokenizer.  Alternatives are tried in order and use
+// greedy quantifiers, matching the Rust `regex` crate semantics.
+int match_pattern3(const CpVec& cp, int n, int i) {
+    // A: [punct][A-Za-z]+
+    if (i < n && is_pattern_punct(cp[i])) {
+        int j = i + 1;
+        while (j < n && is_ascii_alpha(cp[j])) ++j;
+        if (j > i + 1) return j - i;
+    }
+    // B: [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+
+    {
+        if (i < n && cp[i] != '\r' && cp[i] != '\n' &&
+            !(unicode_cat_mask(cp[i]) & (kCatL | kCatP | kCatS))) {
+            int j = i + 1;
+            while (j < n && (unicode_cat_mask(cp[j]) & (kCatL | kCatM))) ++j;
+            if (j > i + 1) return j - i;
+        }
+        if (i < n && (unicode_cat_mask(cp[i]) & (kCatL | kCatM))) {
+            int j = i + 1;
+            while (j < n && (unicode_cat_mask(cp[j]) & (kCatL | kCatM))) ++j;
+            return j - i;
+        }
+    }
+    // C: ' '?[\p{P}\p{S}]+[\r\n]*
+    if (i < n && (unicode_cat_mask(cp[i]) & (kCatP | kCatS))) {
+        int j = i + 1;
+        while (j < n && (unicode_cat_mask(cp[j]) & (kCatP | kCatS))) ++j;
+        while (j < n && (cp[j] == '\r' || cp[j] == '\n')) ++j;
+        return j - i;
+    }
+    if (i + 1 < n && cp[i] == ' ' && (unicode_cat_mask(cp[i + 1]) & (kCatP | kCatS))) {
+        int j = i + 2;
+        while (j < n && (unicode_cat_mask(cp[j]) & (kCatP | kCatS))) ++j;
+        while (j < n && (cp[j] == '\r' || cp[j] == '\n')) ++j;
+        return j - i;
+    }
+    // D: \s*[\r\n]+
+    {
+        int j = i;
+        while (j < n && unicode_is_whitespace(cp[j])) ++j;
+        if (j > i) {
+            int last_nl = -1;
+            for (int k = i; k < j; ++k)
+                if (cp[k] == '\r' || cp[k] == '\n') last_nl = k;
+            if (last_nl >= 0) return last_nl - i + 1;
+        }
+    }
+    // E: \s+(?!\S)
+    {
+        int j = i;
+        while (j < n && unicode_is_whitespace(cp[j])) ++j;
+        if (j > i) {
+            if (j == n) return j - i;      // trailing whitespace: consume all
+            if (j - i >= 2) return j - i - 1;  // leave the last ws for the next piece
+        }
+    }
+    // F: \s+
+    {
+        int j = i;
+        while (j < n && unicode_is_whitespace(cp[j])) ++j;
+        if (j > i) return j - i;
+    }
+    return 0;
+}
+
+// Apply one `Split(..., behavior="isolated")` pass to `s`.
+template <typename MatchFn>
+std::vector<std::string> split_isolated(const std::string& s, MatchFn match) {
+    std::vector<std::string> out;
+    std::vector<std::uint32_t> cps;
+    std::vector<std::size_t> offs;
+    decode_utf8_offsets(s, cps, offs);
+    const int n = static_cast<int>(cps.size());
+    std::size_t seg_start = 0;
+    int i = 0;
+    while (i < n) {
+        const int len = match(cps, n, i);
+        if (len > 0) {
+            const std::size_t ms = offs[i];
+            const std::size_t me = offs[i + len];
+            if (ms > seg_start) out.push_back(s.substr(seg_start, ms - seg_start));
+            out.push_back(s.substr(ms, me - ms));
+            i += len;
+            seg_start = me;
+        } else {
+            ++i;
+        }
+    }
+    if (seg_start < s.size()) out.push_back(s.substr(seg_start));
+    return out;
+}
+
+struct ByteMaps {
+    std::string byte_to_char[256];
+    std::unordered_map<std::uint32_t, int> cp_to_byte;
+    ByteMaps() { build_byte_maps(byte_to_char, cp_to_byte); }
+};
+
+const ByteMaps& byte_maps() {
+    static const ByteMaps maps;
+    return maps;
+}
+
+std::string map_bytes(const std::string& s) {
+    const ByteMaps& m = byte_maps();
+    std::string out;
+    out.reserve(s.size() * 2);
+    for (unsigned char c : s) out += m.byte_to_char[c];
+    return out;
 }
 
 }  // namespace
@@ -146,6 +363,14 @@ Tokenizer Tokenizer::from_file(const std::string& path) {
         }
         std::sort(t.specials_.begin(), t.specials_.end(),
                   [](const auto& x, const auto& y) { return x.first.size() > y.first.size(); });
+    }
+
+    // Index specials by their first byte to keep encode() linear-ish.
+    t.special_by_first_.assign(256, {});
+    for (std::size_t k = 0; k < t.specials_.size(); ++k) {
+        if (t.specials_[k].first.empty()) continue;
+        t.special_by_first_[static_cast<unsigned char>(t.specials_[k].first[0])].push_back(
+            static_cast<int>(k));
     }
 
     // bos/eos from tokenizer_config (best effort)
@@ -220,89 +445,51 @@ std::vector<int> Tokenizer::encode_pretoken(const std::string& mapped) const {
     return ids;
 }
 
-std::vector<int> Tokenizer::encode(const std::string& text, bool add_bos, bool add_eos) const {
-    static std::string byte_to_char[256];
-    static std::unordered_map<std::uint32_t, int> cp_to_byte;
-    static bool init = false;
-    if (!init) {
-        build_byte_maps(byte_to_char, cp_to_byte);
-        init = true;
+// Apply the three `Split` pre-tokenizers in sequence and ByteLevel-map the
+// resulting pieces.  `text` must not contain special/added tokens (the caller
+// extracts those first).
+std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
+    std::vector<std::string> stage1 = split_isolated(text, match_numbers);
+    std::vector<std::string> out;
+    for (const std::string& a : stage1) {
+        std::vector<std::string> stage2 = split_isolated(a, match_cjk);
+        for (const std::string& b : stage2) {
+            std::vector<std::string> stage3 = split_isolated(b, match_pattern3);
+            for (const std::string& c : stage3) out.push_back(map_bytes(c));
+        }
     }
-    (void)cp_to_byte;
+    return out;
+}
 
+std::vector<int> Tokenizer::encode(const std::string& text, bool add_bos, bool add_eos) const {
     std::vector<int> ids;
     if (add_bos) ids.push_back(bos_id_);
 
-    // Split into special / normal segments.
+    // Split into special / normal segments, then pre-tokenize the normal runs.
     std::size_t i = 0;
     std::string normal;
     auto flush = [&]() {
         if (normal.empty()) return;
-        // pretokenize on raw bytes
-        std::size_t p = 0;
-        const std::size_t n = normal.size();
-        while (p < n) {
-            const unsigned char c = static_cast<unsigned char>(normal[p]);
-            std::size_t end = p;
-            if (std::isalpha(c)) {
-                while (end < n && std::isalpha(static_cast<unsigned char>(normal[end]))) ++end;
-            } else if (std::isdigit(c)) {
-                while (end < n && std::isdigit(static_cast<unsigned char>(normal[end]))) ++end;
-            } else if (c == ' ') {
-                if (p + 1 < n && std::isalpha(static_cast<unsigned char>(normal[p + 1]))) {
-                    end = p + 2;
-                    while (end < n && std::isalpha(static_cast<unsigned char>(normal[end]))) ++end;
-                } else if (p + 1 < n && std::isdigit(static_cast<unsigned char>(normal[p + 1]))) {
-                    end = p + 2;
-                    while (end < n && std::isdigit(static_cast<unsigned char>(normal[end]))) ++end;
-                } else {
-                    end = p + 1;
-                    if (p + 1 < n && static_cast<unsigned char>(normal[p + 1]) == ' ') {
-                        while (end < n && static_cast<unsigned char>(normal[end]) == ' ') ++end;
-                    }
-                }
-            } else if (c == '\'' && p + 1 < n) {
-                end = p + 1;
-                for (const auto& con : kContractions) {
-                    if (starts_with(normal, p, con)) {
-                        end = p + con.size();
-                        break;
-                    }
-                }
-            } else if (std::isspace(c)) {
-                end = p + 1;
-                while (end < n && std::isspace(static_cast<unsigned char>(normal[end]))) ++end;
-            } else {
-                // punctuation / non-ascii run, optionally followed by letters
-                end = p + 1;
-                while (end < n) {
-                    const unsigned char d = static_cast<unsigned char>(normal[end]);
-                    if (std::isalnum(d) || std::isspace(d)) break;
-                    ++end;
-                }
-                while (end < n && std::isalpha(static_cast<unsigned char>(normal[end]))) ++end;
-            }
-            // map bytes
-            std::string mapped;
-            mapped.reserve((end - p) * 2);
-            for (std::size_t k = p; k < end; ++k)
-                mapped += byte_to_char[static_cast<unsigned char>(normal[k])];
-            std::vector<int> sub = encode_pretoken(mapped);
+        for (const std::string& piece : pretokenize(normal)) {
+            std::vector<int> sub = encode_pretoken(piece);
             ids.insert(ids.end(), sub.begin(), sub.end());
-            p = end;
         }
         normal.clear();
     };
 
     while (i < text.size()) {
         bool matched = false;
-        for (const auto& sp : specials_) {
-            if (starts_with(text, i, sp.first)) {
-                flush();
-                ids.push_back(sp.second);
-                i += sp.first.size();
-                matched = true;
-                break;
+        const unsigned char first = static_cast<unsigned char>(text[i]);
+        if (first < special_by_first_.size()) {
+            for (int idx : special_by_first_[first]) {
+                const auto& sp = specials_[static_cast<std::size_t>(idx)];
+                if (starts_with(text, i, sp.first)) {
+                    flush();
+                    ids.push_back(sp.second);
+                    i += sp.first.size();
+                    matched = true;
+                    break;
+                }
             }
         }
         if (!matched) {
