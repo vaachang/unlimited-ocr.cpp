@@ -84,6 +84,8 @@ public:
                               const std::vector<int>& lengths, const std::vector<int>& slots,
                               std::vector<std::vector<float>>& logits);
     int batch_slots() const { return batch_slots_; }
+    // Number of captured batched-decode graphs (one per observed batch size).
+    int batch_graph_count() const;
 
     const ModelConfig& config() const { return cfg_; }
 
@@ -150,6 +152,14 @@ private:
     void run_graph_decode(int token, int pos, std::vector<float>& logits);
     void run_graph_decode_attn_dense(int token, int pos, std::vector<float>& logits);
 
+    // Batched-decode graphs.  The batch size fixes every grid dimension in
+    // `forward_batch`, while the row -> slot mapping, positions and token
+    // embeddings are read from persistent device buffers at replay time.  That
+    // means one graph per observed batch size is enough even as requests come
+    // and go (the active slot set may change between replays).
+    void invalidate_batch_graphs();
+    void capture_batch_graph(int batch);
+
     // Batched layer pieces (device MoE, per-slot R-SWA attention).
     void attention_block_batch(int li, int batch, const float* x, const int* positions,
                                const int* slots, float* h1, float* normed2, cudaStream_t stream);
@@ -206,6 +216,10 @@ private:
     cudaGraphExec_t graph_exec_ = nullptr;
     std::vector<cudaGraph_t> attn_graphs_;
     std::vector<cudaGraphExec_t> attn_graph_execs_;
+    // Batched decode graphs, indexed by (batch - 1); null entries are not yet
+    // captured.  Separate from the single-request graph above.
+    std::vector<cudaGraph_t> batch_graphs_;
+    std::vector<cudaGraphExec_t> batch_graph_execs_;
     float* h_embed_pinned_ = nullptr;
     int* h_pos_pinned_ = nullptr;
     cudaEvent_t ev_a_ = nullptr, ev_b_ = nullptr, ev_c_ = nullptr;

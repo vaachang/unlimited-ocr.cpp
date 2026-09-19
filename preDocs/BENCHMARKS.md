@@ -129,6 +129,44 @@ n=896, k=1280, group=128, iters=200（单次 GEMM 调用；`2*m*n*k` 计 FLOP）
 剩余瓶颈：batched decode 未纳入 CUDA Graph（host 逐 kernel 发射）；
 `matmul_t_bf16`（dense/shared 投影）仍是 CUDA-core tiled GEMM（~2 TFLOPS，未用 TC）。
 
+### 2.7 Batched CUDA Graph（`bench/bench_batch_real_*_{graph,plain}.txt`）
+
+`forward_batch + final rmsnorm` 现在整步捕获，按**行数 B** 缓存 Graph（见
+`CORE_TECH.md` §5.6）。基准先跑一次不计时的 `generate_batch` 做 warmup（捕获
+Graph、并在 `batch_configure` 复用分配），再计时第二次；因此表中的数字是
+**稳态**，不含一次性捕获开销。同命令加 `--no-graph` 得到 plain 对照。
+
+prompt=64、steps=16、max_batch=16（tok/s 含整波 prefill；括号内为从 `decode_ms`
+减去 prefill 墙钟得到的纯 decode 吞吐）：
+
+| batch | BF16 plain | BF16 graph | INT4 plain | INT4 graph |
+|---|---|---|---|---|
+| 1 | 101.7 (135) | 102.0 (135) | 91.4 (136) | 91.9 (136) |
+| 2 | 90.6 (111) | 90.6 (111) | 81.8 (110) | 82.8 (112) |
+| 4 | 116.8 (197) | 117.0 (197) | 135.9 (195) | 137.0 (195) |
+| 8 | 192.0 (327) | 187.9 (318) | 220.5 (322) | 215.1 (321) |
+| 16 | 283.2 (479) | **294.8 (511)** | 307.6 (462) | 307.0 (461) |
+
+结论（诚实版）：
+
+- **正确性**：`uocr_cuda_tests` 的 batched graph vs plain 在非恒等 slot 排列、
+  W=8 跑 14 步（覆盖环形覆写）下 logits rel_l2 = 0（逐位一致），且确认捕获到
+  Graph；batch 两次调用复用分配/图后 token 不变。
+- **性能**：当前工作负载已接近带宽/占用受限，host 发射不是瓶颈，因此整步捕获
+  带来的吞吐变化基本在 run-to-run 噪声（±3%）内（BF16 batch=16 纯 decode
+  479→511，+6.7%，其余持平）。它的主要价值是每步 host 侧只剩 **1 次 graph
+  launch + 1 次 lm_head launch**（而非 ~275 次），在更小 batch、更多并发图或
+  launch 延迟更高的平台上收益会更明显。lm_head 仍在图外（其 logits buffer 会
+  按需扩容，但仍是每步最大的一段固定开销）。
+- 复现：
+  ```bash
+  ./build-cuda/benchmarks/bench_cuda_batch --real      --prompt 64 --steps 16 --max-batch 16
+  ./build-cuda/benchmarks/bench_cuda_batch --real      --no-graph --prompt 64 --steps 16 --max-batch 16
+  ./build-cuda/benchmarks/bench_cuda_batch --real --int4 --prompt 64 --steps 16 --max-batch 16
+  ./build-cuda/benchmarks/bench_cuda_batch --real --int4 --no-graph --prompt 64 --steps 16 --max-batch 16
+  ```
+
+
 ## 3. 数值对齐
 
 ### 3.1 端到端 OCR（`bench/compare_ocr.txt`）

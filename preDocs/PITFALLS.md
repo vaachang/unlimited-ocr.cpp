@@ -225,3 +225,24 @@ position_ids = arange(past_key_values_length, seq_length + past_key_values_lengt
   并按 slot 索引 `d_len/d_ring_pos/d_prefill_len`，激活仍按行 b。
 - 回归：新增单测用非恒等排列 `slots={2,1,0}` 与逐 slot 参考内核对比，
   attention / cache 误差为 0。
+
+## 14. batched CUDA Graph 的失效边界（2026-09-19）
+
+把 `forward_batch` 整步捕获后，有两类看似会失效、实际不会的“动态”量与一类
+真正会失效的量：
+
+- **不需要重捕获**：活跃 slot 集合、行→slot 排列、position、token embedding。
+  它们只影响 kernel 的**参数/内容**，不影响 grid 形状或 buffer 地址；只要每步
+  把它们写进地址固定的 `d_batch_slots_/d_pos_/d_xin_`，replay 时读取即可。
+  因此 `batch_decode` 只需按**行数 B** 选择 Graph。
+- **需要重捕获**：任何改变已烘焙地址或静态参数的重新分配，具体是
+  ① `ensure_scratch` 因更大 `seq` 扩容（`scratch_`、`d_xin_`… 基址变化）；
+  ② `ensure_router_scratch` 扩容（`router_cap_` 是 expert kernel 的静态参数，
+  且 `d_act_/d_assign_*` 基址变化）；③ `batch_configure` 重分配 per-slot KV 与
+  `d_batch_len_/d_slots_`。这三处统一调用 `invalidate_batch_graphs()`。
+- 顺序坑：`capture_batch_graph` 里必须先调用 `ensure_*` 再 resize/查表。
+  否则若 `ensure_*` 触发失效清空了 `batch_graphs_`，随后的
+  `batch_graphs_[B-1] = …` 会越界。实际路径中 `batch_decode` 已提前 ensure、
+  捕获时必然 early-return，但把顺序写对才稳。
+- 另注：`graph_scope=="attn_dense"` 的逐层图是给单请求 seq=1 设计的，batched
+  decode 在该 scope 下自动回退到逐 kernel 路径。

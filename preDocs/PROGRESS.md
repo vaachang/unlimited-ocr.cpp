@@ -39,6 +39,7 @@
 ✅ batched R-SWA attention/append 内核（每步 attention kernel 数 O(B·L)→O(L)）
 ✅ prefill 走 device masked MoE（prefill/请求 88→53ms INT4、35ms BF16）
 ✅ ragged 多请求 prefill（整波一次前向，batch=16 prefill 串行 16×88ms→279ms）
+✅ batched decode 纳入 CUDA Graph（按行数缓存图；活跃 slot 变化无需重捕获）
 ```
 
 > 性能原始数据与汇总见 `BENCHMARKS.md` 和 `bench/` 目录。
@@ -227,11 +228,14 @@ tok/s；batch=16 整波 prefill 16×88ms→279ms(INT4)/370ms(BF16)。同时修�
 
 仍待完成（见 `tAgent.md`）：
 
-1. **Batched CUDA Graph**：Graph 仅覆盖单请求 seq=1 稳态，batched decode 仍 host 逐
-   kernel 发射。
-2. **dense/shared GEMM 上 tensor core**：`matmul_t_bf16` 仍是 CUDA-core tiled
-   （~2 TFLOPS），占 batch prefill 相当比例。
-3. **精度评测**：OmniDocBench v1.6（AWQ vs BF16）未接入。
-4. **Prefill KV 分区写入**：仍按参考语义保留全部 prefill KV（prj.md 的优化未做）。
-5. **TC 进一步调优**：swizzle / split-K / `cp.async` 双缓冲。
-6. **性能记录补全**：GPU SM 利用率（已装 ncu/nsys）、KV 碎片率、AWQ vs 朴素 INT4。
+1. **dense/shared GEMM 上 tensor core**：`matmul_t_bf16` 仍是 CUDA-core tiled
+   （~2 TFLOPS），占 batch prefill/decode 相当比例（也是 batched graph 收益被掩盖的
+   原因——瓶颈不在 launch）。
+2. **精度评测**：OmniDocBench v1.6（AWQ vs BF16）未接入。
+3. **Prefill KV 分区写入**：仍按参考语义保留全部 prefill KV（prj.md 的优化未做）。
+4. **TC 进一步调优**：swizzle / split-K / `cp.async` 双缓冲。
+5. **性能记录补全**：GPU SM 利用率（已装 ncu/nsys）、KV 碎片率、AWQ vs 朴素 INT4。
+
+2026-09-19 补充：batched decode 已纳入 CUDA Graph（`CORE_TECH.md` §5.6、
+`PITFALLS.md` §14、`BENCHMARKS.md` §2.7）。正确性通过；吞吐收益在当前带宽受限
+负载下有限，详情与原始数据见 `bench/bench_batch_real_*_{graph,plain}.txt`。

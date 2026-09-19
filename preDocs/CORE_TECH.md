@@ -163,12 +163,38 @@ prefill 的 `matmul_t_bf16` 改为 64×64 分块 + shared memory staging（panel
   - `EngineConfig::use_device_moe_prefill`（默认 true）控制单请求 prefill
     （`prefill_embeds`，OCR 路径）走 masked device MoE。
 
+### 5.6 Batched CUDA Graph（P2，2026-09-19）
+
+单请求 decode 早已整步捕获，但连续批处理的每一步仍由 host 逐 kernel 发射
+（每步约 `13 × ~20` 个 launch）。本项把 batched decode 也纳入 Graph：
+
+- **按 batch size 缓存 Graph**：`GpuDecoder` 维护 `batch_graphs_[B-1]` /
+  `batch_graph_execs_[B-1]`，第一次以某个行数 `B` 解码时捕获
+  `forward_batch + final rmsnorm`，之后同 `B` 直接 replay。不同步数只对应
+  有限个 `B`（`1..max_batch`），因此最多缓存 `max_batch` 张图。
+- **活跃集合变化不需要重捕获**：`B` 只决定 kernel 的 grid 维度；每步变化的
+  行→slot 映射、position、token embedding 都写入**地址固定**的
+  `d_batch_slots_ / d_pos_ / d_xin_`，在 replay 时被录制好的 kernel 读取。
+  因此请求进出、slot 复用、非恒等 slot 排列都不会使 Graph 失效——这与
+  tAgent 里“活跃集合变化即重捕获”的备选方案相比更省。
+- **失效条件**：只要 `ensure_scratch` / `ensure_router_scratch` 因更大的
+  `seq` 重新分配（scratch 基址或 `router_cap_` 改变），或
+  `batch_configure` 重分配 per-slot KV，就销毁全部 batched graph
+  （`invalidate_batch_graphs()`），下次解码重新捕获。
+- **lm_head 仍在图外**：`matmul_t_bf16` 的输出 `d_logits_batch_` 会按需扩容，
+  且每步都要 D2H 供采样，放在图外避免把可变量烘焙进去。
+- `graph_scope=="attn_dense"` 时 batched decode 回退到非 Graph 路径（逐层图仅
+  为单请求 seq=1 设计）。
+- 测试：`uocr_cuda_tests` 新增“batched decode graph vs plain”——固定 token/pos
+  脚本、非恒等 slot 排列、窗口 W=8 跑 14 步覆盖环形覆写，两者 logits
+  rel_l2 = 0（逐位一致），且 graph 路径确认捕获到 1 张图、plain 路径 0 张。
+
 ## 6. 与 `prj.md` 三大创新点的对应
 
 | prj.md 创新点 | 本项目实现 | 状态 |
 |---|---|---|
 | 固定+环形双层 KV 管理 | `RSWACache` + `BlockManager`（前缀引用计数 + 环形池） | 已实现 |
-| CUDA Graph 下的动态 MoE 路由 | 路由在 Graph 外求值、expert 在 Graph 内"全调度 + 掩码跳过" | 设计保留，未接入 Graph |
+| CUDA Graph 下的动态 MoE 路由 | 路由在 Graph 内以 device kernel 求值、expert 以"全调度 + 掩码跳过"执行；单请求与 batched decode 均整步捕获 | 已实现（含连续批处理） |
 | Prefill 的 KV 分区写入 | 参考实现并不丢弃 gap（见 PITFALLS §1），当前按参考语义；分区丢弃作为优化 TODO | 未实现优化 |
 
 ## 7. 端到端数据流（当前）

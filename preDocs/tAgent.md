@@ -1,6 +1,6 @@
 按照preDocs/prj.md中的内容实现这个项目。
 实现这个项目的过程中，有不明白、不清楚的地方问我。需要安装第三方依赖时请让我做决定，不要擅自安装。
-保留中间进度文档、踩过的坑、核心技术实现等内容，放在preDocs目录下。
+保留中间进度文档、重要性能测试结果、踩过的坑、核心技术实现等内容，放在preDocs目录下。
 使用g++作为C++编译器。
 记得使用git保存项目。
 
@@ -18,7 +18,7 @@
 → P2 合并访存内核与分块 prefill GEMM → P1 attention 逐层残差定位
 → P2 TC `ldmatrix`/shared-memory staging → 连续批处理接入 device decoder
 → **batched R-SWA attention/append 内核** → **ragged 多请求 prefill**
-→ **slot 映射 bug 修复**。
+→ **slot 映射 bug 修复** → **batched decode 纳入 CUDA Graph**。
 
 最终回归：`compare_ocr` greedy **24/24**（CPU 参考路径）；`uocr_cuda_tests` 全过
 （含 batched 排列 / ragged prefill / slot 复用）；CPU 单测 20/20。
@@ -37,14 +37,14 @@
 
 **下一步优先级**（按收益/成本排序，详见文末各节）：
 
-1. **Batched CUDA Graph**（最大剩余项）：Graph 目前只覆盖单请求 seq=1 稳态。
-   batched decode 仍由 host 逐 kernel 发射（每步 ~275 个 kernel）。可为固定 batch
-   shape 捕获 batched decode（按 batch size / 活跃 slot 组合缓存多个 Graph），
-   用 pinned staging 更新 token/pos/slot。注意 slots 会随请求进出变化，
-   需要“活跃集合变化即重捕获”或把 slot 映射做成设备端结构。
-2. **dense/shared 投影上 tensor core**：`matmul_t_bf16` 仍是 CUDA-core 分块 GEMM
-   （实测 ~2 TFLOPS），在 batch prefill 中占显著比例。用与 `moe_gemm_int4_tc`
-   相同的 `ldmatrix`/MMA 路径实现 bf16×bf16 tensor-core GEMM。
+1. ~~**Batched CUDA Graph**~~（已完成 2026-09-19）：`forward_batch` 整步捕获，
+   按行数 B 缓存图，活跃 slot 变化靠设备端 slot 映射免重捕获；详见 `CORE_TECH.md`
+   §5.6。正确性 rel_l2=0；吞吐收益在带宽受限负载下有限（BF16 batch=16 纯 decode
+   479→511 tok/s，其余持平，见 `BENCHMARKS.md` §2.7）。
+2. **dense/shared 投影上 tensor core**（当前首要剩余项）：`matmul_t_bf16` 仍是
+   CUDA-core 分块 GEMM（实测 ~2 TFLOPS），且 small-m（batch=16）时 64 行 tile 存在
+   浪费；lm_head `[129280,1280]` 是每步最大固定开销。参考 `moe_gemm_int4_tc` 的
+   `ldmatrix`/MMA 路径实现 bf16×bf16 tensor-core GEMM。
 3. **Prefill KV 分区写入优化**（prj.md 创新点三）：prefill 时按位置分区
    （视觉区/环形区/gap 丢弃），节省 ~70% prefill KV 写入带宽（当前按参考语义
    保留全部 prefill KV）。
@@ -190,7 +190,20 @@
 - [x] **slot 映射修复**：`batch_decode(tokens, positions, slots, logits)` 显式传入
       “行→slot”映射（此前按行号当 slot，请求顺序与 slot 顺序不一致时会读错
       KV）。见 `PITFALLS.md` §13。
-- [ ] **待优化**：batched decode 纳入 CUDA Graph；dense/shared 投影上 tensor core。
+- [ ] **待优化**：dense/shared 投影上 tensor core（`matmul_t_bf16` ~2 TFLOPS）。
+
+### P2 Batched CUDA Graph（已完成 2026-09-19）
+- [x] `forward_batch + final rmsnorm` 整步捕获；按行数 B 缓存
+      `batch_graphs_[B-1]`，第一次遇到该 B 时捕获、之后 replay。
+- [x] 活跃 slot 集合 / 行→slot 排列 / position / embedding 每步写入地址固定的
+      `d_batch_slots_/d_pos_/d_xin_`，replay 时读取 → **活跃集合变化无需重捕获**。
+- [x] 失效条件：scratch 扩容、`router_cap_` 扩容、`batch_configure` 重分配；统一
+      `invalidate_batch_graphs()`。`batch_configure` 形状不变时复用分配与图。
+- [x] 测试：batched graph vs plain（非恒等 slot、W=8、14 步含环形覆写）
+      logits rel_l2=0；`Engine batch` 二次调用复用图后 token 不变。
+- [x] 基准：`bench_cuda_batch --no-graph` 对照 + warmup 稳态计时，
+      原始数据 `bench/bench_batch_real_*_{graph,plain}.txt`，汇总见
+      `BENCHMARKS.md` §2.7。带宽受限下收益有限（BF16 batch=16 纯 decode +6.7%）。
 
 ### P2 分词器与性能记录
 - [x] 分词器对齐已提前到 P0/E0 执行（43/43），此处只保留性能与回归项。

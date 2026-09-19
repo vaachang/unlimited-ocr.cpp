@@ -281,6 +281,7 @@ GpuDecoder::~GpuDecoder() {
     f(d_batch_row_slot_);
     f(d_batch_last_idx_);
     f(d_logits_batch_);
+    invalidate_batch_graphs();
     invalidate_graph();
     if (ev_a_) cudaEventDestroy(ev_a_);
     if (ev_b_) cudaEventDestroy(ev_b_);
@@ -351,6 +352,9 @@ void GpuDecoder::upload_expert_table(const std::vector<ExpertWeights>& experts, 
 
 void GpuDecoder::ensure_scratch(int seq) {
     if (seq <= scratch_seq_ && scratch_ != nullptr) return;
+    // The scratch base changes, so every captured batched graph (which baked
+    // these addresses) must be discarded.
+    invalidate_batch_graphs();
     auto f = [](void* p) { if (p) cudaFree(p); };
     f(scratch_);
     f(d_xin_);
@@ -393,6 +397,9 @@ void GpuDecoder::ensure_scratch(int seq) {
 
 void GpuDecoder::ensure_router_scratch(int seq) {
     if (seq <= router_seq_ && d_count_ != nullptr) return;
+    // `router_cap_` is baked into the captured MoE kernels, so a resize
+    // invalidates the batched graphs as well.
+    invalidate_batch_graphs();
     auto f = [](void* p) { if (p) cudaFree(p); };
     f(d_router_ids_);
     f(d_router_w_);
@@ -653,6 +660,50 @@ void GpuDecoder::invalidate_graph() {
     graph_prefill_len_ = -1;
 }
 
+void GpuDecoder::invalidate_batch_graphs() {
+    for (cudaGraphExec_t e : batch_graph_execs_)
+        if (e) cudaGraphExecDestroy(e);
+    for (cudaGraph_t g : batch_graphs_)
+        if (g) cudaGraphDestroy(g);
+    batch_graph_execs_.clear();
+    batch_graphs_.clear();
+}
+
+int GpuDecoder::batch_graph_count() const {
+    int n = 0;
+    for (cudaGraphExec_t e : batch_graph_execs_)
+        if (e) ++n;
+    return n;
+}
+
+void GpuDecoder::capture_batch_graph(int batch) {
+    UOCR_CHECK(batch > 0, "capture_batch_graph: invalid batch size");
+    // Allocate every buffer the captured kernels address first: `ensure_*` may
+    // invalidate existing graphs (and clear the vectors below), so it must run
+    // before the resize/lookup.
+    ensure_scratch(batch);
+    ensure_router_scratch(batch);
+    if (static_cast<int>(batch_graph_execs_.size()) < batch) {
+        batch_graphs_.resize(batch, nullptr);
+        batch_graph_execs_.resize(batch, nullptr);
+    }
+    if (batch_graph_execs_[batch - 1] != nullptr) return;
+
+    const int h = cfg_.hidden_size;
+    cudaGraph_t graph = nullptr;
+    cu_check(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal),
+             "begin batch capture");
+    forward_batch(d_xin_, batch, d_pos_, d_batch_slots_, d_hidden_, stream_);
+    cuda::rmsnorm(d_hidden_, final_norm_, d_normed_, batch, h, cfg_.rms_norm_eps, stream_);
+    cu_check(cudaStreamEndCapture(stream_, &graph), "end batch capture");
+
+    cudaGraphExec_t exec = nullptr;
+    cu_check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0),
+             "instantiate batch graph");
+    batch_graphs_[batch - 1] = graph;
+    batch_graph_execs_[batch - 1] = exec;
+}
+
 void GpuDecoder::capture_decode_graph() {
     const int h = cfg_.hidden_size;
     ensure_scratch(1);
@@ -776,6 +827,30 @@ void GpuDecoder::prefill_tokens(const std::vector<int>& tokens, std::vector<floa
 // ---------------------------------------------------------------------------
 
 void GpuDecoder::batch_configure(int slots, int capacity) {
+    // Reuse the current allocation (and any captured batched graphs) when the
+    // shape is unchanged: only the per-slot state must be cleared.  Graphs are
+    // keyed by batch size and read the slot map from device memory, so they
+    // stay valid across requests as long as the buffers are not reallocated.
+    const bool reuse = slots == batch_slots_ && capacity == batch_cap_ &&
+                       !batch_k_.empty() && batch_k_[0] != nullptr && d_batch_len_ != nullptr;
+    if (reuse) {
+        const std::size_t per_slot =
+            static_cast<std::size_t>(batch_cap_) * batch_stride_ * sizeof(float);
+        for (int l = 0; l < cfg_.num_hidden_layers; ++l) {
+            cu_check(cudaMemset(batch_k_[l], 0, per_slot * slots), "batch k zero");
+            cu_check(cudaMemset(batch_v_[l], 0, per_slot * slots), "batch v zero");
+        }
+        cu_check(cudaMemset(d_batch_len_, 0, cfg_.num_hidden_layers * slots * sizeof(int)),
+                 "batch len zero");
+        cu_check(cudaMemset(d_batch_ring_, 0, cfg_.num_hidden_layers * slots * sizeof(int)),
+                 "batch ring zero");
+        cu_check(cudaMemset(d_batch_prefill_, 0, slots * sizeof(int)), "batch prefill zero");
+        slot_prefill_len_.assign(slots, 0);
+        return;
+    }
+    // The per-slot KV buffers and the length/slot tables are (re)allocated, so
+    // any captured batched-decode graph points at stale memory.
+    invalidate_batch_graphs();
     for (float* p : batch_k_)
         if (p) cudaFree(p);
     for (float* p : batch_v_)
@@ -1059,8 +1134,19 @@ void GpuDecoder::batch_decode(const std::vector<int>& tokens, const std::vector<
              "batch slots");
 
     cu_check(cudaEventRecord(ev_a_, 0), "batch ev a");
-    forward_batch(d_xin_, batch, d_pos_, d_batch_slots_, d_hidden_, 0);
-    cuda::rmsnorm(d_hidden_, final_norm_, d_normed_, batch, h, cfg_.rms_norm_eps, 0);
+    // A captured batched graph is valid for a fixed row count; the row -> slot
+    // map, positions and embeddings are staged into persistent device buffers
+    // just above and read at replay time, so the same graph serves any active
+    // slot set.  The lm_head projection stays outside the graph (it needs a
+    // logits buffer that may be reallocated).
+    const bool graph_ok = use_graph_ && graph_scope_ == GraphScope::kFull;
+    if (graph_ok) {
+        capture_batch_graph(batch);
+        cu_check(cudaGraphLaunch(batch_graph_execs_[batch - 1], 0), "batch graph launch");
+    } else {
+        forward_batch(d_xin_, batch, d_pos_, d_batch_slots_, d_hidden_, 0);
+        cuda::rmsnorm(d_hidden_, final_norm_, d_normed_, batch, h, cfg_.rms_norm_eps, 0);
+    }
     if (batch > batch_logits_cap_) {
         if (d_logits_batch_) cudaFree(d_logits_batch_);
         cu_check(cudaMalloc(&d_logits_batch_, static_cast<std::size_t>(batch) * V * sizeof(float)),

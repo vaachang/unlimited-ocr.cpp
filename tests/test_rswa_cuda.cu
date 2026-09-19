@@ -629,6 +629,87 @@ int main() {
         if (worst > 0.05f) ++failures;
     }
 
+    // ---- batched decode CUDA Graph vs plain (slot permutation + ring wrap) ----
+    {
+        ModelConfig cfg;
+        cfg.vocab_size = 256;
+        cfg.hidden_size = 64;
+        cfg.intermediate_size = 128;
+        cfg.moe_intermediate_size = 32;
+        cfg.num_hidden_layers = 2;
+        cfg.num_attention_heads = 4;
+        cfg.num_key_value_heads = 4;
+        cfg.first_k_dense_replace = 1;
+        cfg.n_routed_experts = 8;
+        cfg.n_shared_experts = 1;
+        cfg.num_experts_per_tok = 2;
+        cfg.norm_topk_prob = true;
+        cfg.sliding_window = 8;  // small: ring overwrites during the run
+        cfg.max_position_embeddings = 256;
+        cfg.projector_input_dim = 2048;
+        cfg.projector_n_embed = 64;
+
+        DecoderWeights w = DecoderWeights::random(cfg, 4242);
+        const int B = 3;
+        const int h = cfg.hidden_size;
+        std::vector<std::vector<int>> prompts = {{1, 2, 3, 4, 5}, {6, 7, 8}, {9, 10, 11, 12, 13, 14}};
+        const std::vector<int> slot_map = {3, 1, 2};  // non-identity permutation
+        const int steps = 14;
+
+        // Runs `steps` batched decode steps with a fixed token/position script
+        // (independent of sampling) so the graph and plain runs are comparable.
+        auto run = [&](bool use_graph, std::vector<std::vector<float>>& last,
+                       int& captured) {
+            cuda::GpuDecoder gpu(cfg, w);
+            gpu.set_use_graph(use_graph);
+            gpu.batch_configure(4, 32);
+            std::vector<float> embeds;
+            std::vector<int> starts, lengths;
+            for (int r = 0; r < B; ++r) {
+                starts.push_back(static_cast<int>(embeds.size()) / h);
+                lengths.push_back(static_cast<int>(prompts[r].size()));
+                embeds.resize(embeds.size() + static_cast<std::size_t>(prompts[r].size()) * h);
+                float* dst = embeds.data() + static_cast<std::size_t>(starts.back()) * h;
+                for (std::size_t t = 0; t < prompts[r].size(); ++t)
+                    w.embed_tokens.row(prompts[r][t], dst + static_cast<std::size_t>(t) * h);
+            }
+            std::vector<std::vector<float>> pf;
+            gpu.batch_prefill_embeds(embeds.data(), starts, lengths, slot_map, pf);
+
+            for (int s = 0; s < steps; ++s) {
+                std::vector<int> toks(B), poss(B);
+                for (int b = 0; b < B; ++b) {
+                    toks[b] = (s * 31 + b * 7 + 1) % cfg.vocab_size;
+                    poss[b] = lengths[b] + s;  // next position for this slot
+                }
+                gpu.batch_decode(toks, poss, slot_map, last);
+            }
+            captured = gpu.batch_graph_count();
+        };
+
+        std::vector<std::vector<float>> plain, graph;
+        int plain_captured = -1, graph_captured = -1;
+        run(false, plain, plain_captured);
+        run(true, graph, graph_captured);
+
+        auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+            double num = 0, den = 0;
+            for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+                const double e = static_cast<double>(a[i]) - b[i];
+                num += e * e;
+                den += static_cast<double>(b[i]) * b[i];
+            }
+            return std::sqrt(num / (den + 1e-30));
+        };
+        float worst = 0.0f;
+        for (int b = 0; b < B; ++b)
+            worst = std::max(worst, static_cast<float>(rel(graph[b], plain[b])));
+        const bool ok = worst <= 1e-4f && graph_captured >= 1 && plain_captured == 0;
+        std::printf("Batched decode graph vs plain: rel_l2=%.7f captured(plain=%d graph=%d) %s\n",
+                    worst, plain_captured, graph_captured, ok ? "OK" : "FAIL");
+        if (!ok) ++failures;
+    }
+
     // ---- Engine CUDA branch vs CPU branch (same tiny model) ----
     {
         ModelConfig cfg;
@@ -880,6 +961,13 @@ int main() {
             seq_flatten.push_back(-1);
         }
         auto rb = gpu_batch.generate_batch(prompts, 6);
+        // Second call with the same shapes must reuse the per-slot KV
+        // allocation and the captured batched graphs, producing identical
+        // tokens (guards the `batch_configure` reuse path).
+        auto rb2 = gpu_batch.generate_batch(prompts, 6);
+        bool reuse_ok = rb2.size() == rb.size();
+        for (std::size_t i = 0; i < rb.size() && reuse_ok; ++i)
+            if (rb2[i].tokens != rb[i].tokens) reuse_ok = false;
         bool order_ok = true;
         for (std::size_t i = 0; i < prompts.size(); ++i) {
             if (rb[i].prefill_tokens != static_cast<int>(prompts[i].size())) order_ok = false;
@@ -900,10 +988,11 @@ int main() {
             std::printf("]");
         }
         std::printf("\n");
-        std::printf("  batch_vs_sequential=%s batch_vs_cpu=%s order=%s %s\n",
-                    same_seq ? "OK" : "DIFF", same_cpu ? "OK" : "DIFF", order_ok ? "OK" : "BAD",
-                    (same_seq && same_cpu && order_ok) ? "OK" : "FAIL");
-        if (!same_seq || !order_ok) ++failures;
+        std::printf("  batch_vs_sequential=%s batch_vs_cpu=%s reuse=%s order=%s %s\n",
+                    same_seq ? "OK" : "DIFF", same_cpu ? "OK" : "DIFF", reuse_ok ? "OK" : "DIFF",
+                    order_ok ? "OK" : "BAD",
+                    (same_seq && same_cpu && order_ok && reuse_ok) ? "OK" : "FAIL");
+        if (!same_seq || !order_ok || !reuse_ok) ++failures;
     }
 
     // ---- continuous batching with slot recycling (more requests than slots) ----

@@ -61,12 +61,13 @@ ModelConfig synthetic_config() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool real = false, int4 = false;
+    bool real = false, int4 = false, no_graph = false;
     std::string model_dir = "models";
     int prompt_len = 64, steps = 32, max_batch = 16;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--real")) real = true;
         else if (!std::strcmp(argv[i], "--int4")) int4 = true;
+        else if (!std::strcmp(argv[i], "--no-graph")) no_graph = true;
         else if (!std::strcmp(argv[i], "--model") && i + 1 < argc) model_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_len = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--steps") && i + 1 < argc) steps = std::atoi(argv[++i]);
@@ -97,12 +98,13 @@ int main(int argc, char** argv) {
     ecfg.use_int4_experts = int4;
     ecfg.no_repeat_ngram_size = 0;
     ecfg.max_new_tokens = steps;
+    ecfg.use_cuda_graph = !no_graph;
 
     const std::size_t before = used_vram();
     Engine engine(cfg, ecfg, std::move(weights), Backend::CUDA);
 
-    std::printf("prompt=%d steps=%d max_batch=%d experts=%s\n", prompt_len, steps, max_batch,
-                int4 ? "INT4" : "BF16");
+    std::printf("prompt=%d steps=%d max_batch=%d experts=%s graph=%s\n", prompt_len, steps,
+                max_batch, int4 ? "INT4" : "BF16", no_graph ? "off" : "on");
     std::printf("%6s %12s %12s %14s %12s\n", "batch", "prefill_ms", "decode_ms", "tok/s", "peakMB");
 
     std::vector<std::vector<int>> all_prompts(max_batch);
@@ -115,6 +117,9 @@ int main(int argc, char** argv) {
     for (int B : {1, 2, 4, 8, 16}) {
         if (B > max_batch) break;
         std::vector<std::vector<int>> prompts(all_prompts.begin(), all_prompts.begin() + B);
+        // Warmup: captures the batched CUDA graph (first decode) so the timed
+        // run measures steady state, not the one-off capture cost.
+        (void)engine.generate_batch(prompts, steps);
         double t_prefill = 0.0;
         const double t0 = now_ms();
         auto res = engine.generate_batch(prompts, steps);
