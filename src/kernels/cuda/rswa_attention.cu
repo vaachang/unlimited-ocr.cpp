@@ -73,7 +73,93 @@ __global__ void rswa_decode_kernel(const float* __restrict__ q, const float* __r
     }
 }
 
+// General kernel: one block per (query s, head).  Used for prefill (causal) and
+// as a fallback for decode.
+template <int MAX_HD>
+__global__ void rswa_attn_kernel(const float* __restrict__ q, const float* __restrict__ kcache,
+                                 const float* __restrict__ vcache, int kv_len, int heads,
+                                 int kv_heads, int head_dim, float scale, int q_start, int causal,
+                                 float* __restrict__ out) {
+    const int qidx = blockIdx.x;
+    const int head = qidx % heads;
+    const int s = qidx / heads;
+    const int tid = threadIdx.x;
+    const int group = heads / kv_heads;
+    const int kvh = head / group;
+    const int qpos = q_start + s;
+    const int limit = causal ? min(kv_len, qpos + 1) : kv_len;
+    const float* qh = q + static_cast<std::size_t>(qidx) * head_dim;
+
+    __shared__ float q_sh[MAX_HD];
+    __shared__ float acc[MAX_HD];
+    __shared__ float red[256];
+    __shared__ float m_sh, l_sh;
+
+    if (tid == 0) {
+        m_sh = -1e30f;
+        l_sh = 0.0f;
+    }
+    if (tid < head_dim) {
+        q_sh[tid] = qh[tid];
+        acc[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int t = 0; t < limit; ++t) {
+        const std::size_t base =
+            (static_cast<std::size_t>(t) * kv_heads + kvh) * head_dim;
+        float part = 0.0f;
+        if (tid < head_dim) part = q_sh[tid] * kcache[base + tid];
+        red[tid] = part;
+        __syncthreads();
+        for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+            if (tid < st) red[tid] += red[tid + st];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const float dot = red[0] * scale;
+            const float m_new = fmaxf(m_sh, dot);
+            const float alpha = __expf(m_sh - m_new);
+            const float beta = __expf(dot - m_new);
+            red[0] = alpha;
+            red[1] = beta;
+            m_sh = m_new;
+            l_sh = l_sh * alpha + beta;
+        }
+        __syncthreads();
+        const float alpha = red[0];
+        const float beta = red[1];
+        if (tid < head_dim) acc[tid] = acc[tid] * alpha + beta * vcache[base + tid];
+        __syncthreads();
+    }
+
+    if (tid < head_dim) {
+        const float inv = l_sh > 0.0f ? 1.0f / l_sh : 0.0f;
+        out[static_cast<std::size_t>(qidx) * head_dim + tid] = acc[tid] * inv;
+    }
+}
+
 }  // namespace
+
+void rswa_attention(const float* q, const float* kcache, const float* vcache, int kv_len, int seq,
+                    int q_start, int heads, int kv_heads, int head_dim, bool causal, float* out,
+                    cudaStream_t stream) {
+    const float scale = rsqrtf(static_cast<float>(head_dim));
+    const int threads = 256;
+    const int blocks = seq * heads;
+    if (head_dim <= 64)
+        rswa_attn_kernel<64><<<blocks, threads, 0, stream>>>(q, kcache, vcache, kv_len, heads,
+                                                             kv_heads, head_dim, scale, q_start,
+                                                             causal ? 1 : 0, out);
+    else if (head_dim <= 128)
+        rswa_attn_kernel<128><<<blocks, threads, 0, stream>>>(q, kcache, vcache, kv_len, heads,
+                                                              kv_heads, head_dim, scale, q_start,
+                                                              causal ? 1 : 0, out);
+    else
+        rswa_attn_kernel<256><<<blocks, threads, 0, stream>>>(q, kcache, vcache, kv_len, heads,
+                                                              kv_heads, head_dim, scale, q_start,
+                                                              causal ? 1 : 0, out);
+}
 
 void rswa_attention_decode(const float* q, const float* kcache, const float* vcache, int kv_len,
                            int heads, int kv_heads, int head_dim, float* out,

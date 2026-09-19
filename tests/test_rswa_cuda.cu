@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "uocr/cuda_ops.h"
+#include "uocr/gpu_cache.h"
 #include "uocr/kv_cache.h"
 #include "uocr/quant.h"
 
@@ -89,6 +90,123 @@ int main() {
             max_err = std::max(max_err, std::fabs(cpu_out[i] - gpu_out[i]));
         std::printf("R-SWA attention: kv_len=%d max_err=%.6f\n", kv_len, max_err);
         if (max_err > 1e-3f) {
+            std::printf("  FAIL\n");
+            ++failures;
+        } else {
+            std::printf("  OK\n");
+        }
+    }
+
+    // ---- device R-SWA cache: ring overwrite + prefill causal attention ----
+    {
+        const int layers = 1, kv_heads = 10, heads = 10, hd = 128, W = 8, P = 4;
+        auto upload = [&](const std::vector<float>& h) -> float* {
+            float* d = nullptr;
+            if (cudaMalloc(&d, h.size() * sizeof(float)) != cudaSuccess) {
+                std::printf("cudaMalloc failed\n");
+                return nullptr;
+            }
+            if (cudaMemcpy(d, h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice) !=
+                cudaSuccess) {
+                std::printf("cudaMemcpy H2D failed\n");
+                return nullptr;
+            }
+            return d;
+        };
+
+        // decode path: drive host + device caches with the same K/V stream
+        RSWACache hc(layers, kv_heads, hd, W);
+        hc.reset(P);
+        cuda::GpuRSWACache gc(layers, kv_heads, hd, W);
+        gc.reset(P);
+        std::vector<float> pk = rand_vec(rng, static_cast<std::size_t>(P) * kv_heads * hd);
+        std::vector<float> pv = rand_vec(rng, static_cast<std::size_t>(P) * kv_heads * hd);
+        hc.write_prefill(0, pk.data(), pv.data(), P);
+        {
+            float* dk = upload(pk);
+            float* dv = upload(pv);
+            gc.write_prefill(0, dk, dv, P);
+            cudaFree(dk);
+            cudaFree(dv);
+        }
+        for (int t = 0; t < 24; ++t) {
+            std::vector<float> k = rand_vec(rng, kv_heads * hd);
+            std::vector<float> v = rand_vec(rng, kv_heads * hd);
+            hc.append_decode(0, k.data(), v.data());
+            float* dk = upload(k);
+            float* dv = upload(v);
+            gc.append_decode(0, dk, dv);
+            cudaFree(dk);
+            cudaFree(dv);
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        std::vector<float> q = rand_vec(rng, static_cast<std::size_t>(heads) * hd);
+        std::vector<float> cpu_out(static_cast<std::size_t>(heads) * hd);
+        hc.attention(0, q.data(), 1, hc.length(0) - 1, cpu_out.data(), heads, false);
+        float* dq = upload(q);
+        float* dout = nullptr;
+        CUDA_CHECK(cudaMalloc(&dout, cpu_out.size() * sizeof(float)));
+        gc.attention(0, dq, 1, hc.length(0) - 1, dout, heads, false);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<float> gpu_out(cpu_out.size());
+        CUDA_CHECK(cudaMemcpy(gpu_out.data(), dout, gpu_out.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        float dec_err = 0.0f;
+        for (std::size_t i = 0; i < cpu_out.size(); ++i)
+            dec_err = std::max(dec_err, std::fabs(cpu_out[i] - gpu_out[i]));
+        cudaFree(dq);
+        cudaFree(dout);
+
+        const std::size_t cap = static_cast<std::size_t>(hc.capacity()) * kv_heads * hd;
+        std::vector<float> gk(cap), gv(cap);
+        CUDA_CHECK(cudaMemcpy(gk.data(), gc.keys(0), cap * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(gv.data(), gc.values(0), cap * sizeof(float), cudaMemcpyDeviceToHost));
+        float kerr = 0.0f, verr = 0.0f;
+        for (std::size_t i = 0; i < cap; ++i) {
+            kerr = std::max(kerr, std::fabs(hc.keys(0)[i] - gk[i]));
+            verr = std::max(verr, std::fabs(hc.values(0)[i] - gv[i]));
+        }
+        std::printf("GpuRSWACache: len=%d decode_max_err=%.6f cache_k_err=%.6f cache_v_err=%.6f\n",
+                    gc.len(0), dec_err, kerr, verr);
+        if (dec_err > 1e-3f || kerr > 1e-5f || verr > 1e-5f) {
+            std::printf("  FAIL\n");
+            ++failures;
+        } else {
+            std::printf("  OK\n");
+        }
+
+        // prefill causal attention
+        RSWACache hp(layers, kv_heads, hd, W);
+        hp.reset(P);
+        hp.write_prefill(0, pk.data(), pv.data(), P);
+        cuda::GpuRSWACache gp(layers, kv_heads, hd, W);
+        gp.reset(P);
+        {
+            float* dk = upload(pk);
+            float* dv = upload(pv);
+            gp.write_prefill(0, dk, dv, P);
+            cudaFree(dk);
+            cudaFree(dv);
+        }
+        std::vector<float> qa = rand_vec(rng, static_cast<std::size_t>(P) * heads * hd);
+        std::vector<float> cpu_a(qa.size());
+        hp.attention(0, qa.data(), P, 0, cpu_a.data(), heads, true);
+        float* dqa = upload(qa);
+        float* douta = nullptr;
+        CUDA_CHECK(cudaMalloc(&douta, cpu_a.size() * sizeof(float)));
+        gp.attention(0, dqa, P, 0, douta, heads, true);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<float> gpu_a(cpu_a.size());
+        CUDA_CHECK(cudaMemcpy(gpu_a.data(), douta, gpu_a.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        float pre_err = 0.0f;
+        for (std::size_t i = 0; i < cpu_a.size(); ++i)
+            pre_err = std::max(pre_err, std::fabs(cpu_a[i] - gpu_a[i]));
+        cudaFree(dqa);
+        cudaFree(douta);
+        std::printf("GpuRSWACache prefill causal: max_err=%.6f\n", pre_err);
+        if (pre_err > 1e-3f) {
             std::printf("  FAIL\n");
             ++failures;
         } else {

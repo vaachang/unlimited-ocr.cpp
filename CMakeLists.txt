@@ -120,6 +120,7 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
         src/kernels/cuda/rope_fused.cu
         src/kernels/cuda/rswa_attention.cu
         src/kernels/cuda/moe_gemm_int4.cu
+        src/kernels/cuda/gpu_cache.cu
         src/kernels/cuda/backend.cu)
     target_include_directories(uocr_cuda PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include

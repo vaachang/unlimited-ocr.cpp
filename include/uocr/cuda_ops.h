@@ -39,6 +39,14 @@ void rswa_attention_decode(const float* q, const float* kcache, const float* vca
                            int heads, int kv_heads, int head_dim, float* out,
                            cudaStream_t stream = 0);
 
+// General R-SWA attention for a whole query block (prefill or decode).
+// q/out: [seq, heads, head_dim]; cache: [capacity, kv_heads, head_dim].
+// `q_start` is the absolute position of the first query; when `causal` is set,
+// query s attends slots [0, min(kv_len, q_start+s+1)).
+void rswa_attention(const float* q, const float* kcache, const float* vcache, int kv_len, int seq,
+                    int q_start, int heads, int kv_heads, int head_dim, bool causal, float* out,
+                    cudaStream_t stream = 0);
+
 // MoE INT4 GEMM: y[m,n] = x[m,k] * dequant(W_int4[n,k]); W is packed 2-per-byte
 // with per-group affine scale/zero.
 void moe_gemm_int4(const float* x, const std::uint8_t* packed, const float* scales,
