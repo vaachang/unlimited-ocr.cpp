@@ -211,6 +211,41 @@ m=8/16 从 ~36µs 降到 ~30µs（+20%）。lm_head 只在 2–8 TFLOPS——大
 每 k-step 两次 `__syncthreads` 限制了流水，是后续调优点（split-K、更大 BN、
 `cp.async` 双缓冲）。
 
+### 2.9 nsys kernel 分解（`bench/bench_nsys_batch_int4.txt`）
+
+命令（INT4，`steps=4` 以缩小 trace；包含 B=1..16 与 warmup，故是 prefill+decode 的
+混合统计）：
+
+```bash
+nsys profile --stats=true -o nsys_batch ./build-cuda/benchmarks/bench_cuda_batch \
+    --real --int4 --prompt 64 --steps 4 --max-batch 16
+```
+
+GPU kernel 时间占比（top）：
+
+| kernel | 占比 | instances | avg |
+|---|---|---|---|
+| `moe_gemm_int4_tc_kernel` | **55.4%** | 12096 | 55 µs |
+| `expert_gate_up_int4_kernel`（decode masked） | 12.6% | 44 | 3.44 ms |
+| `matmul_t_bf16_tc_kernel` | 9.3% | 950 | 117 µs |
+| `matmul_t_bf16_tc_small_kernel` | 7.0% | 32 | 2.64 ms |
+| `rswa_attn_ragged_kernel<128>`（ragged prefill） | 7.0% | 120 | 0.70 ms |
+| `expert_down_int4_kernel`（decode masked） | 6.3% | 44 | 1.71 ms |
+| 其余（scatter/gather/silu/rmsnorm/rope） | <2% | — | — |
+
+host API：`cudaMemcpy` 76%（2.46s，主要是权重上传 2.08GB）、`cudaStreamSynchronize`
+13%（427ms）、`cudaLaunchKernel` 27584 次 / 99ms；`cudaGraphLaunch` 仅 30 次——说明
+CUDA Graph 确实把逐步发射压到常数级。
+
+解读与下一步：
+
+- **prefill 的逐专家 `moe_gemm_int4_tc` 是最大头**：12096 次小 GEMM（avg 55µs）。
+  每个 prefill 波对 11 层 × 64 专家 × {gate,up,down} 各发一次，M≈tokens/expert。
+  优化方向：把每专家 token 数很少的专家合并成一次 masked/分组调用，或做
+  persistent kernel，减少小 GEMM 发射与低占用。
+- decode 的 masked INT4 专家（gate_up+down 18.9%）是第二块；其权重读取受带宽限制。
+- `rswa_attn_ragged` 7%：prefill attention 的 grid=(total,heads)，total 大时较可观。
+
 
 ## 3. 数值对齐
 

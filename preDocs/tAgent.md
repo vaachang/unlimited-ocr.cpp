@@ -49,13 +49,18 @@
 3. **TC 进一步调优**（进行中）：小 m 变体已完成（m ≤ 16 沿 n 拆 warp，见
    `CORE_TECH.md` §5.5）；lm_head 大 n 仍 2–8 TFLOPS，剩余 `swizzle` 减 bank
    conflict、split-K、`cp.async` 双缓冲。参考 `BENCHMARKS.md` §2.8。
-4. **Prefill KV 分区写入优化**（prj.md 创新点三）：prefill 时按位置分区
+4. **Prefill MoE 发射优化**（nsys 显示的最大头）：`forward_ragged` 对 11 层 × 64
+   专家 × 3 矩阵各发一次 `moe_gemm_int4_tc`（12096 次、avg 55µs、占 GPU kernel
+   时间 55%）。可把低 token 数的专家合并为一次 masked/分组调用，或用
+   persistent kernel。见 `BENCHMARKS.md` §2.9。
+5. **Prefill KV 分区写入优化**（prj.md 创新点三）：prefill 时按位置分区
    （视觉区/环形区/gap 丢弃），节省 ~70% prefill KV 写入带宽（当前按参考语义
-   保留全部 prefill KV）。
-5. **精度评测**：OmniDocBench v1.6（AWQ vs BF16 综合分）、AWQ vs 朴素 INT4 消融。
-6. **性能记录补全**：GPU SM 利用率（已装 ncu/nsys）、KV Cache 碎片率、
-   纯 decode 的 TTFT/TPOT 分解（当前吞吐含 prefill）。
-7. **权重加载优化**（prj.md 6.1）：`mmap` + `cudaHostRegister` pinned DMA 直通。
+   保留全部 prefill KV；注意与参考数值对齐的取舍）。
+6. **精度评测**：OmniDocBench v1.6（AWQ vs BF16 综合分）、AWQ vs 朴素 INT4 消融。
+7. **性能记录补全**：GPU SM 利用率（nsys kernel 分解已完成，见 §2.9；SM 峰值
+   utilization 仍需 ncu）、KV Cache 碎片率。
+8. **权重加载优化**（prj.md 6.1）：`mmap` + `cudaHostRegister` pinned DMA 直通
+   （nsys 显示权重上传 2.08GB H2D 占 host API 76%）。
 
 **已知遗留/技术债**：
 - `GpuDecoder::mlp_block` 的 host 路由分支（`dev_moe=false`）在每层做一次
