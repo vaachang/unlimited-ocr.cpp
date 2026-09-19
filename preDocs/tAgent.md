@@ -49,23 +49,58 @@
 2. **Grouped expert GEMM**：`forward_ragged` 每层逐专家发 3×64 个
    `moe_gemm_int4_tc`（12096 次/整轮、avg 55µs）。改为“一层一次 launch，block 映射到
    (expert, m-tile, n-tile)”可去除 ~2000 次小发射；与第 1 项一起做收益最大。
-3. **Prefill KV 分区写入优化**（prj.md 创新点三）：按位置分区（视觉区/环形区/gap
+3. **DeepEncoder CUDA 移植**（GPU 卸载缺口，工作量最大、潜力也大）：视觉编码器
+   （SAM-ViT + CLIP-ViT + projector，~1.5GB FP16）**目前是纯 CPU/OpenMP**，
+   `src/engine/deep_encoder.cpp` 无任何 CUDA；`Engine::image_embeddings` 在 CUDA
+   后端也走它，单图编码约 1–2 分钟。`prj.md` 架构图写的是「DeepEncoder (FP16,
+   CUDA Graph)」，应补齐：把 patch/pos embed、12 层 SAM block、neck、CLIP×24、
+   projector 做成设备内核并常驻 FP16 权重；可复用现有 `rmsnorm`/`matmul_t`/
+   attention 内核。**验收**：`tools/compare_vision` 在 CUDA 后端输出与 CPU/f32
+   参考 rel_l2 ≤ 6e-4，单图编码进入亚秒级。
+4. **大批量 prefill 的 device router**：`GpuDecoder::mlp_block(dev_moe=false)` 分支
+   （ragged 大批量 prefill 走此分支）每层把 router logits D2H + host top-k/分组 +
+   每专家 H2D 索引，形成同步点。把 top-k 下放设备端（复用 `moe_router_topk`），
+   为第 2 项的 grouped GEMM 提供设备端分组表。
+5. **device embedding / position 查表**：当前每步 `host_weights_->embed_tokens.row()`
+   在 host 查表再 H2D（`GpuDecoder` 的 `h_embed_pinned_`）。把 embedding 表常驻设备，
+   用 token id 在设备端 gather，省掉每步小 H2D（batch 越大越明显）。
+6. **Prefill KV 分区写入优化**（prj.md 创新点三）：按位置分区（视觉区/环形区/gap
    丢弃），省 ~70% prefill KV 写入带宽。**注意**：参考实现并不丢弃 gap
    （`PITFALLS.md` §1），改动会偏离参考数值，需先确认是否接受。
-4. **精度评测**：OmniDocBench v1.6（AWQ vs BF16 综合分）、AWQ vs 朴素 INT4 消融。
-5. **性能记录补全**：ncu 采 SM/DRAM 峰值利用率（nsys kernel 分解已完成，见
+7. **精度评测**：OmniDocBench v1.6（AWQ vs BF16 综合分）、AWQ vs 朴素 INT4 消融。
+8. **性能记录补全**：ncu 采 SM/DRAM 峰值利用率（nsys kernel 分解已完成，见
    `BENCHMARKS.md` §2.9）、KV Cache 碎片率、纯 decode 的 TTFT/TPOT 分解。
-6. **权重加载优化**（prj.md 6.1）：`mmap` + `cudaHostRegister` pinned DMA 直通
+9. **权重加载优化**（prj.md 6.1）：`mmap` + `cudaHostRegister` pinned DMA 直通
    （nsys 显示权重上传 2.08GB H2D 占 host API 76%）。
+
+> 第 3–5 项是「能上 GPU 但仍在 CPU」的模型部分（见本文档「GPU 卸载现状」小节）；
+> 其余（tokenizer、图像预处理、采样/ngram、调度）留在 CPU 属合理设计。
 
 **已知遗留/技术债**：
 - `GpuDecoder::mlp_block` 的 host 路由分支（`dev_moe=false`，ragged 大批量 prefill
-  走此分支）每层做一次 router D2H + host top-k；可与 grouped GEMM 一起下放设备端。
+  走此分支）每层做一次 router D2H + host top-k；见优先级 4。
+- **DeepEncoder 仅 CPU 实现**（优先级 3）；`Engine` 的 CUDA 后端在
+  `image_embeddings` 时仍调 CPU 编码器。
+- **embedding 查表在 host**（优先级 5），lm_head 已在设备。
 - `mlp_block_batch` 为未定义的空声明，可删除。
 - `batch_import_prefill` 已无调用者，可删除。
 - 真实 INT4 模型下 CUDA 端 greedy 尚未与参考 OCR 做端到端回归（当前 OCR 对齐
   走 CPU 参考路径）。
 - release 构建下 `matmul_t_bf16_ref` 仅用于单测 A/B，保留。
+
+### GPU 卸载现状（2026-09-19 审计）
+
+| 模型/计算部分 | 执行位置 | 备注 |
+|---|---|---|
+| 文本解码器（12 层 MoE：RMSNorm/QKV/O/RoPE/R-SWA/dense/shared/专家） | **GPU** | `GpuDecoder`，权重常驻 |
+| lm_head | **GPU** | 设备副本 + `matvec`/`matmul_t_bf16` |
+| MoE router / top-k（decode、小批量 prefill） | **GPU** | `moe_router_topk` |
+| MoE router / top-k（ragged 大批量 prefill） | **CPU** | 每层 router D2H + host top-k（优先级 4） |
+| token embedding 查表 | **CPU** | host gather + 每步 H2D（优先级 5） |
+| **DeepEncoder 视觉编码器（SAM+CLIP+projector, ~1.5GB）** | **CPU / OpenMP** | **无 CUDA 实现**（优先级 3） |
+| 采样 / no-repeat-ngram | CPU | 每步 D2H logits 后采样，属设计选择 |
+| tokenizer / 图像预处理 / 调度 | CPU | 设计如此 |
+
 
 ### P0 视觉编码器数值对齐（已完成 2026-09-15）
 - [x] 跑完 `tools/compare_vision.cpp`。`DeepEncoder::encode` 输出 273×1280 与

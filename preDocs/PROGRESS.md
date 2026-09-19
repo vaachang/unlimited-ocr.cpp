@@ -254,8 +254,16 @@ staging 重写、指标表、nsys kernel 分解、可选 reference CTest）。
    `cp.async` 双缓冲 + swizzle，目标把 4–18 TFLOPS 拉到数十 TFLOPS。
 2. **Grouped expert GEMM**：一层一次 launch，去掉每波 ~2000 次小 GEMM 发射
    （可与 1 合并）。
-3. **Prefill KV 分区写入**（prj.md 创新点三；与参考对齐有取舍，需确认）。
-4. **精度评测**：OmniDocBench v1.6（AWQ vs BF16）、AWQ vs 朴素 INT4。
-5. **性能记录补全**：ncu SM/DRAM 峰值利用率、KV 碎片率。
-6. **权重加载优化**：`mmap` + `cudaHostRegister` pinned DMA。
+3. **DeepEncoder CUDA 移植**（GPU 卸载缺口）：视觉编码器目前纯 CPU/OpenMP，
+   单图 1–2 分钟；`prj.md` 原计划是 FP16 CUDA（含 CUDA Graph）。
+4. **大批量 prefill device router**：消除每层 router D2H + host top-k。
+5. **device embedding/position 查表**：省每步小 H2D。
+6. **Prefill KV 分区写入**（prj.md 创新点三；与参考对齐有取舍，需确认）。
+7. **精度评测**：OmniDocBench v1.6（AWQ vs BF16）、AWQ vs 朴素 INT4。
+8. **性能记录补全**：ncu SM/DRAM 峰值利用率、KV 碎片率。
+9. **权重加载优化**：`mmap` + `cudaHostRegister` pinned DMA。
+
+> GPU 卸载审计（2026-09-19）：文本解码器（含 lm_head、decode router）已在 GPU；
+> 仍在 CPU 的模型部分是 **DeepEncoder**、**大批量 prefill 的 MoE 路由**、
+> **token embedding 查表**；采样/tokenizer/预处理/调度留 CPU 属设计选择。
 
