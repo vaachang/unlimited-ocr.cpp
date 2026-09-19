@@ -6,27 +6,39 @@
 
 ---
 
-## 下一阶段任务计划（2026-09-19 更新）
+## 下一阶段任务计划（2026-09-19 二次更新）
 
-进度与结果见 `PROGRESS.md`、`ALIGNMENT.md`、`PITFALLS.md`、`CORE_TECH.md`。
+进度与结果见 `PROGRESS.md`、`ALIGNMENT.md`、`PITFALLS.md`、`CORE_TECH.md`、
+`BENCHMARKS.md`（含 `bench/` 原始输出）。
 
 **已完成里程碑**：M1 调研 → M2 骨架 → M3 调度 → M4 引擎 → M5 CUDA 内核
 → M6 视觉对齐 → P0 端到端 OCR 对齐（E0–E5）→ P1 R-SWA 环形覆写验证
-→ P1 CUDA 设备端 decoder + Engine CUDA 分支 → P2 Tensor Core W4A16 GEMM。
+→ P1 CUDA 设备端 decoder + Engine CUDA 分支 → P2 Tensor Core W4A16 GEMM
+→ P2 CUDA Graph（device router + 固定调度掩码跳过）→ P2 device INT4 专家权重
+→ P2 合并访存内核与分块 prefill GEMM → P1 attention 逐层残差定位
+→ P2 TC `ldmatrix`/shared-memory staging → **连续批处理接入 device decoder**。
+最终回归：`compare_ocr` greedy **24/24**；`uocr_cuda_tests` 全过。
 
 **下一步优先级**（详见文末各节）：
 
-1. **P2 Tensor Core 性能**：`moe_gemm_int4_tc` 仍按标量读寄存器装入 mma，需
-   `ldmatrix`/shared-memory staging + split-K；prefill 已用 64×64 shared-memory
-   分块 GEMM，但 INT4 TC 路径未做。
-2. **P1 残留**：逐层对比 attention 的 q/k/v、O 投影输出，定位路由以外的残差
-   （需先扩展 `export_reference.py` 导出 attention 内部张量）。
-3. **批处理**：已完成（2026-09-19）。`Engine::generate_batch` 用
-   `ContinuousBatchScheduler` 驱动 device batched decoder（每 slot 独立 R-SWA KV）。
-   `bench_cuda_batch` 实测 INT4 batch=16 达 117.6 tok/s、显存 2.66GB；测试
-   `Engine batch` 验证 batch 与 sequential token 一致。**待优化**：batched attention
-   kernel（当前每 slot 循环发射）、batched/continuous prefill。
-4. **精度评测**：OmniDocBench v1.6（AWQ vs BF16）尚未接入。
+1. **Batched attention kernel（最大性能缺口）**：当前 batch decode 对每个 slot
+   循环发射 `rswa_append_decode` + `rswa_attention_devlen`（每步 B×L 个 kernel）。
+   需要写一个 grid=(B, heads) 的 batched R-SWA attention + batched ring append，
+   把每步 kernel 数从 O(B·L) 降到 O(L)。预期提升 batch=16 吞吐数倍。
+2. **Chunked/continuous prefill**：`generate_batch` 目前逐请求串行 prefill，长
+   prompt 时 prefill 主导墙钟。需要支持 ragged prefill（变长 + causal mask）或
+   chunked prefill，并纳入 CUDA Graph。
+3. **Batched CUDA Graph**：现在 Graph 只覆盖单请求 seq=1 稳态。可为固定 batch
+   shape 捕获 batched decode（按 batch size 缓存多个 Graph），去掉 batched
+   decode 的 host 逐 kernel 发射。
+4. **Prefill KV 分区写入优化**（prj.md 创新点三）：prefill 时按位置分区
+   （视觉区/环形区/gap 丢弃），节省 ~70% prefill KV 写入带宽。
+5. **TC 进一步调优**：`ldmatrix` 已完成；剩余 `swizzle` 减少 bank conflict、
+   split-K（小 m 场景）、`cp.async` 双缓冲。
+6. **精度评测**：OmniDocBench v1.6（AWQ vs BF16 综合分）、AWQ vs 朴素 INT4 消融。
+7. **性能记录补全**：GPU SM 利用率（需 ncu/nsys）、KV Cache 碎片率、
+   batch=8/16 的 TTFT（当前吞吐含串行 prefill，偏保守）。
+8. **权重加载优化**（prj.md 6.1）：`mmap` + `cudaHostRegister` pinned DMA 直通。
 
 ### P0 视觉编码器数值对齐（已完成 2026-09-15）
 - [x] 跑完 `tools/compare_vision.cpp`。`DeepEncoder::encode` 输出 273×1280 与
@@ -128,16 +140,33 @@
       “激活值 BF16 输入”矛盾。经确认采用 W4A16（内核内 INT4→BF16 反量化 +
       bf16 tensor core），既保留权重带宽收益又保留 BF16 激活精度。
 
-### P2 Tensor Core 性能优化（后续）
-- [ ] 目前 TC kernel 每线程标量读取权重/激活；应改用 `ldmatrix` / 共享内存
-      staging + swizzle，并做 split-K，才能接近峰值。
+### P2 Tensor Core 性能优化（部分完成 2026-09-19）
+- [x] `moe_gemm_int4_tc` 改用 shared-memory staging + `ldmatrix.x4/x2`：block=4
+      warps 计算 64×8 tile，反量化权重 panel 每 k-step 只加载一次并被共享。
+      微基准（n=896,k=1280）：m=273 1372µs→136µs（10.1×），m=128 653µs→71µs（9.2×），
+      最高 4.6 TFLOPS。原始数据 `bench/bench_int4_gemm.txt`。
+- [ ] 剩余：`swizzle` 消除 shared bank conflict、split-K（小 m）、`cp.async` 双缓冲。
+- [ ] prefill 的 `matmul_t_bf16` 已是 64×64 分块 shared-memory GEMM；可继续做
+      双缓冲与 register tiling。
+
+### P2 连续批处理（已完成 2026-09-19）
+- [x] `GpuDecoder` per-slot R-SWA KV cache + `attention_block_batch` /
+      `forward_batch` / `batch_decode`。
+- [x] `Engine::generate_batch` 由 `ContinuousBatchScheduler` 驱动：admit/prefill →
+      所有活跃 slot 一起 decode → 完成即释放 slot。
+- [x] 修复 CUDA 下 host `MemoryPool` 按 `max_seq_len×max_batch` 预分配数十 GB 的
+      问题（CUDA 后端改用小 arena）。
+- [x] `bench_cuda_batch`：INT4 batch=16 **117.6 tok/s / 2656MB**；BF16 73.5 tok/s。
+      测试 `Engine batch`（4 个不同长度 prompt）batch == sequential == CPU。
+- [ ] **待优化**：batched attention kernel（见下节优先级 1）、chunked prefill。
 
 ### P2 分词器与性能记录
-- [ ] 分词器对齐已提前到 P0/E0 执行（见上），此处只保留性能与回归项。
-- [ ] 补齐 prj.md §7.2 的所有指标（CUDA 上的 TTFT/TPOT/吞吐/峰值显存/碎片率），
-      以及 §7.3 的 ablation（INT4 vs BF16、AWQ vs 朴素 INT4、Graph 范围等）。
-- [ ] 把 `compare_reference` / `compare_vision` 纳入可选 CTest（需要 `.venv`
-      与权重，默认跳过）。
+- [x] 分词器对齐已提前到 P0/E0 执行（43/43），此处只保留性能与回归项。
+- [x] 补齐 prj.md §7.2 大部分指标（TTFT/TPOT/吞吐/峰值显存），见 `BENCHMARKS.md`
+      与 `prj.md §7.2`；§7.3 完成 INT4 vs BF16、Graph 范围消融。
+- [x] `compare_reference` / `compare_vision` 等纳入可选 CTest
+      （`-DENGINE_REFERENCE_DIR=...`，默认跳过）。
+- [ ] 仍缺：GPU SM 利用率（本机无 ncu/nsys）、KV Cache 碎片率、AWQ vs 朴素 INT4。
 
 ### 环境与依赖备注
 - 仅第三方 C++ 依赖：系统 `nlohmann/json`（已安装）；未用 `spdlog`（自研 log）。

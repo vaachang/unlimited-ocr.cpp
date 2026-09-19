@@ -38,6 +38,8 @@
 ✅ 连续批处理接入 device decoder（`Engine::generate_batch`，每 slot 独立 R-SWA KV）
 ```
 
+> 性能原始数据与汇总见 `BENCHMARKS.md` 和 `bench/` 目录。
+
 ### CUDA Graph 与性能（P2，2026-09-19）
 
 - **device router**：`moe_router_topk` 在设备端做 softmax/top-k + 按专家分组，去掉了每层
