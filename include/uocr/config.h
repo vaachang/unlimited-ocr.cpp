@@ -100,6 +100,10 @@ struct EngineConfig {
     // routing + fused expert kernel); "attn_dense" captures only the attention
     // subgraphs and issues the MoE outside the graph (ablation).
     std::string graph_scope = "full";
+    // Run device-resident MoE (device router + fused masked expert kernel) for
+    // prefill as well as decode.  This is faster than the per-expert tensor-core
+    // GEMM path when few tokens route to each expert (single-request prefill).
+    bool use_device_moe_prefill = true;
     bool use_int4_experts = true;
     int int4_group_size = 128;
 

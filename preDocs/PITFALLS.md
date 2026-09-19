@@ -210,3 +210,18 @@ position_ids = arange(past_key_values_length, seq_length + past_key_values_lengt
   这样**同一个 Graph 能跨越 warmup→稳态**。
 - **设备地址稳定**：所有 scratch、router 分组 buffer、pinned staging 必须预分配，
   捕获期间不能 `cudaMalloc`。
+
+## 13. 连续批处理的 slot 映射错位（2026-09-19，隐性 bug）
+
+`Engine::generate_batch` 用 `free_slots.back()` 给请求分配 slot（先到先得 → 倒序），
+但最初的 `GpuDecoder::batch_decode` 直接假设“decode 数组第 b 行 = slot b”。当请求
+顺序与 slot 顺序不一致时，每行会读写**别人的 KV cache**。
+
+- 为什么原来的 `Engine batch` 测试没抓到：tiny 随机模型的 greedy 输出由当前 token
+  的 embedding 主导，attention/MoE 的随机贡献不足以改变 argmax，错位 cache 仍得到
+  相同 token。
+- 修复：`batch_decode(tokens, positions, slots, logits)` 显式传入“行→slot”映射，
+  `rswa_append_decode_batch` / `rswa_attention_batch` 用 `d_slots[b]` 选 cache base
+  并按 slot 索引 `d_len/d_ring_pos/d_prefill_len`，激活仍按行 b。
+- 回归：新增单测用非恒等排列 `slots={2,1,0}` 与逐 slot 参考内核对比，
+  attention / cache 误差为 0。

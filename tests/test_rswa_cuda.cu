@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -212,6 +213,146 @@ int main() {
         cudaFree(douta);
         std::printf("GpuRSWACache prefill causal: max_err=%.6f\n", pre_err);
         if (pre_err > 1e-3f) {
+            std::printf("  FAIL\n");
+            ++failures;
+        } else {
+            std::printf("  OK\n");
+        }
+    }
+
+    // ---- batched R-SWA append/attention vs per-slot device kernels ----
+    {
+        const int kv_heads = 4, heads = 4, hd = 64, W = 8, batch = 3;
+        const int prefill[batch] = {4, 6, 3};
+        const int cap = 6 + W;
+        const std::size_t stride = static_cast<std::size_t>(kv_heads) * hd;
+        const std::size_t slot_elems = static_cast<std::size_t>(cap) * stride;
+
+        std::vector<float> init_k(static_cast<std::size_t>(batch) * slot_elems, 0.0f);
+        std::vector<float> init_v(init_k.size(), 0.0f);
+        for (int b = 0; b < batch; ++b) {
+            auto k = rand_vec(rng, static_cast<std::size_t>(prefill[b]) * stride);
+            auto v = rand_vec(rng, static_cast<std::size_t>(prefill[b]) * stride);
+            std::copy(k.begin(), k.end(), init_k.begin() + static_cast<std::size_t>(b) * slot_elems);
+            std::copy(v.begin(), v.end(), init_v.begin() + static_cast<std::size_t>(b) * slot_elems);
+        }
+
+        auto upload = [&](const std::vector<float>& h) -> float* {
+            float* d = nullptr;
+            if (cudaMalloc(&d, h.size() * sizeof(float)) != cudaSuccess) return nullptr;
+            cudaMemcpy(d, h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice);
+            return d;
+        };
+        float* dk_batch = upload(init_k);
+        float* dv_batch = upload(init_v);
+        float* dk_ref = upload(init_k);
+        float* dv_ref = upload(init_v);
+        int *d_len_b = nullptr, *d_ring_b = nullptr, *d_pref = nullptr, *d_slots = nullptr;
+        int *d_len_r = nullptr, *d_ring_r = nullptr;
+        // Decode row -> cache slot permutation (non-identity on purpose).
+        const int slots[batch] = {2, 1, 0};
+        CUDA_CHECK(cudaMalloc(&d_len_b, batch * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_ring_b, batch * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_pref, batch * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_slots, batch * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_len_r, batch * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_ring_r, batch * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_len_b, prefill, batch * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_len_r, prefill, batch * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_pref, prefill, batch * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_slots, slots, batch * sizeof(int), cudaMemcpyHostToDevice));
+        std::vector<int> zero(batch, 0);
+        CUDA_CHECK(cudaMemcpy(d_ring_b, zero.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_ring_r, zero.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
+
+        const int steps = 3 * W;  // warmup, fill, and several ring wraps
+        float worst = 0.0f;
+        for (int step = 0; step < steps; ++step) {
+            std::vector<float> kstep(static_cast<std::size_t>(batch) * stride);
+            std::vector<float> vstep(kstep.size());
+            for (int b = 0; b < batch; ++b) {
+                auto k = rand_vec(rng, stride);
+                auto v = rand_vec(rng, stride);
+                std::copy(k.begin(), k.end(), kstep.begin() + static_cast<std::size_t>(b) * stride);
+                std::copy(v.begin(), v.end(), vstep.begin() + static_cast<std::size_t>(b) * stride);
+            }
+            std::vector<float> q = rand_vec(rng, static_cast<std::size_t>(batch) * heads * hd);
+            float* d_kstep = upload(kstep);
+            float* d_vstep = upload(vstep);
+            float* d_q = upload(q);
+            float* d_out_b = nullptr;
+            float* d_out_r = nullptr;
+            CUDA_CHECK(cudaMalloc(&d_out_b, q.size() * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_out_r, q.size() * sizeof(float)));
+
+            cuda::rswa_append_decode_batch(d_kstep, d_vstep, dk_batch, dv_batch, d_len_b, d_ring_b,
+                                           d_pref, d_slots, batch, cap, W, kv_heads, hd);
+            cuda::rswa_attention_batch(d_q, dk_batch, dv_batch, d_len_b, d_slots, batch, cap,
+                                       heads, kv_heads, hd, d_out_b);
+
+            for (int b = 0; b < batch; ++b) {
+                const int sl = slots[b];
+                cuda::rswa_append_decode(d_kstep + static_cast<std::size_t>(b) * stride,
+                                         d_vstep + static_cast<std::size_t>(b) * stride,
+                                         dk_ref + static_cast<std::size_t>(sl) * slot_elems,
+                                         dv_ref + static_cast<std::size_t>(sl) * slot_elems,
+                                         d_len_r + sl, d_ring_r + sl, prefill[sl], W, kv_heads, hd);
+                cuda::rswa_attention_devlen(
+                    d_q + static_cast<std::size_t>(b) * heads * hd,
+                    dk_ref + static_cast<std::size_t>(sl) * slot_elems,
+                    dv_ref + static_cast<std::size_t>(sl) * slot_elems, d_len_r + sl, 1, 0, heads,
+                    kv_heads, hd, false,
+                    d_out_r + static_cast<std::size_t>(b) * heads * hd);
+            }
+            CUDA_CHECK(cudaDeviceSynchronize());
+            std::vector<float> out_b(q.size()), out_r(q.size());
+            CUDA_CHECK(cudaMemcpy(out_b.data(), d_out_b, q.size() * sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(out_r.data(), d_out_r, q.size() * sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+            for (std::size_t i = 0; i < q.size(); ++i)
+                worst = std::max(worst, std::fabs(out_b[i] - out_r[i]));
+
+            cudaFree(d_kstep);
+            cudaFree(d_vstep);
+            cudaFree(d_q);
+            cudaFree(d_out_b);
+            cudaFree(d_out_r);
+        }
+
+        // The batched ring cursors must have advanced identically.
+        std::vector<int> len_b(batch), len_r(batch);
+        CUDA_CHECK(cudaMemcpy(len_b.data(), d_len_b, batch * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(len_r.data(), d_len_r, batch * sizeof(int), cudaMemcpyDeviceToHost));
+        const bool len_ok = len_b == len_r;
+
+        // Final cache contents must match the per-slot reference exactly.
+        const std::size_t total = static_cast<std::size_t>(batch) * slot_elems;
+        std::vector<float> kb(total), kr(total), vb(total), vr(total);
+        CUDA_CHECK(cudaMemcpy(kb.data(), dk_batch, total * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(kr.data(), dk_ref, total * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(vb.data(), dv_batch, total * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(vr.data(), dv_ref, total * sizeof(float), cudaMemcpyDeviceToHost));
+        float cache_err = 0.0f;
+        for (std::size_t i = 0; i < total; ++i) {
+            cache_err = std::max(cache_err, std::fabs(kb[i] - kr[i]));
+            cache_err = std::max(cache_err, std::fabs(vb[i] - vr[i]));
+        }
+
+        cudaFree(dk_batch);
+        cudaFree(dv_batch);
+        cudaFree(dk_ref);
+        cudaFree(dv_ref);
+        cudaFree(d_len_b);
+        cudaFree(d_ring_b);
+        cudaFree(d_pref);
+        cudaFree(d_slots);
+        cudaFree(d_len_r);
+        cudaFree(d_ring_r);
+
+        std::printf("Batched R-SWA (B=%d, W=%d, %d steps): attn_max_err=%.6f cache_err=%.6f %s\n",
+                    batch, W, steps, worst, cache_err, len_ok ? "" : "len_mismatch");
+        if (worst > 1e-4f || cache_err > 1e-5f || !len_ok) {
             std::printf("  FAIL\n");
             ++failures;
         } else {
@@ -703,6 +844,63 @@ int main() {
                     same_seq ? "OK" : "DIFF", same_cpu ? "OK" : "DIFF", order_ok ? "OK" : "BAD",
                     (same_seq && same_cpu && order_ok) ? "OK" : "FAIL");
         if (!same_seq || !order_ok) ++failures;
+    }
+
+    // ---- continuous batching with slot recycling (more requests than slots) ----
+    {
+        ModelConfig cfg;
+        cfg.vocab_size = 256;
+        cfg.hidden_size = 64;
+        cfg.intermediate_size = 128;
+        cfg.moe_intermediate_size = 32;
+        cfg.num_hidden_layers = 2;
+        cfg.num_attention_heads = 4;
+        cfg.num_key_value_heads = 4;
+        cfg.first_k_dense_replace = 1;
+        cfg.n_routed_experts = 8;
+        cfg.n_shared_experts = 1;
+        cfg.num_experts_per_tok = 2;
+        cfg.norm_topk_prob = true;
+        cfg.sliding_window = 8;
+        cfg.max_position_embeddings = 256;
+        cfg.projector_input_dim = 2048;
+        cfg.projector_n_embed = 64;
+
+        EngineConfig ecfg;
+        ecfg.memory_pool_bytes = 1 << 20;
+        ecfg.max_seq_len = 64;
+        ecfg.max_batch_size = 3;  // 6 requests -> slots are reused
+        ecfg.min_batch_size = 1;
+        ecfg.use_int4_experts = false;
+        ecfg.no_repeat_ngram_size = 0;
+
+        DecoderWeights w = DecoderWeights::random(cfg, 555);
+        std::vector<std::vector<int>> prompts = {
+            {1, 2, 3},       {4, 5, 6, 7, 8}, {9, 10},         {2, 4, 6, 8},
+            {11, 12, 13, 14}, {1, 5, 9, 3, 7, 2}};
+
+        Engine gpu_seq(cfg, ecfg, w, Backend::CUDA);
+        Engine gpu_batch(cfg, ecfg, w, Backend::CUDA);
+        Engine cpu(cfg, ecfg, w, Backend::CPU);
+
+        auto rb = gpu_batch.generate_batch(prompts, 5);
+        bool same_seq = true, same_cpu = true, order_ok = rb.size() == prompts.size();
+        for (std::size_t i = 0; i < prompts.size(); ++i) {
+            auto rs = gpu_seq.generate(prompts[i], 5);
+            auto rc = cpu.generate(prompts[i], 5);
+            if (rb[i].tokens != rs.tokens) same_seq = false;
+            if (rb[i].tokens != rc.tokens) same_cpu = false;
+            if (rb[i].prefill_tokens != static_cast<int>(prompts[i].size())) order_ok = false;
+        }
+        std::printf("Engine batch recycling (%zu prompts, %d slots): seq=%s cpu=%s order=%s\n",
+                    prompts.size(), ecfg.max_batch_size, same_seq ? "OK" : "DIFF",
+                    same_cpu ? "OK" : "DIFF", order_ok ? "OK" : "BAD");
+        if (!same_seq || !same_cpu || !order_ok) {
+            std::printf("  FAIL\n");
+            ++failures;
+        } else {
+            std::printf("  OK\n");
+        }
     }
 
     std::printf("%s\n", failures == 0 ? "all CUDA tests passed" : "CUDA tests FAILED");

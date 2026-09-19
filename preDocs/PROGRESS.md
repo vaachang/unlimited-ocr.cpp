@@ -36,6 +36,8 @@
 ✅ 合并式 decode 内核（warp-per-output matvec / expert MLP）+ 分块 prefill GEMM
 ✅ Tensor Core W4A16 `ldmatrix` + shared-memory staging
 ✅ 连续批处理接入 device decoder（`Engine::generate_batch`，每 slot 独立 R-SWA KV）
+✅ batched R-SWA attention/append 内核（每步 attention kernel 数 O(B·L)→O(L)）
+✅ prefill 走 device masked MoE（prefill/请求 88→53ms INT4、35ms BF16）
 ```
 
 > 性能原始数据与汇总见 `BENCHMARKS.md` 和 `bench/` 目录。
@@ -167,6 +169,7 @@ cmake --build build-cuda -j8
 | R-SWA decode attention（kv_len=307, heads=10, hd=128） | max_err = 0.000000 |
 | `GpuRSWACache` 环形覆写（W=8, P=4, 24 步） | cache K/V err = 0；decode err = 1e-6 |
 | `GpuRSWACache` prefill causal attention | max_err = 0.000001 |
+| Batched R-SWA（B=3 变长 prefill, W=8, 24 步, 环形覆写）vs per-slot 内核 | attn err = 0；cache err = 0 |
 | INT4 MoE GEMM 标量（8×64×256, group=128） | max_err = 0.000010 |
 | INT4 MoE GEMM 张量核 W4A16（8×64×256） | rel_l2 = 0.0024 |
 | INT4 MoE GEMM 张量核 ragged（M=5,K=48） | rel_l2 = 0.0026 |
@@ -209,13 +212,20 @@ P2（device router + 固定调度掩码 kernel + CUDA Graph、device INT4 权重
 指标表、可选 reference CTest）。最终回归：`compare_ocr` layout OK、
 visual rel_l2 0.04187、greedy **24/24**。
 
+2026-09-19 续做：**batched R-SWA attention/append 内核**（每步 attention 发射数
+O(B·L)→O(L)）与 **prefill 走 device masked MoE**（复用解码的融合专家内核）。
+真实模型 `bench_cuda_batch` batch=16：BF16 73.5→**240.4** tok/s、INT4 117.6→**179.9**
+tok/s，prefill/请求 88→35/53 ms。同时修复连续批处理的 **slot 映射错位**（`batch_decode`
+显式接收“行→slot”映射，见 `PITFALLS.md` §13）。回归：`uocr_cuda_tests` 全过（新增
+Batched R-SWA 非恒等排列用例，attn/cache err = 0）；20/20 CPU 单测通过。
+
 仍待完成（见 `tAgent.md`）：
 
-1. **P2 Tensor Core 路径优化**：`moe_gemm_int4_tc` 仍是寄存器内标量反量化 + `mma`，
-   未用 `ldmatrix`/shared-memory staging/split-K。它是正确性基线与 plain（非 Graph）
-   路径在用；生产 decode 走 `moe_experts_masked_int4`（已合并访存），故不影响当前
-   TPOT 指标。
-2. **批处理**：`Engine` 当前单请求，prj.md §7.2 的 batch=8/16 吞吐/显存、GPU SM 利用率
-   依赖连续批处理接入 device decoder。
+1. **Chunked/ragged prefill**：prefill 仍逐请求串行，长 prompt 时主导墙钟；
+   `moe_gemm_int4_tc` 的逐专家小 GEMM 已不再用于 prefill（改走 masked 路径）。
+2. **Batched CUDA Graph**：Graph 仅覆盖单请求 seq=1 稳态，batched decode 仍 host 逐
+   kernel 发射。
 3. **精度评测**：OmniDocBench v1.6（AWQ vs BF16）未接入。
 4. **Prefill KV 分区写入**：仍按参考语义保留全部 prefill KV（prj.md 的优化未做）。
+5. **TC 进一步调优**：swizzle / split-K / `cp.async` 双缓冲。
+6. **性能记录补全**：GPU SM 利用率（已装 ncu/nsys）、KV 碎片率、AWQ vs 朴素 INT4。

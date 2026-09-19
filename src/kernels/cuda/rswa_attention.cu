@@ -76,6 +76,77 @@ __global__ void rswa_decode_kernel(const float* __restrict__ q, const float* __r
     }
 }
 
+// Batched decode attention: one block per (batch slot, query head).  Identical
+// online-softmax walk as `rswa_decode_kernel`, but the per-slot KV base and the
+// effective length come from the batch arrays, so a whole step is one launch.
+template <int MAX_HD>
+__global__ void rswa_decode_batch_kernel(const float* __restrict__ q,
+                                         const float* __restrict__ kcache_base,
+                                         const float* __restrict__ vcache_base,
+                                         const int* __restrict__ d_len,
+                                         const int* __restrict__ d_slots, int heads, int kv_heads,
+                                         int head_dim, int batch_cap, float scale,
+                                         float* __restrict__ out) {
+    const int b = blockIdx.x;
+    const int head = blockIdx.y;
+    const int slot = d_slots[b];
+    const int tid = threadIdx.x;
+    const int group = heads / kv_heads;
+    const int kvh = head / group;
+    const int stride = kv_heads * head_dim;
+    const int kv_len = d_len[slot];
+    const float* kcache = kcache_base + static_cast<std::size_t>(slot) * batch_cap * stride;
+    const float* vcache = vcache_base + static_cast<std::size_t>(slot) * batch_cap * stride;
+    const std::size_t qoff = (static_cast<std::size_t>(b) * heads + head) * head_dim;
+
+    __shared__ float q_sh[MAX_HD];
+    __shared__ float acc[MAX_HD];
+    __shared__ float red[256];
+    __shared__ float m_sh, l_sh;
+
+    if (tid == 0) {
+        m_sh = -1e30f;
+        l_sh = 0.0f;
+    }
+    if (tid < head_dim) {
+        q_sh[tid] = q[qoff + tid];
+        acc[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int t = 0; t < kv_len; ++t) {
+        const std::size_t base = (static_cast<std::size_t>(t) * kv_heads + kvh) * head_dim;
+        float part = 0.0f;
+        if (tid < head_dim) part = q_sh[tid] * kcache[base + tid];
+        red[tid] = part;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const float dot = red[0] * scale;
+            const float m_new = fmaxf(m_sh, dot);
+            const float alpha = __expf(m_sh - m_new);
+            const float beta = __expf(dot - m_new);
+            red[0] = alpha;
+            red[1] = beta;
+            m_sh = m_new;
+            l_sh = l_sh * alpha + beta;
+        }
+        __syncthreads();
+        const float alpha = red[0];
+        const float beta = red[1];
+        if (tid < head_dim) acc[tid] = acc[tid] * alpha + beta * vcache[base + tid];
+        __syncthreads();
+    }
+
+    if (tid < head_dim) {
+        const float inv = l_sh > 0.0f ? 1.0f / l_sh : 0.0f;
+        out[qoff + tid] = acc[tid] * inv;
+    }
+}
+
 // General kernel: one block per (query s, head).  Used for prefill (causal) and
 // as a fallback for decode.
 template <int MAX_HD>
@@ -142,6 +213,39 @@ __global__ void rswa_attn_kernel(const float* __restrict__ q, const float* __res
     }
 }
 
+// Batched append: one block per batch slot.  Each slot owns an independent ring
+// cursor and (possibly different) prefill length, read from the batch arrays.
+__global__ void rswa_append_batch_kernel(const float* __restrict__ k,
+                                         const float* __restrict__ v,
+                                         float* __restrict__ kcache_base,
+                                         float* __restrict__ vcache_base,
+                                         int* __restrict__ d_len, int* __restrict__ d_ring_pos,
+                                         const int* __restrict__ d_prefill_len,
+                                         const int* __restrict__ d_slots, int batch_cap,
+                                         int window, int stride) {
+    const int b = blockIdx.x;
+    const int slot = d_slots[b];
+    const int prefill_len = d_prefill_len[slot];
+    int len = d_len[slot];
+    int row;
+    if (len < prefill_len + window) {
+        row = len;
+        d_len[slot] = len + 1;
+        if (len + 1 >= prefill_len + window) d_ring_pos[slot] = 0;
+    } else {
+        row = prefill_len + d_ring_pos[slot];
+        d_ring_pos[slot] = (d_ring_pos[slot] + 1) % window;
+    }
+    const float* kb = k + static_cast<std::size_t>(b) * stride;
+    const float* vb = v + static_cast<std::size_t>(b) * stride;
+    float* kc = kcache_base + (static_cast<std::size_t>(slot) * batch_cap + row) * stride;
+    float* vc = vcache_base + (static_cast<std::size_t>(slot) * batch_cap + row) * stride;
+    for (int i = threadIdx.x; i < stride; i += blockDim.x) {
+        kc[i] = kb[i];
+        vc[i] = vb[i];
+    }
+}
+
 }  // namespace
 
 void rswa_attention(const float* q, const float* kcache, const float* vcache, int kv_len, int seq,
@@ -203,6 +307,28 @@ void rswa_attention_devlen(const float* q, const float* kcache, const float* vca
                                                                 d_len);
 }
 
+void rswa_attention_batch(const float* q, const float* kcache_base, const float* vcache_base,
+                          const int* d_len, const int* d_slots, int batch, int batch_cap,
+                          int heads, int kv_heads, int head_dim, float* out,
+                          cudaStream_t stream) {
+    if (batch <= 0) return;
+    const float scale = rsqrtf(static_cast<float>(head_dim));
+    const int threads = 256;
+    dim3 grid(batch, heads);
+    if (head_dim <= 64)
+        rswa_decode_batch_kernel<64><<<grid, threads, 0, stream>>>(
+            q, kcache_base, vcache_base, d_len, d_slots, heads, kv_heads, head_dim, batch_cap,
+            scale, out);
+    else if (head_dim <= 128)
+        rswa_decode_batch_kernel<128><<<grid, threads, 0, stream>>>(
+            q, kcache_base, vcache_base, d_len, d_slots, heads, kv_heads, head_dim, batch_cap,
+            scale, out);
+    else
+        rswa_decode_batch_kernel<256><<<grid, threads, 0, stream>>>(
+            q, kcache_base, vcache_base, d_len, d_slots, heads, kv_heads, head_dim, batch_cap,
+            scale, out);
+}
+
 namespace {
 
 // Single block writes one row of K/V and advances the device ring pointer.
@@ -234,6 +360,18 @@ void rswa_append_decode(const float* k, const float* v, float* kcache, float* vc
     const int stride = kv_heads * head_dim;
     rswa_append_kernel<<<1, 256, 0, stream>>>(k, v, kcache, vcache, d_len, d_ring_pos, prefill_len,
                                               window, stride);
+}
+
+void rswa_append_decode_batch(const float* k, const float* v, float* kcache_base,
+                              float* vcache_base, int* d_len, int* d_ring_pos,
+                              const int* d_prefill_len, const int* d_slots, int batch,
+                              int batch_cap, int window, int kv_heads, int head_dim,
+                              cudaStream_t stream) {
+    if (batch <= 0) return;
+    const int stride = kv_heads * head_dim;
+    rswa_append_batch_kernel<<<batch, 256, 0, stream>>>(k, v, kcache_base, vcache_base, d_len,
+                                                        d_ring_pos, d_prefill_len, d_slots,
+                                                        batch_cap, window, stride);
 }
 
 }  // namespace cuda

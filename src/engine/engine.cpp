@@ -49,6 +49,7 @@ Engine::Engine(ModelConfig mcfg, EngineConfig ecfg, DecoderWeights weights, Back
     if (backend_ == Backend::CUDA) {
         gpu_decoder_ = std::make_unique<cuda::GpuDecoder>(mcfg_, weights_);
         gpu_decoder_->set_use_graph(ecfg_.use_cuda_graph);
+        gpu_decoder_->set_prefill_device_moe(ecfg_.use_device_moe_prefill);
         if (ecfg_.graph_scope == "attn_dense")
             gpu_decoder_->set_graph_scope(cuda::GpuDecoder::GraphScope::kAttnDense);
     }
@@ -347,22 +348,28 @@ std::vector<GenerationResult> Engine::generate_batch(const std::vector<std::vect
             }
             // Decode every running request together.
             if (!b.decode.empty()) {
-                std::vector<int> toks, poss;
+                std::vector<int> dec_ids, toks, poss, slots;
+                dec_ids.reserve(b.decode.size());
                 toks.reserve(b.decode.size());
                 poss.reserve(b.decode.size());
+                slots.reserve(b.decode.size());
                 for (int id : b.decode) {
                     Request* r = scheduler_->get(id);
                     if (!r || r->output_tokens.empty()) continue;
+                    auto sit = id_slot.find(id);
+                    if (sit == id_slot.end()) continue;
+                    dec_ids.push_back(id);
                     toks.push_back(r->output_tokens.back());
                     poss.push_back(static_cast<int>(r->prompt_tokens.size() +
                                                     r->output_tokens.size() - 1));
+                    slots.push_back(sit->second);
                 }
                 if (!toks.empty()) {
                     std::vector<std::vector<float>> lgs;
-                    gpu_decoder_->batch_decode(toks, poss, lgs);
-                    const std::size_t n = std::min(b.decode.size(), lgs.size());
+                    gpu_decoder_->batch_decode(toks, poss, slots, lgs);
+                    const std::size_t n = std::min(dec_ids.size(), lgs.size());
                     for (std::size_t k = 0; k < n; ++k) {
-                        const int id = b.decode[k];
+                        const int id = dec_ids[k];
                         Request* r = scheduler_->get(id);
                         if (!r) continue;
                         const int tok = sample(lgs[k], history[id]);

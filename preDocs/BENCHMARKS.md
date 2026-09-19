@@ -91,22 +91,38 @@ n=896, k=1280, group=128, iters=200（单次 GEMM 调用；`2*m*n*k` 计 FLOP）
 ## 2.6 连续批处理吞吐（`bench/bench_batch_*.txt`）
 
 `Engine::generate_batch`（scheduler + device batched decoder），prompt=64，steps=16；
-吞吐按总生成 token / 总墙钟计（**含每个请求的串行 prefill**，因此偏保守）：
+吞吐按总生成 token / 总墙钟计（**含每个请求的串行 prefill**，因此偏保守）。
+2026-09-19 两项优化后（batched attention kernel + prefill 走 device masked MoE）：
 
 | batch | BF16 tok/s | BF16 peak | INT4 tok/s | INT4 peak |
 |---|---|---|---|---|
-| 1 | 44.3 | 9274 MB | 75.0 | 2278 MB |
-| 2 | 52.5 | 9300 MB | 66.7 | 2304 MB |
-| 4 | 57.2 | 9352 MB | 83.1 | 2356 MB |
-| 8 | 74.3 | 9452 MB | 105.7 | 2456 MB |
-| 16 | 73.5 | 9652 MB | **117.6** | 2656 MB |
+| 1 | 101.4 | 9288 MB | 92.3 | 2292 MB |
+| 2 | 88.5 | 9314 MB | 80.8 | 2318 MB |
+| 4 | 136.8 | 9366 MB | 118.3 | 2370 MB |
+| 8 | 191.3 | 9466 MB | 153.0 | 2470 MB |
+| 16 | **240.4** | 9660 MB | **179.9** | 2664 MB |
+
+优化前对照（同命令，本次改动前）：
+
+| batch | BF16 tok/s | INT4 tok/s | prefill/请求 |
+|---|---|---|---|
+| 8 | 74.3 | 105.7 | 88 ms |
+| 16 | 73.5 | 117.6 | 88 ms |
+
+- **Batched attention kernel**：`rswa_append_decode_batch` + `rswa_attention_batch`
+  （grid=(slots, heads)）把每步 attention 的 kernel 数从 `O(B·L)` 降到 `O(L)`。
+  合成小模型（launch-bound）收益最大：batch=16 吞吐 2828 → 6406 tok/s（2.3×）；
+  真实模型因 prefill/MoE 占主导，单纯此改动吞吐持平。
+- **prefill device MoE**：prefill 不再逐专家发射 `moe_gemm_int4_tc`（64×3 个小
+  GEMM/层），而是复用解码的 device router + 融合 masked 专家内核，按 token 归组。
+  prefill 从 88 ms 降到 53 ms（INT4）/ 35 ms（BF16）。这是真实模型吞吐提升的主因。
 
 正确性：`uocr_cuda_tests` 的 `Engine batch` 用例用 4 个不同长度 prompt 对比
-batch 与 sequential device decode，token 完全一致（并对 CPU 一致）。
+batch 与 sequential device decode，token 完全一致（并对 CPU 一致）；
+`GpuDecoder prefill`、`Engine CUDA greedy` 同样通过。
 
-瓶颈：batch attention 目前对每个 slot 循环发射 `rswa_append_decode` +
-`rswa_attention_devlen`（每步 B×L 个 kernel），尚未做 batched attention kernel；
-prefill 也是逐请求串行（标准的 continuous batching 行为）。
+剩余瓶颈：prefill 仍逐请求串行（未做 ragged/chunked prefill）；
+batched decode 未纳入 CUDA Graph（当前复用单请求 Graph 仅覆盖 batch=1）。
 
 ## 3. 数值对齐
 

@@ -67,6 +67,27 @@ void rswa_append_decode(const float* k, const float* v, float* kcache, float* vc
                         int* d_ring_pos, int prefill_len, int window, int kv_heads, int head_dim,
                         cudaStream_t stream = 0);
 
+// Batched variant of `rswa_append_decode`: one block per batch row, so a whole
+// decode step costs a single launch per layer instead of one per slot.
+// `k`/`v` are [batch, kv_heads, head_dim] (row `b`).  The destination cache is
+// selected by `d_slots[b]` and starts at
+// `kcache_base + d_slots[b] * batch_cap * kv_heads * head_dim`; the per-slot
+// ring state is indexed by the same slot id.  `d_len`, `d_ring_pos`,
+// `d_prefill_len` and `d_slots` are device arrays.
+void rswa_append_decode_batch(const float* k, const float* v, float* kcache_base,
+                              float* vcache_base, int* d_len, int* d_ring_pos,
+                              const int* d_prefill_len, const int* d_slots, int batch,
+                              int batch_cap, int window, int kv_heads, int head_dim,
+                              cudaStream_t stream = 0);
+
+// Batched R-SWA decode attention: grid = (batch, heads).  Row `b` of `q`/`out`
+// ([batch, heads, head_dim]) attends the cache selected by `d_slots[b]` with
+// effective length `d_len[d_slots[b]]`.
+void rswa_attention_batch(const float* q, const float* kcache_base, const float* vcache_base,
+                          const int* d_len, const int* d_slots, int batch, int batch_cap,
+                          int heads, int kv_heads, int head_dim, float* out,
+                          cudaStream_t stream = 0);
+
 // MoE router on device: softmax/sigmoid -> greedy top-k -> per-expert grouping.
 // `d_ids` / `d_weights` are [seq, top_k]; `d_assign_token` / `d_assign_w` are
 // [n_experts, cap] and `d_count` is [n_experts] (must be zeroed by the caller).

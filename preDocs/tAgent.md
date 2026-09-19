@@ -21,10 +21,14 @@
 
 **下一步优先级**（详见文末各节）：
 
-1. **Batched attention kernel（最大性能缺口）**：当前 batch decode 对每个 slot
-   循环发射 `rswa_append_decode` + `rswa_attention_devlen`（每步 B×L 个 kernel）。
-   需要写一个 grid=(B, heads) 的 batched R-SWA attention + batched ring append，
-   把每步 kernel 数从 O(B·L) 降到 O(L)。预期提升 batch=16 吞吐数倍。
+1. [x] **Batched attention kernel**（2026-09-19 完成）：新增
+   `rswa_append_decode_batch`（grid=B）与 `rswa_attention_batch`（grid=(B, heads)），
+   每步 attention kernel 数从 O(B·L) 降到 O(L)。合成模型 batch=16 吞吐
+   2828 → 6406 tok/s（2.3×）；真实模型因 prefill 主导，单项收益被掩盖，与下一项
+   合计后 BF16 batch=16 73.5 → 240.4 tok/s、INT4 117.6 → 179.9 tok/s。
+   [x] 同批完成 **prefill 走 device masked MoE**：prefill 复用解码的
+   device router + 融合专家内核，prefill/请求 88 → 53 ms(INT4)/35 ms(BF16)。
+   详见 `BENCHMARKS.md` §2.6、`CORE_TECH.md` §“批处理”。
 2. **Chunked/continuous prefill**：`generate_batch` 目前逐请求串行 prefill，长
    prompt 时 prefill 主导墙钟。需要支持 ragged prefill（变长 + causal mask）或
    chunked prefill，并纳入 CUDA Graph。
@@ -156,9 +160,11 @@
       所有活跃 slot 一起 decode → 完成即释放 slot。
 - [x] 修复 CUDA 下 host `MemoryPool` 按 `max_seq_len×max_batch` 预分配数十 GB 的
       问题（CUDA 后端改用小 arena）。
-- [x] `bench_cuda_batch`：INT4 batch=16 **117.6 tok/s / 2656MB**；BF16 73.5 tok/s。
+- [x] `bench_cuda_batch`（2026-09-19 优化后）：INT4 batch=16 **179.9 tok/s / 2664MB**；
+      BF16 **240.4 tok/s**（batched attention + prefill device MoE，见 §2.6）。
       测试 `Engine batch`（4 个不同长度 prompt）batch == sequential == CPU。
-- [ ] **待优化**：batched attention kernel（见下节优先级 1）、chunked prefill。
+- [x] batched attention kernel（见优先级 1）。
+- [ ] **待优化**：chunked/ragged prefill；batched decode 纳入 CUDA Graph。
 
 ### P2 分词器与性能记录
 - [x] 分词器对齐已提前到 P0/E0 执行（43/43），此处只保留性能与回归项。
@@ -166,11 +172,10 @@
       与 `prj.md §7.2`；§7.3 完成 INT4 vs BF16、Graph 范围消融。
 - [x] `compare_reference` / `compare_vision` 等纳入可选 CTest
       （`-DENGINE_REFERENCE_DIR=...`，默认跳过）。
-- [ ] 仍缺：GPU SM 利用率（本机无 ncu/nsys）、KV Cache 碎片率、AWQ vs 朴素 INT4。
+- [ ] 仍缺：GPU SM 利用率（已安装 ncu/nsys）、KV Cache 碎片率、AWQ vs 朴素 INT4。
 
 ### 环境与依赖备注
 - 仅第三方 C++ 依赖：系统 `nlohmann/json`（已安装）；未用 `spdlog`（自研 log）。
 - Python 参考环境在 `.venv`（torch 2.10.0+cu128 / transformers 4.57.1），
   安装依赖前需经代理 `http://192.168.1.164:7897`。
 - 若需新增系统依赖或 Python 包，先询问确认后再安装。
-

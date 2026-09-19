@@ -54,6 +54,13 @@ public:
     void set_graph_scope(GraphScope s) { graph_scope_ = s; }
     GraphScope graph_scope() const { return graph_scope_; }
 
+    // Run device-resident MoE during prefill (device router + fused masked
+    // expert kernel) instead of per-expert tensor-core GEMMs.  The masked
+    // kernel wins when the MoE batch is small (few tokens per expert), which is
+    // the common case for one-request prefill.
+    void set_prefill_device_moe(bool v) { prefill_dev_moe_ = v; }
+    bool prefill_device_moe() const { return prefill_dev_moe_; }
+
     // Timing of the last decode step (CUDA events): decoder forward and the
     // final lm_head projection + logits D2H.
     double last_forward_ms() const { return last_forward_ms_; }
@@ -65,8 +72,10 @@ public:
     // then advance all active slots together with `batch_decode`.
     void batch_configure(int slots, int capacity);
     void batch_import_prefill(int slot, int prefill_len);
+    // `slots` maps decode order (row) to cache slot; it may be any permutation
+    // of the configured slots, so requests are free to occupy any slot.
     void batch_decode(const std::vector<int>& tokens, const std::vector<int>& positions,
-                      std::vector<std::vector<float>>& logits);
+                      const std::vector<int>& slots, std::vector<std::vector<float>>& logits);
     int batch_slots() const { return batch_slots_; }
 
     const ModelConfig& config() const { return cfg_; }
@@ -135,12 +144,12 @@ private:
     void run_graph_decode_attn_dense(int token, int pos, std::vector<float>& logits);
 
     // Batched layer pieces (device MoE, per-slot R-SWA attention).
-    void attention_block_batch(int li, int batch, const float* x, const int* positions, float* h1,
-                               float* normed2, cudaStream_t stream);
+    void attention_block_batch(int li, int batch, const float* x, const int* positions,
+                               const int* slots, float* h1, float* normed2, cudaStream_t stream);
     void mlp_block_batch(int li, int batch, const float* h1, const float* normed2, float* out,
                          cudaStream_t stream);
-    void forward_batch(const float* x, int batch, const int* positions, float* out,
-                       cudaStream_t stream);
+    void forward_batch(const float* x, int batch, const int* positions, const int* slots,
+                       float* out, cudaStream_t stream);
 
     ModelConfig cfg_;
     const DecoderWeights* host_weights_ = nullptr;
@@ -175,6 +184,7 @@ private:
 
     // CUDA-Graph state
     bool use_graph_ = false;
+    bool prefill_dev_moe_ = false;
     bool graph_ready_ = false;
     GraphScope graph_scope_ = GraphScope::kFull;
     int graph_prefill_len_ = -1;
@@ -193,6 +203,9 @@ private:
     std::vector<float*> batch_k_, batch_v_;  // [num_layers] -> [slots, cap, kvh*hd]
     int* d_batch_len_ = nullptr;             // [num_layers * slots]
     int* d_batch_ring_ = nullptr;            // [num_layers * slots]
+    int* d_batch_prefill_ = nullptr;         // [slots] per-slot prefill length
+    int* d_batch_slots_ = nullptr;           // [batch] row -> slot mapping
+    int batch_slots_cap_ = 0;                // allocated length of d_batch_slots_
     std::vector<int> slot_prefill_len_;      // [slots]
     float* d_logits_batch_ = nullptr;
     int batch_logits_cap_ = 0;

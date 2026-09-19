@@ -138,6 +138,25 @@ gate_up/down 内核修复了“相邻线程按行 stride 读权重”导致的 ~
 prefill 的 `matmul_t_bf16` 改为 64×64 分块 + shared memory staging（panel 补 1 列
 避免 bank conflict）。
 
+### 5.5 连续批处理（P2 收尾，2026-09-19）
+
+- **per-slot R-SWA KV**：`GpuDecoder::batch_configure(slots, capacity)` 为每个 slot
+  分配独立 `[capacity, kv_heads, head_dim]` K/V 与 `d_len/d_ring_pos`（`[layers*slots]`
+  扁平数组，索引 `layer*slots + slot`）。
+- **batched attention**：`rswa_append_decode_batch`（grid=B，每行一个 block 推进
+  对应 slot 的环形游标）与 `rswa_attention_batch`（grid=(B, heads)，每 block 走
+  online softmax）。行→slot 由 `d_slots[b]` 指定（请求可占用任意 slot），cache
+  地址与 `d_len/d_ring_pos/d_prefill_len` 均按 slot 索引，激活按行索引，因此变长
+  prompt 的固定区/环形区边界正确。每步 attention 发射数从 `2·B·L` 降到 `2·L`。
+- **batch decode 流程**：`forward_batch` 逐层 `attention_block_batch` +
+  `mlp_block(dev_moe=true)`（device router + masked 专家），最后一次性
+  `matmul_t_bf16` lm_head 得到 `[B, V]` logits 并 D2H。
+- **prefill 也走 device MoE**：`EngineConfig::use_device_moe_prefill`（默认 true）。
+  单请求 prefill 中每个专家平均只有几个 token，逐专家发射 `moe_gemm_int4_tc`
+  产生 64×3 个小 GEMM/层，kernel 发射与低占用开销大；改为按 token 归组的
+  `moe_experts_masked[_int4]` 后 prefill 从 88ms 降到 53ms(INT4)/35ms(BF16)。
+  数学等价（同为 AWQ 反量化 + bf16/INT4 权重），`uocr_cuda_tests` 校验。
+
 ## 6. 与 `prj.md` 三大创新点的对应
 
 | prj.md 创新点 | 本项目实现 | 状态 |

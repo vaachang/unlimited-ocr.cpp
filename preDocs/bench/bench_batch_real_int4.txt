@@ -1,16 +1,16 @@
 # real INT4 batch throughput, prompt=64 steps=16
-[14:36:43][INFO] decoder weights loaded from models/model-00001-of-000001.safetensors  (/home/admin/MyDocs/unlimited-ocr.cpp/src/runtime/weights.cpp:214)
-[14:36:45][INFO] engine created (CUDA backend)  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:56)
-[14:36:45][INFO] batch done: 1 requests, 16 decode tokens, 212.6 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:393)
-[14:36:46][INFO] batch done: 2 requests, 32 decode tokens, 478.0 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:393)
-[14:36:46][INFO] batch done: 4 requests, 64 decode tokens, 768.1 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:393)
-[14:36:48][INFO] batch done: 8 requests, 128 decode tokens, 1208.3 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:393)
-[14:36:50][INFO] batch done: 16 requests, 256 decode tokens, 2174.2 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:393)
+[15:44:20][INFO] decoder weights loaded from models/model-00001-of-000001.safetensors  (/home/admin/MyDocs/unlimited-ocr.cpp/src/runtime/weights.cpp:214)
+[15:44:22][INFO] engine created (CUDA backend)  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:58)
+[15:44:22][INFO] batch done: 1 requests, 16 decode tokens, 175.5 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:401)
+[15:44:23][INFO] batch done: 2 requests, 32 decode tokens, 392.4 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:401)
+[15:44:23][INFO] batch done: 4 requests, 64 decode tokens, 546.3 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:401)
+[15:44:24][INFO] batch done: 8 requests, 128 decode tokens, 830.5 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:401)
+[15:44:25][INFO] batch done: 16 requests, 256 decode tokens, 1438.3 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:401)
 device: NVIDIA GeForce RTX 5060 Ti (sm_120, 36 SMs, 15.6 GB)
 prompt=64 steps=16 max_batch=16 experts=INT4
  batch   prefill_ms    decode_ms          tok/s       peakMB
-     1         91.7        213.3           75.0       2278.0
-     2         87.9        479.4           66.7       2304.0
-     4         88.4        769.9           83.1       2356.0
-     8         87.6       1210.5          105.7       2456.0
-    16         88.0       2176.4          117.6       2656.0
+     1         54.7        176.1           90.8       2292.0
+     2         53.3        393.9           81.2       2318.0
+     4         53.5        548.2          116.7       2370.0
+     8         53.4        832.5          153.8       2470.0
+    16         53.7       1441.1          177.6       2664.0
