@@ -45,70 +45,104 @@ __global__ void moe_gemm_int4_kernel(const float* __restrict__ x,
     y[static_cast<std::size_t>(row) * n + col] = acc;
 }
 
-__device__ __forceinline__ unsigned pack_bf16(float lo, float hi) {
-    const unsigned short l = __bfloat16_as_ushort(__float2bfloat16_rn(lo));
-    const unsigned short h = __bfloat16_as_ushort(__float2bfloat16_rn(hi));
-    return static_cast<unsigned>(l) | (static_cast<unsigned>(h) << 16);
+__device__ __forceinline__ unsigned smem_addr(const void* p) {
+    return static_cast<unsigned>(__cvta_generic_to_shared(p));
 }
 
-// W4A16 tensor-core kernel.  Each warp computes a 16(m) x 8(n) output tile and
-// walks K in steps of 16, dequantizing the INT4 weights to bf16 in registers
-// before the `mma.m16n8k16.bf16` instruction (f32 accumulator).
+// W4A16 tensor-core kernel with shared-memory staging and `ldmatrix`.
 //
-// Fragment layouts follow PTX ISA 9.7.16.5.8:
-//   A (16x16): a0,a1 = (g,tig*2),(g,tig*2+1); a2,a3 = (g+8,*);
-//              a4,a5 = (g,tig*2+8),(g,tig*2+9); a6,a7 = (g+8,*)
-//   B (16x8):  b0,b1 = (tig*2,*),(tig*2+1,*); b2,b3 = (tig*2+8,*),(tig*2+9,*)
-//   C (16x8):  c0,c1 = (g,tig*2),(g,tig*2+1); c2,c3 = (g+8,*)
+// Block = 4 warps and computes a 64(m) x 8(n) tile: the dequantized INT4 weight
+// panel sW[8][16] is loaded once per k-step (coalesced) and shared by all four
+// warps, each of which handles a 16-row slice of the m dimension.  A (bf16
+// activations, 64x16) and B (bf16 weights, stored as W[n][k], i.e. col-major
+// relative to the mma) fragments are pulled from shared memory with
+// `ldmatrix`; the mma is `mma.m16n8k16.bf16.bf16.f32`.
+//
+// Fragment layouts follow PTX ISA: A is 4x[2xb16] (a0..a3), B is 2x[2xb16]
+// (b0,b1), matching the values the previous scalar kernel packed by hand.
 __global__ void moe_gemm_int4_tc_kernel(const float* __restrict__ x,
                                         const std::uint8_t* __restrict__ packed,
                                         const float* __restrict__ scales,
                                         const float* __restrict__ zeros, int m, int n, int k,
                                         int group_size, float* __restrict__ y) {
+    constexpr int BM = 64;  // rows per block (4 warps x 16)
+    constexpr int BN = 8;   // columns per block
+    constexpr int BK = 16;
+    __shared__ __nv_bfloat16 sA[BM][BK];
+    __shared__ __nv_bfloat16 sW[BN][BK];
+
     const int lane = threadIdx.x & 31;
-    const int g = lane >> 2;
-    const int tig = lane & 3;
-    const int m0 = blockIdx.y * 16;
-    const int n0 = blockIdx.x * 8;
+    const int warp = threadIdx.x >> 5;
+    const int tid = threadIdx.x;
+    const int m0 = blockIdx.y * BM;
+    const int n0 = blockIdx.x * BN;
     const int packed_row = (k + 1) / 2;
     const int ng = (k + group_size - 1) / group_size;
 
+    const int g = lane >> 2;
+    const int tig = lane & 3;
     float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    for (int k0 = 0; k0 < k; k0 += 16) {
-        auto xload = [&](int r, int cc) -> float {
-            const int mm = m0 + r;
-            const int kk = k0 + cc;
-            if (mm >= m || kk >= k) return 0.0f;
-            return x[static_cast<std::size_t>(mm) * k + kk];
-        };
-        const int wn = n0 + g;
-        auto wload = [&](int kk) -> float {
-            if (wn >= n || kk >= k) return 0.0f;
-            const std::uint8_t* prow = packed + static_cast<std::size_t>(wn) * packed_row;
-            const std::uint8_t byte = prow[kk >> 1];
-            const int q = (kk & 1) ? (byte >> 4) : (byte & 0x0f);
-            const int gg = kk / group_size;
-            return (static_cast<float>(q) - zeros[static_cast<std::size_t>(wn) * ng + gg]) *
-                   scales[static_cast<std::size_t>(wn) * ng + gg];
-        };
+    for (int k0 = 0; k0 < k; k0 += BK) {
+        // ---- stage activations [BM, BK] (coalesced; c fastest) ----
+#pragma unroll
+        for (int l = 0; l < (BM * BK) / 128; ++l) {
+            const int idx = tid + l * 128;
+            const int r = idx / BK, cc = idx % BK;
+            const int gm = m0 + r, gk = k0 + cc;
+            sA[r][cc] = (gm < m && gk < k)
+                            ? __float2bfloat16(x[static_cast<std::size_t>(gm) * k + gk])
+                            : __float2bfloat16(0.0f);
+        }
+        // ---- dequantize the INT4 weight panel into sW[n][k] ----
+        if (tid < BN * (BK / 2)) {
+            const int row = tid >> 3;        // n within the tile
+            const int byte_in_row = tid & 7; // 8 bytes = 16 nibbles
+            const int kk = k0 + byte_in_row * 2;
+            const int gn = n0 + row;
+            float lo = 0.0f, hi = 0.0f;
+            if (gn < n && kk < k) {
+                const std::uint8_t byte =
+                    packed[static_cast<std::size_t>(gn) * packed_row + (kk >> 1)];
+                const int q0 = byte & 0x0f;
+                const int q1 = byte >> 4;
+                const int gg = kk / group_size;
+                if (gg < ng) {
+                    const float s = scales[static_cast<std::size_t>(gn) * ng + gg];
+                    const float z = zeros[static_cast<std::size_t>(gn) * ng + gg];
+                    lo = (static_cast<float>(q0) - z) * s;
+                    hi = (kk + 1 < k) ? (static_cast<float>(q1) - z) * s : 0.0f;
+                }
+            }
+            sW[row][byte_in_row * 2] = __float2bfloat16(lo);
+            sW[row][byte_in_row * 2 + 1] = __float2bfloat16(hi);
+        }
+        __syncthreads();
 
-        const unsigned a0 = pack_bf16(xload(g, tig * 2), xload(g, tig * 2 + 1));
-        const unsigned a1 = pack_bf16(xload(g + 8, tig * 2), xload(g + 8, tig * 2 + 1));
-        const unsigned a2 = pack_bf16(xload(g, tig * 2 + 8), xload(g, tig * 2 + 9));
-        const unsigned a3 = pack_bf16(xload(g + 8, tig * 2 + 8), xload(g + 8, tig * 2 + 9));
-        const unsigned b0 = pack_bf16(wload(k0 + tig * 2), wload(k0 + tig * 2 + 1));
-        const unsigned b1 = pack_bf16(wload(k0 + tig * 2 + 8), wload(k0 + tig * 2 + 9));
+        // ---- ldmatrix fragments ----
+        const __nv_bfloat16* a_ptr = &sA[warp * 16 + (lane & 15)][(lane >> 4) * 8];
+        unsigned a0, a1, a2, a3;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                     : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+                     : "r"(smem_addr(a_ptr)));
+        // x2 only consumes addresses from lanes 0-15; mirror them for the rest
+        // so no lane forms an out-of-bounds pointer.
+        const __nv_bfloat16* b_ptr = &sW[lane & 7][((lane >> 3) & 1) * 8];
+        unsigned b0, b1;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                     : "=r"(b0), "=r"(b1)
+                     : "r"(smem_addr(b_ptr)));
 
         asm volatile(
             "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
             "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
             : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+        __syncthreads();
     }
 
-    const int r0 = m0 + g, r1 = m0 + g + 8;
-    const int c0 = n0 + tig * 2, c1 = n0 + tig * 2 + 1;
+    const int r0 = m0 + warp * 16 + g, r1 = r0 + 8;
+    const int c0 = n0 + tig * 2, c1 = c0 + 1;
     if (r0 < m) {
         if (c0 < n) y[static_cast<std::size_t>(r0) * n + c0] = c[0];
         if (c1 < n) y[static_cast<std::size_t>(r0) * n + c1] = c[1];
@@ -133,8 +167,8 @@ void moe_gemm_int4(const float* x, const std::uint8_t* packed, const float* scal
 void moe_gemm_int4_tc(const float* x, const std::uint8_t* packed, const float* scales,
                       const float* zeros, int m, int n, int k, int group_size, float* y,
                       cudaStream_t stream) {
-    const dim3 block(32);
-    const dim3 grid((n + 7) / 8, (m + 15) / 16);
+    const dim3 block(128);  // 4 warps -> 64 rows per block
+    const dim3 grid((n + 7) / 8, (m + 63) / 64);
     moe_gemm_int4_tc_kernel<<<grid, block, 0, stream>>>(x, packed, scales, zeros, m, n, k,
                                                         group_size, y);
 }

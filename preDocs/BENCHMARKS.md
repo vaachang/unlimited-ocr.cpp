@@ -71,6 +71,23 @@ cmake --build build-cuda -j8
 | full Graph | 2.96 ms | 0.589 ms |
 | attn_dense Graph | 2.89 ms | 0.588 ms |
 
+## 2.5 INT4 W4A16 GEMM：标量 vs Tensor Core（`bench/bench_int4_gemm.txt`）
+
+n=896, k=1280, group=128, iters=200（单次 GEMM 调用；`2*m*n*k` 计 FLOP）：
+
+| m | scalar (µs) | tensor-core (µs) | TC 有效 TFLOPS | 加速 |
+|---|---|---|---|---|
+| 1 | 66.4 | 37.1 | 0.062 | 1.8× |
+| 8 | 71.6 | 38.9 | 0.472 | 1.8× |
+| 32 | 206.0 | 41.3 | 1.776 | 5.0× |
+| 64 | 356.0 | 60.1 | 2.443 | 5.9× |
+| 128 | 653.4 | 70.9 | 4.140 | 9.2× |
+| 273 | 1371.7 | 135.6 | 4.619 | 10.1× |
+
+`moe_gemm_int4_tc` 现在用 shared-memory staging + `ldmatrix.x4/x2`：block=4 warps 计算
+64×8 tile，反量化后的权重 panel `sW[8][16]` 每 k-step 只加载一次并被 4 个 warp 共享。
+结果与标量路径 rel_l2 ≤ 0.0026（`uocr_cuda_tests`，含 ragged M/K）。
+
 ## 3. 数值对齐
 
 ### 3.1 端到端 OCR（`bench/compare_ocr.txt`）
