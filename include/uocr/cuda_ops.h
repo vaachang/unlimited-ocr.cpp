@@ -61,6 +61,20 @@ void moe_gemm_int4_tc(const float* x, const std::uint8_t* packed, const float* s
                       const float* zeros, int m, int n, int k, int group_size, float* y,
                       cudaStream_t stream = 0);
 
+// out[i] = silu(gate[i]) * up[i]
+void silu_mul(const float* gate, const float* up, float* out, int n, cudaStream_t stream = 0);
+
+// dst[i] += scale * src[i]
+void add_scaled(float* dst, const float* src, float scale, int n, cudaStream_t stream = 0);
+
+// out[row_idx[r] * cols + c] += weight[r] * vals[r * cols + c]
+void scatter_add_scaled(float* out, const float* vals, const int* row_idx, const float* weights,
+                        int rows, int cols, cudaStream_t stream = 0);
+
+// dst[r, :] = src[row_idx[r], :]
+void gather_rows(float* dst, const float* src, const int* row_idx, int rows, int cols,
+                 cudaStream_t stream = 0);
+
 // Device information.
 struct DeviceInfo {
     char name[256];

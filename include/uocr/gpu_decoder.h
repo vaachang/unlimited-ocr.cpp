@@ -1,0 +1,93 @@
+#pragma once
+
+// Device-resident MoE decoder (CUDA builds only).
+//
+// Weights are uploaded once (bf16) and every decoder op runs on the GPU:
+// RMSNorm, QKV/O projections, RoPE, R-SWA attention and the MoE/dense blocks.
+// Control flow (MoE top-k selection, expert grouping) stays on the host, which
+// keeps the first version simple while removing all per-step weight transfers.
+//
+// Embedding lookup and the lm_head projection are done on the host (they touch
+// large tables but only one row per decode step).
+
+#if defined(UOCR_CUDA_ENABLED)
+
+#include <cuda_runtime.h>
+
+#include <vector>
+
+#include "uocr/common.h"
+#include "uocr/config.h"
+#include "uocr/gpu_cache.h"
+#include "uocr/weights.h"
+
+namespace uocr {
+namespace cuda {
+
+class GpuDecoder {
+public:
+    GpuDecoder(ModelConfig cfg, const DecoderWeights& weights);
+    ~GpuDecoder();
+
+    GpuDecoder(const GpuDecoder&) = delete;
+    GpuDecoder& operator=(const GpuDecoder&) = delete;
+
+    // Reset the KV cache for a prefill of `prefill_len` tokens.
+    void reset(int prefill_len);
+
+    void prefill_tokens(const std::vector<int>& tokens, std::vector<float>& logits);
+    void prefill_embeds(const float* host_embeds, int seq, std::vector<float>& logits);
+    void decode_token(int token, int pos, std::vector<float>& logits);
+
+    const ModelConfig& config() const { return cfg_; }
+
+private:
+    struct DevLinear {
+        std::uint16_t* w = nullptr;  // bf16 [rows, cols]
+        float* bias = nullptr;
+        int rows = 0;
+        int cols = 0;
+    };
+    struct DevLayer {
+        float* in_ln = nullptr;
+        float* post_ln = nullptr;
+        DevLinear q, k, v, o;
+        bool is_moe = false;
+        DevLinear dense_gate, dense_up, dense_down;
+        std::uint16_t* router = nullptr;  // [n_experts, hidden]
+        std::vector<DevLinear> experts;   // each .w is one expert matrix
+        DevLinear shared_gate, shared_up, shared_down;
+    };
+
+    void upload_linear(const Linear& src, DevLinear& dst);
+    void forward(const float* x_dev, int seq, const int* positions_dev, bool prefill, int q_start,
+                 float* out_dev);
+    void layer_forward(int li, const float* x, int seq, const int* positions, bool prefill,
+                       int q_start, float* out);
+    void ensure_scratch(int seq);
+    void final_logits(const float* hidden_dev, int seq, std::vector<float>& logits);
+
+    ModelConfig cfg_;
+    const DecoderWeights* host_weights_ = nullptr;
+    GpuRSWACache cache_;
+    std::vector<DevLayer> layers_;
+    float* final_norm_ = nullptr;
+
+    // scratch (device)
+    void* scratch_ = nullptr;
+    std::size_t scratch_bytes_ = 0;
+    int scratch_seq_ = 0;
+    float* d_xin_ = nullptr;
+    int* d_pos_ = nullptr;
+    int* d_row_idx_ = nullptr;
+    float* d_row_w_ = nullptr;
+    float* d_ping_ = nullptr;
+    float* d_pong_ = nullptr;
+    float* d_normed_ = nullptr;
+    float* d_hidden_ = nullptr;
+};
+
+}  // namespace cuda
+}  // namespace uocr
+
+#endif  // UOCR_CUDA_ENABLED

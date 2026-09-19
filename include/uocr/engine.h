@@ -24,6 +24,10 @@
 
 namespace uocr {
 
+namespace cuda {
+class GpuDecoder;
+}
+
 enum class Backend { CPU, CUDA };
 
 struct GenerationResult {
@@ -38,6 +42,7 @@ struct GenerationResult {
 class Engine {
 public:
     Engine(ModelConfig mcfg, EngineConfig ecfg, DecoderWeights weights, Backend backend = Backend::CPU);
+    ~Engine();
 
     // Convenience: load config + weights from `ecfg.model_dir`.
     static std::unique_ptr<Engine> load(const EngineConfig& ecfg, Backend backend = Backend::CPU);
@@ -95,6 +100,9 @@ private:
     std::unique_ptr<ContinuousBatchScheduler> scheduler_;
     std::unique_ptr<Sampler> sampler_;
     std::shared_ptr<DeepEncoder> vision_;
+#if defined(UOCR_CUDA_ENABLED)
+    std::unique_ptr<cuda::GpuDecoder> gpu_decoder_;
+#endif
 };
 
 }  // namespace uocr

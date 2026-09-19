@@ -68,10 +68,21 @@
       与通用 `cuda::rswa_attention`（causal prefill / decode）。
       `tests/test_rswa_cuda.cu` 验证：环形覆写 cache K/V 完全一致、
       decode 与 prefill causal 误差 ≤1e-6。
-- [ ] 将 `MoEDecoder` 的 `Linear::forward` / attention 分派到 `uocr::cuda::*`，
-      实现设备端完整前向（当前 attention 已可走 GPU，但 matmul/MoE 仍在 CPU）。
-- [ ] 权重常驻 device（bf16 + INT4），避免每步 H2D。
-- [ ] 提供 `Engine` 的 CUDA 执行分支；CPU 仍作为参考实现。
+- [x] 设备端完整前向（2026-09-19）：`GpuDecoder`
+      （`include/uocr/gpu_decoder.h`, `src/engine/gpu_decoder.cu`）把 RMSNorm、
+      QKV/O 投影、RoPE、R-SWA attention、dense/MoE 全部放到 GPU；MoE 路由
+      在 GPU 算 logits，top-k/按专家分组在 host 调度。
+- [x] 权重常驻 device（当前 bf16，加载时上传一次）；embedding 与 lm_head
+      仍在 host（每步仅取/算一行）。`tests/test_rswa_cuda.cu` 验证
+      `GpuDecoder` vs CPU `MoEDecoder`：prefill rel_l2 0.0019、decode 0.0021。
+- [x] `Engine` 的 CUDA 执行分支：`Engine(..., Backend::CUDA)` 构造 `GpuDecoder`，
+      `generate` / `generate_from_image` 自动走设备路径；测试中 CPU/CUDA
+      greedy token 一致。
+- [ ] device 端 INT4 专家权重（当前上传 bf16，显存占用偏大）与
+      resident KV / CUDA Graph。
+
+> 构建结构调整：CUDA 源文件直接并入 `uocr_core`（`UOCR_ENGINE_LIB` 恒为
+> `uocr_core`），避免 Engine 与 CUDA 静态库的循环依赖；CPU 构建不编译 `.cu`。
 
 ### P2 CUDA Graph 与创新点落地
 - [ ] 按 prj.md 方案实现"路由 kernel 在 Graph 外、expert 计算在 Graph 内全调度 +

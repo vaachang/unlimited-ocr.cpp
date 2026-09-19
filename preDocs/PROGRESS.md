@@ -29,8 +29,10 @@
 ✅ Decoder 数值对齐（11/12 层 hidden <1%，logits <1%）
 ✅ Vision 对齐完成（对 f32 参考全链路 rel_l2 ≤ 6e-4；对 bf16 参考 3.2%）
 ✅ 端到端图像 OCR 对齐（E0–E5：布局、预处理、视觉注入、greedy 24/24）
+✅ CUDA 设备端 decoder + Engine CUDA 分支（GpuDecoder，bf16 权重常驻）
+✅ Tensor Core W4A16 INT4 MoE GEMM
 ⬜ CUDA Graph 捕获（当前为普通 kernel 启动）
-⬜ CUDA 版 MoE/decoder 调度接入（当前 CUDA 仅提供内核与测试，主推理走 CPU）
+⬜ device 端 INT4 专家权重（当前上传 bf16）
 ```
 
 ### 端到端 OCR 对齐（E0–E5，2026-09-19）

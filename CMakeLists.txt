@@ -111,34 +111,30 @@ endif()
 # ---------------------------------------------------------------------------
 # CUDA kernels (only when requested and a toolkit is available)
 # ---------------------------------------------------------------------------
+# The CUDA sources are added directly to `uocr_core` so that the engine (which
+# lives in core) can own a device decoder without a circular library dependency.
 if(ENGINE_BACKEND STREQUAL "CUDA")
     if(NOT CUDAToolkit_FOUND)
         message(FATAL_ERROR "ENGINE_BACKEND=CUDA but no CUDA toolkit was found")
     endif()
-    add_library(uocr_cuda
+    target_sources(uocr_core PRIVATE
         src/kernels/cuda/rmsnorm.cu
         src/kernels/cuda/rope_fused.cu
         src/kernels/cuda/rswa_attention.cu
         src/kernels/cuda/moe_gemm_int4.cu
+        src/kernels/cuda/gpu_ops.cu
         src/kernels/cuda/gpu_cache.cu
-        src/kernels/cuda/backend.cu)
-    target_include_directories(uocr_cuda PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_link_libraries(uocr_cuda PUBLIC uocr_core CUDA::cudart)
-    target_compile_options(uocr_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
-    set_target_properties(uocr_cuda PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+        src/kernels/cuda/backend.cu
+        src/engine/gpu_decoder.cu)
+    target_link_libraries(uocr_core PUBLIC CUDA::cudart)
+    target_compile_options(uocr_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+    set_target_properties(uocr_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
 
-# Convenience alias used by tests/benchmarks/tools so that backend switching is
-# a single place.
-if(ENGINE_BACKEND STREQUAL "CUDA")
-    add_library(uocr_engine ALIAS uocr_cuda)
-    set(UOCR_ENGINE_LIB uocr_cuda)
-else()
-    add_library(uocr_engine ALIAS uocr_core)
-    set(UOCR_ENGINE_LIB uocr_core)
-endif()
+# The engine library is always `uocr_core`; the backend is selected at compile
+# time via UOCR_CUDA_ENABLED / UOCR_CPU_BACKEND.
+add_library(uocr_engine ALIAS uocr_core)
+set(UOCR_ENGINE_LIB uocr_core)
 
 # ---------------------------------------------------------------------------
 # Tests

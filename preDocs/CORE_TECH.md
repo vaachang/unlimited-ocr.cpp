@@ -87,6 +87,9 @@ MoE 权重在 `DecoderWeights::load(..., quantize_experts_int4=true)` 时按需�
 | `rmsnorm.cu` | `rmsnorm_kernel` | 块内归约 |
 | `rope_fused.cu` | `rope_kernel`, `rmsnorm_head_kernel` | 融合逐头 RMSNorm + RoPE |
 | `backend.cu` | `matmul_t(_bf16)`, `device_info` | 稠密 GEMM、设备信息 |
+| `gpu_ops.cu` | `silu_mul`, `add_scaled`, `gather_rows`, `scatter_add_scaled` | 设备端逐元素 / 分组 MoE 辅助 |
+| `gpu_cache.cu` / `gpu_cache.h` | `GpuRSWACache` | device-resident 固定+环形 KV cache |
+| `gpu_decoder.cu` / `gpu_decoder.h` | `GpuDecoder` | 完整设备端 MoE decoder（bf16 权重常驻；路由 top-k 在 host 调度） |
 
 CUDA 构建与 CPU 构建共用 `RSWACache`/`WeightMatrix` 的数据布局，因此
 `tests/test_rswa_cuda.cu` 可以直接把 host cache 上传后与 CPU 参考逐元素对比

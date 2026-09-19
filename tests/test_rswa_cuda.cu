@@ -7,10 +7,15 @@
 #include <random>
 #include <vector>
 
+#include "uocr/config.h"
 #include "uocr/cuda_ops.h"
+#include "uocr/engine.h"
 #include "uocr/gpu_cache.h"
+#include "uocr/gpu_decoder.h"
 #include "uocr/kv_cache.h"
+#include "uocr/moe_decoder.h"
 #include "uocr/quant.h"
+#include "uocr/weights.h"
 
 using namespace uocr;
 
@@ -350,6 +355,118 @@ int main() {
         } else {
             std::printf("  OK\n");
         }
+    }
+
+    // ---- full device decoder vs CPU MoEDecoder (tiny synthetic config) ----
+    {
+        ModelConfig cfg;
+        cfg.vocab_size = 256;
+        cfg.hidden_size = 64;
+        cfg.intermediate_size = 128;
+        cfg.moe_intermediate_size = 32;
+        cfg.num_hidden_layers = 2;
+        cfg.num_attention_heads = 4;
+        cfg.num_key_value_heads = 4;
+        cfg.first_k_dense_replace = 1;
+        cfg.n_routed_experts = 4;
+        cfg.n_shared_experts = 1;
+        cfg.num_experts_per_tok = 2;
+        cfg.norm_topk_prob = true;
+        cfg.sliding_window = 8;
+        cfg.max_position_embeddings = 256;
+        cfg.projector_input_dim = 2048;
+        cfg.projector_n_embed = 64;
+
+        DecoderWeights w = DecoderWeights::random(cfg, 99);
+        MoEDecoder cpu(cfg, w);
+        cuda::GpuDecoder gpu(cfg, w);
+
+        std::vector<int> prompt(6);
+        for (int i = 0; i < 6; ++i) prompt[i] = i + 1;
+
+        RSWACache cache(cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim(),
+                        cfg.sliding_window);
+        std::vector<float> cpu_logits, gpu_logits;
+        cpu.prefill(cache, prompt, 0, cpu_logits);
+        gpu.prefill_tokens(prompt, gpu_logits);
+
+        auto diff = [](const std::vector<float>& a, const std::vector<float>& b) {
+            double num = 0, den = 0, mx = 0;
+            for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+                const double e = std::fabs(static_cast<double>(a[i]) - b[i]);
+                mx = std::max(mx, e);
+                num += e * e;
+                den += static_cast<double>(b[i]) * b[i];
+            }
+            return std::pair<double, double>(mx, std::sqrt(num / (den + 1e-30)));
+        };
+        auto [p_mx, p_rel] = diff(gpu_logits, cpu_logits);
+        std::printf("GpuDecoder prefill: vocab=%zu max_abs=%.5f rel_l2=%.5f\n", cpu_logits.size(),
+                    p_mx, p_rel);
+        float worst = static_cast<float>(p_rel);
+        if (p_rel > 0.05) {
+            std::printf("  FAIL\n");
+            ++failures;
+        } else {
+            std::printf("  OK\n");
+        }
+
+        int pos = static_cast<int>(prompt.size());
+        for (int step = 0; step < 6; ++step) {
+            int tok = 0;
+            float best = -1e30f;
+            for (std::size_t i = 0; i < cpu_logits.size(); ++i)
+                if (cpu_logits[i] > best) { best = cpu_logits[i]; tok = static_cast<int>(i); }
+            cpu.decode(cache, tok, pos, cpu_logits);
+            gpu.decode_token(tok, pos, gpu_logits);
+            ++pos;
+            auto [d_mx, d_rel] = diff(gpu_logits, cpu_logits);
+            worst = std::max(worst, static_cast<float>(d_rel));
+            if (d_rel > 0.05) ++failures;
+        }
+        std::printf("GpuDecoder decode (6 steps): worst rel_l2=%.5f %s\n", worst,
+                    worst <= 0.05 ? "OK" : "FAIL");
+    }
+
+    // ---- Engine CUDA branch vs CPU branch (same tiny model) ----
+    {
+        ModelConfig cfg;
+        cfg.vocab_size = 256;
+        cfg.hidden_size = 64;
+        cfg.intermediate_size = 128;
+        cfg.moe_intermediate_size = 32;
+        cfg.num_hidden_layers = 2;
+        cfg.num_attention_heads = 4;
+        cfg.num_key_value_heads = 4;
+        cfg.first_k_dense_replace = 1;
+        cfg.n_routed_experts = 4;
+        cfg.n_shared_experts = 1;
+        cfg.num_experts_per_tok = 2;
+        cfg.norm_topk_prob = true;
+        cfg.sliding_window = 8;
+        cfg.max_position_embeddings = 256;
+        cfg.projector_input_dim = 2048;
+        cfg.projector_n_embed = 64;
+
+        EngineConfig ecfg;
+        ecfg.memory_pool_bytes = 1 << 20;
+        ecfg.max_seq_len = 64;
+        ecfg.use_int4_experts = false;
+        ecfg.no_repeat_ngram_size = 0;
+
+        DecoderWeights w = DecoderWeights::random(cfg, 7);
+        Engine cpu(cfg, ecfg, w, Backend::CPU);
+        Engine gpu(cfg, ecfg, w, Backend::CUDA);
+        std::vector<int> prompt = {1, 2, 3, 4, 5};
+        auto rc = cpu.generate(prompt, 4);
+        auto rg = gpu.generate(prompt, 4);
+        bool same = rc.tokens == rg.tokens;
+        std::printf("Engine CUDA greedy: cpu=[");
+        for (int t : rc.tokens) std::printf("%d ", t);
+        std::printf("] gpu=[");
+        for (int t : rg.tokens) std::printf("%d ", t);
+        std::printf("] %s\n", same ? "OK" : "DIFF");
+        if (!same) ++failures;
     }
 
     std::printf("%s\n", failures == 0 ? "all CUDA tests passed" : "CUDA tests FAILED");

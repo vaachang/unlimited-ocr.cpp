@@ -7,6 +7,9 @@
 #include <limits>
 
 #include "uocr/log.h"
+#if defined(UOCR_CUDA_ENABLED)
+#include "uocr/gpu_decoder.h"
+#endif
 
 namespace uocr {
 
@@ -33,8 +36,14 @@ Engine::Engine(ModelConfig mcfg, EngineConfig ecfg, DecoderWeights weights, Back
     block_mgr_ = std::make_unique<BlockManager>(prefix_budget, ring_budget);
     scheduler_ = std::make_unique<ContinuousBatchScheduler>(ecfg_.max_batch_size, ecfg_.min_batch_size);
     sampler_ = std::make_unique<Sampler>(SamplingParams{ecfg_.temperature, ecfg_.top_p, ecfg_.top_k});
+#if defined(UOCR_CUDA_ENABLED)
+    if (backend_ == Backend::CUDA)
+        gpu_decoder_ = std::make_unique<cuda::GpuDecoder>(mcfg_, weights_);
+#endif
     UOCR_INFO("engine created (%s backend)", backend_ == Backend::CUDA ? "CUDA" : "CPU");
 }
+
+Engine::~Engine() = default;
 
 std::unique_ptr<Engine> Engine::load(const EngineConfig& ecfg, Backend backend) {
     namespace fs = std::filesystem;
@@ -77,6 +86,38 @@ GenerationResult Engine::generate(const std::vector<int>& prompt, int max_new_to
                                   const std::string& doc_key) {
     GenerationResult res;
     res.prefill_tokens = static_cast<int>(prompt.size());
+
+#if defined(UOCR_CUDA_ENABLED)
+    if (gpu_decoder_) {
+        std::vector<float> logits;
+        const double t0 = now_ms();
+        gpu_decoder_->prefill_tokens(prompt, logits);
+        const double t1 = now_ms();
+        res.ttft_ms = t1 - t0;
+        const int limit = max_new_tokens > 0 ? max_new_tokens : ecfg_.max_new_tokens;
+        std::vector<int> history = prompt;
+        const double td0 = now_ms();
+        int pos = static_cast<int>(prompt.size());
+        for (int step = 0; step < limit; ++step) {
+            if (ecfg_.no_repeat_ngram_size > 0 &&
+                static_cast<int>(history.size()) >= ecfg_.no_repeat_ngram_size)
+                Sampler::apply_no_repeat_ngram(logits.data(), mcfg_.vocab_size, history,
+                                               ecfg_.no_repeat_ngram_size, ecfg_.ngram_window);
+            const int tok = sampler_->sample(logits.data(), mcfg_.vocab_size);
+            if (tok == mcfg_.eos_token_id) break;
+            res.tokens.push_back(tok);
+            history.push_back(tok);
+            if (step + 1 >= limit) break;
+            gpu_decoder_->decode_token(tok, pos, logits);
+            ++pos;
+        }
+        const double td1 = now_ms();
+        res.decode_ms = td1 - td0;
+        res.decode_tokens = static_cast<int>(res.tokens.size());
+        res.tpot_ms = res.decode_tokens > 0 ? res.decode_ms / res.decode_tokens : 0.0;
+        return res;
+    }
+#endif
 
     auto cache = std::make_shared<RSWACache>(mcfg_.num_hidden_layers, mcfg_.num_key_value_heads,
                                              mcfg_.head_dim(), mcfg_.sliding_window);
@@ -142,6 +183,38 @@ GenerationResult Engine::generate_from_image(const std::vector<int>& prompt,
 
     GenerationResult res;
     res.prefill_tokens = seq;
+
+#if defined(UOCR_CUDA_ENABLED)
+    if (gpu_decoder_) {
+        std::vector<float> logits;
+        const double t0 = now_ms();
+        gpu_decoder_->prefill_embeds(inputs.data(), seq, logits);
+        const double t1 = now_ms();
+        res.ttft_ms = t1 - t0;
+        const int limit = max_new_tokens > 0 ? max_new_tokens : ecfg_.max_new_tokens;
+        std::vector<int> history = prompt;
+        const double td0 = now_ms();
+        int pos = seq;
+        for (int step = 0; step < limit; ++step) {
+            if (ecfg_.no_repeat_ngram_size > 0 &&
+                static_cast<int>(history.size()) >= ecfg_.no_repeat_ngram_size)
+                Sampler::apply_no_repeat_ngram(logits.data(), mcfg_.vocab_size, history,
+                                               ecfg_.no_repeat_ngram_size, ecfg_.ngram_window);
+            const int tok = sampler_->sample(logits.data(), mcfg_.vocab_size);
+            if (tok == mcfg_.eos_token_id) break;
+            res.tokens.push_back(tok);
+            history.push_back(tok);
+            if (step + 1 >= limit) break;
+            gpu_decoder_->decode_token(tok, pos, logits);
+            ++pos;
+        }
+        const double td1 = now_ms();
+        res.decode_ms = td1 - td0;
+        res.decode_tokens = static_cast<int>(res.tokens.size());
+        res.tpot_ms = res.decode_tokens > 0 ? res.decode_ms / res.decode_tokens : 0.0;
+        return res;
+    }
+#endif
     auto cache = std::make_shared<RSWACache>(mcfg_.num_hidden_layers, mcfg_.num_key_value_heads,
                                              mcfg_.head_dim(), mcfg_.sliding_window);
 
