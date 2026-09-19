@@ -18,6 +18,11 @@ void matmul_t(const float* x, const float* w, const float* bias, float* y, int m
 void matmul_t_bf16(const float* x, const std::uint16_t* w, const float* bias, float* y, int m,
                    int n, int k, cudaStream_t stream = 0);
 
+// CUDA-core reference for `matmul_t_bf16` (f32 activations x bf16 weights,
+// shared-memory tiled 64x64).  Kept for the tensor-core correctness A/B.
+void matmul_t_bf16_ref(const float* x, const std::uint16_t* w, const float* bias, float* y,
+                       int m, int n, int k, cudaStream_t stream = 0);
+
 // y[n] = W[n,k] * x[k] + bias (single activation vector).  Unlike the tiled
 // GEMM this reads each weight exactly once, which matters for m == 1 decode.
 void matvec_bf16(const float* x, const std::uint16_t* w, const float* bias, float* y, int n,

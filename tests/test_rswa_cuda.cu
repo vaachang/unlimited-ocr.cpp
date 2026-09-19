@@ -498,6 +498,61 @@ int main() {
         }
     }
 
+    // ---- bf16 tensor-core GEMM vs CUDA-core reference (various m/n/k) ----
+    {
+        struct Shape { int m, n, k; };
+        const Shape shapes[] = {{16, 64, 128}, {64, 128, 256}, {3, 40, 48}, {273, 96, 160}};
+        float worst_rel = 0.0f;
+        for (const Shape& s : shapes) {
+            const int m = s.m, n = s.n, k = s.k;
+            auto x = rand_vec(rng, static_cast<std::size_t>(m) * k);
+            auto wf = rand_vec(rng, static_cast<std::size_t>(n) * k);
+            auto bias = rand_vec(rng, n);
+            std::vector<std::uint16_t> wb(wf.size());
+            for (std::size_t i = 0; i < wf.size(); ++i) wb[i] = f32_to_bf16(wf[i]);
+
+            float *d_x, *d_b, *d_y, *d_yref;
+            std::uint16_t* d_w;
+            CUDA_CHECK(cudaMalloc(&d_x, x.size() * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_w, wb.size() * sizeof(std::uint16_t)));
+            CUDA_CHECK(cudaMalloc(&d_b, bias.size() * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_y, static_cast<std::size_t>(m) * n * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_yref, static_cast<std::size_t>(m) * n * sizeof(float)));
+            CUDA_CHECK(cudaMemcpy(d_x, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_w, wb.data(), wb.size() * sizeof(std::uint16_t),
+                                  cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_b, bias.data(), bias.size() * sizeof(float),
+                                  cudaMemcpyHostToDevice));
+            cuda::matmul_t_bf16(d_x, d_w, d_b, d_y, m, n, k);
+            cuda::matmul_t_bf16_ref(d_x, d_w, d_b, d_yref, m, n, k);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            std::vector<float> y(static_cast<std::size_t>(m) * n), yref(y.size());
+            CUDA_CHECK(cudaMemcpy(y.data(), d_y, y.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(yref.data(), d_yref, yref.size() * sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+            double num = 0, den = 0;
+            float max_err = 0.0f;
+            for (std::size_t i = 0; i < y.size(); ++i) {
+                const double e = static_cast<double>(y[i]) - yref[i];
+                num += e * e;
+                den += static_cast<double>(yref[i]) * yref[i];
+                max_err = std::max(max_err, static_cast<float>(std::fabs(e)));
+            }
+            const float rel = static_cast<float>(std::sqrt(num / (den + 1e-30)));
+            worst_rel = std::max(worst_rel, rel);
+            std::printf("bf16 TC GEMM: [%d,%d]x[%d,%d] max_err=%.5f rel_l2=%.5f\n", m, n, k, k,
+                        max_err, rel);
+            cudaFree(d_x);
+            cudaFree(d_w);
+            cudaFree(d_b);
+            cudaFree(d_y);
+            cudaFree(d_yref);
+        }
+        std::printf("bf16 TC GEMM worst rel_l2 vs ref=%.5f %s\n", worst_rel,
+                    worst_rel <= 0.02f ? "OK" : "FAIL");
+        if (worst_rel > 0.02f) ++failures;
+    }
+
     // ---- full device decoder vs CPU MoEDecoder (tiny synthetic config) ----
     {
         ModelConfig cfg;

@@ -18,7 +18,8 @@
 → P2 合并访存内核与分块 prefill GEMM → P1 attention 逐层残差定位
 → P2 TC `ldmatrix`/shared-memory staging → 连续批处理接入 device decoder
 → **batched R-SWA attention/append 内核** → **ragged 多请求 prefill**
-→ **slot 映射 bug 修复** → **batched decode 纳入 CUDA Graph**。
+→ **slot 映射 bug 修复** → **batched decode 纳入 CUDA Graph**
+→ **bf16 tensor-core GEMM（dense/shared + lm_head）**。
 
 最终回归：`compare_ocr` greedy **24/24**（CPU 参考路径）；`uocr_cuda_tests` 全过
 （含 batched 排列 / ragged prefill / slot 复用）；CPU 单测 20/20。
@@ -39,17 +40,18 @@
 
 1. ~~**Batched CUDA Graph**~~（已完成 2026-09-19）：`forward_batch` 整步捕获，
    按行数 B 缓存图，活跃 slot 变化靠设备端 slot 映射免重捕获；详见 `CORE_TECH.md`
-   §5.6。正确性 rel_l2=0；吞吐收益在带宽受限负载下有限（BF16 batch=16 纯 decode
+   §5.7。正确性 rel_l2=0；吞吐收益在带宽受限负载下有限（BF16 batch=16 纯 decode
    479→511 tok/s，其余持平，见 `BENCHMARKS.md` §2.7）。
-2. **dense/shared 投影上 tensor core**（当前首要剩余项）：`matmul_t_bf16` 仍是
-   CUDA-core 分块 GEMM（实测 ~2 TFLOPS），且 small-m（batch=16）时 64 行 tile 存在
-   浪费；lm_head `[129280,1280]` 是每步最大固定开销。参考 `moe_gemm_int4_tc` 的
-   `ldmatrix`/MMA 路径实现 bf16×bf16 tensor-core GEMM。
-3. **Prefill KV 分区写入优化**（prj.md 创新点三）：prefill 时按位置分区
+2. ~~**dense/shared 投影上 tensor core**~~（已完成 2026-09-19）：`matmul_t_bf16`
+   改为 `ldmatrix`/`mma.m16n8k16` bf16 TC GEMM，并保留 CUDA-core 参考做 A/B
+   （rel_l2 ≤ 0.0018）。真实模型 BF16 batch=16 298→411 tok/s、整波 prefill
+   367→216ms，详见 `CORE_TECH.md` §5.5、`BENCHMARKS.md` §2.7–2.8。
+3. **TC 进一步调优**（当前首要剩余项）：lm_head 小 m 时 TC 仅 2 TFLOPS（每 block
+   仅 1 warp 做 mma，n 方向未拆给多 warp）；另 `swizzle` 减 bank conflict、
+   split-K、`cp.async` 双缓冲。参考 `BENCHMARKS.md` §2.8。
+4. **Prefill KV 分区写入优化**（prj.md 创新点三）：prefill 时按位置分区
    （视觉区/环形区/gap 丢弃），节省 ~70% prefill KV 写入带宽（当前按参考语义
    保留全部 prefill KV）。
-4. **TC 进一步调优**：`ldmatrix` 已完成；剩余 `swizzle` 减少 bank conflict、
-   split-K（小 m 场景）、`cp.async` 双缓冲。
 5. **精度评测**：OmniDocBench v1.6（AWQ vs BF16 综合分）、AWQ vs 朴素 INT4 消融。
 6. **性能记录补全**：GPU SM 利用率（已装 ncu/nsys）、KV Cache 碎片率、
    纯 decode 的 TTFT/TPOT 分解（当前吞吐含 prefill）。
@@ -168,8 +170,14 @@
       微基准（n=896,k=1280）：m=273 1372µs→136µs（10.1×），m=128 653µs→71µs（9.2×），
       最高 4.6 TFLOPS。原始数据 `bench/bench_int4_gemm.txt`。
 - [ ] 剩余：`swizzle` 消除 shared bank conflict、split-K（小 m）、`cp.async` 双缓冲。
-- [ ] prefill 的 `matmul_t_bf16` 已是 64×64 分块 shared-memory GEMM；可继续做
-      双缓冲与 register tiling。
+- [x] **bf16 tensor-core GEMM**（2026-09-19）：`matmul_t_bf16` 改为 block=4 warps、
+      64(m)×64(n) tile、`ldmatrix.x4/x2` + `mma.m16n8k16.bf16`；m 不足 64 时越界
+      warp 跳过 mma（小 m 不浪费）。保留 `matmul_t_bf16_ref` 做 A/B，单测
+      rel_l2 ≤ 0.0018。微基准 n=k=1280 最高 18.4 TFLOPS（m=273，4.5×）；真实模型
+      BF16 batch=16 298→411 tok/s、整波 prefill 367→216ms。见 `CORE_TECH.md` §5.5、
+      `BENCHMARKS.md` §2.7–2.8。
+- [ ] 剩余：lm_head 小 m 时 n 方向拆给多 warp（当前每 block 仅 1 warp 做 mma，
+      2 TFLOPS）；swizzle / split-K / `cp.async`。
 
 ### P2 连续批处理（已完成 2026-09-19）
 - [x] `GpuDecoder` per-slot R-SWA KV cache + `attention_block_batch` /
@@ -190,7 +198,7 @@
 - [x] **slot 映射修复**：`batch_decode(tokens, positions, slots, logits)` 显式传入
       “行→slot”映射（此前按行号当 slot，请求顺序与 slot 顺序不一致时会读错
       KV）。见 `PITFALLS.md` §13。
-- [ ] **待优化**：dense/shared 投影上 tensor core（`matmul_t_bf16` ~2 TFLOPS）。
+- [x] **待优化**：dense/shared 投影上 tensor core（已于 2026-09-19 完成，见上）。
 
 ### P2 Batched CUDA Graph（已完成 2026-09-19）
 - [x] `forward_batch + final rmsnorm` 整步捕获；按行数 B 缓存

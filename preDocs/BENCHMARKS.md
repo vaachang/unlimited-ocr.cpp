@@ -126,38 +126,49 @@ n=896, k=1280, group=128, iters=200（单次 GEMM 调用；`2*m*n*k` 计 FLOP）
 （rel_l2 = 0）；`Engine batch` / slot 复用 / 非恒等 slot 排列 / `GpuDecoder prefill` /
 `Engine CUDA greedy` 全部通过。
 
-剩余瓶颈：batched decode 未纳入 CUDA Graph（host 逐 kernel 发射）；
-`matmul_t_bf16`（dense/shared 投影）仍是 CUDA-core tiled GEMM（~2 TFLOPS，未用 TC）。
+剩余瓶颈：`matmul_t_bf16` 曾是 CUDA-core tiled GEMM（~2 TFLOPS，未用 TC）；
+lm_head 小 m 下 TC 利用率偏低。
 
-### 2.7 Batched CUDA Graph（`bench/bench_batch_real_*_{graph,plain}.txt`）
+### 2.7 连续批处理：bf16 TC GEMM + Batched CUDA Graph
+（`bench/bench_batch_real_*_{graph,plain}.txt`）
 
-`forward_batch + final rmsnorm` 现在整步捕获，按**行数 B** 缓存 Graph（见
-`CORE_TECH.md` §5.6）。基准先跑一次不计时的 `generate_batch` 做 warmup（捕获
-Graph、并在 `batch_configure` 复用分配），再计时第二次；因此表中的数字是
-**稳态**，不含一次性捕获开销。同命令加 `--no-graph` 得到 plain 对照。
+本轮两项改动叠加：
 
-prompt=64、steps=16、max_batch=16（tok/s 含整波 prefill；括号内为从 `decode_ms`
+1. **bf16 tensor-core GEMM**（`CORE_TECH.md` §5.5）：`matmul_t_bf16`（dense/shared
+   投影 + lm_head）走 `ldmatrix`/`mma.m16n8k16`；行数 1 的 lm_head 走 `matvec_bf16`。
+2. **Batched CUDA Graph**（`CORE_TECH.md` §5.7）：`forward_batch + final rmsnorm`
+   按行数 B 缓存 Graph；活跃 slot 变化靠设备端映射免重捕获。基准先跑一次不计时的
+   `generate_batch` 做 warmup（捕获 Graph 并复用分配），表中的数字是**稳态**，
+   不含一次性捕获开销。`--no-graph` 关闭 Graph 做对照。
+
+prompt=64、steps=16、max_batch=16（tok/s 含整波 prefill；括号内为 `decode_ms`
 减去 prefill 墙钟得到的纯 decode 吞吐）：
 
 | batch | BF16 plain | BF16 graph | INT4 plain | INT4 graph |
 |---|---|---|---|---|
-| 1 | 101.7 (135) | 102.0 (135) | 91.4 (136) | 91.9 (136) |
-| 2 | 90.6 (111) | 90.6 (111) | 81.8 (110) | 82.8 (112) |
-| 4 | 116.8 (197) | 117.0 (197) | 135.9 (195) | 137.0 (195) |
-| 8 | 192.0 (327) | 187.9 (318) | 220.5 (322) | 215.1 (321) |
-| 16 | 283.2 (479) | **294.8 (511)** | 307.6 (462) | 307.0 (461) |
+| 1 | 150.6 (216) | 148.4 (211) | 130.1 (219) | 130.5 (221) |
+| 2 | 117.5 (147) | 116.5 (146) | 104.5 (149) | 103.6 (147) |
+| 4 | 158.7 (252) | 160.9 (255) | 171.9 (253) | 166.7 (244) |
+| 8 | 258.4 (394) | 265.1 (411) | 261.5 (387) | 256.1 (371) |
+| 16 | 401.6 (607) | **411.1 (630)** | 363.1 (538) | 366.2 (538) |
 
-结论（诚实版）：
+**与上一轮（无 TC、无 batched graph）对比**（同样命令、warmup 稳态）：
 
-- **正确性**：`uocr_cuda_tests` 的 batched graph vs plain 在非恒等 slot 排列、
-  W=8 跑 14 步（覆盖环形覆写）下 logits rel_l2 = 0（逐位一致），且确认捕获到
-  Graph；batch 两次调用复用分配/图后 token 不变。
-- **性能**：当前工作负载已接近带宽/占用受限，host 发射不是瓶颈，因此整步捕获
-  带来的吞吐变化基本在 run-to-run 噪声（±3%）内（BF16 batch=16 纯 decode
-  479→511，+6.7%，其余持平）。它的主要价值是每步 host 侧只剩 **1 次 graph
-  launch + 1 次 lm_head launch**（而非 ~275 次），在更小 batch、更多并发图或
-  launch 延迟更高的平台上收益会更明显。lm_head 仍在图外（其 logits buffer 会
-  按需扩容，但仍是每步最大的一段固定开销）。
+| 配置 | 上一轮 | 现在 | 备注 |
+|---|---|---|---|
+| BF16 batch=16 整波 prefill | 367 ms | **216 ms** | TC GEMM −41% |
+| BF16 batch=16 tok/s | 298.0 | **411.1** | +38% |
+| INT4 batch=16 整波 prefill | 279 ms | **223 ms** | −20% |
+| INT4 batch=16 tok/s | 307.6 | **366.2** | +19% |
+| BF16 batch=1 tok/s | 99.4 | **148.4** | TC + matvec lm_head +50% |
+| INT4 batch=1 tok/s | 91.4 | **130.5** | +43% |
+
+结论：
+
+- **TC GEMM 是主要收益**（prefill 与 decode 的 dense/shared/投影 + lm_head 全线提速）。
+- **Graph 本身收益仍在噪声内**（±3%）：负载已接近带宽/占用受限，host 发射不是
+  瓶颈；其价值是每步 host 侧只剩 1 次 graph launch + 1 次 lm_head launch。正确性
+  上 graph vs plain 逐位一致（单测 rel_l2=0）。
 - 复现：
   ```bash
   ./build-cuda/benchmarks/bench_cuda_batch --real      --prompt 64 --steps 16 --max-batch 16
@@ -165,6 +176,36 @@ prompt=64、steps=16、max_batch=16（tok/s 含整波 prefill；括号内为从 
   ./build-cuda/benchmarks/bench_cuda_batch --real --int4 --prompt 64 --steps 16 --max-batch 16
   ./build-cuda/benchmarks/bench_cuda_batch --real --int4 --no-graph --prompt 64 --steps 16 --max-batch 16
   ```
+
+### 2.8 bf16 tensor-core GEMM 微基准（`bench/bench_bf16_gemm_*.txt`）
+
+`bench_bf16_gemm` 对比 `matmul_t_bf16_ref`（CUDA-core tiled）与 `matmul_t_bf16`
+（TC），iters=300/20（`2*m*n*k` 计 FLOP）：
+
+n=k=1280（dense 投影形状）：
+
+| m | tiled (µs) | TC (µs) | TC TFLOPS | 加速 |
+|---|---|---|---|---|
+| 1 | 3.2 | 3.2 (matvec) | 1.01 | 1.00 |
+| 8 | 83.0 | 36.0 | 0.73 | 2.31 |
+| 16 | 84.6 | 36.1 | 1.45 | 2.34 |
+| 64 | 86.3 | 38.7 | 5.42 | 2.23 |
+| 128 | 150.3 | 41.7 | 10.05 | 3.60 |
+| 273 | 216.8 | 48.5 | **18.44** | 4.47 |
+
+n=129280, k=1280（lm_head 形状）：
+
+| m | tiled (µs) | TC (µs) | TC TFLOPS | 加速 |
+|---|---|---|---|---|
+| 1 | 780.5 | 780.5 (matvec) | 0.42 | 1.00 |
+| 8 | 3791.1 | 2535.6 | 1.04 | 1.48 |
+| 16 | 3830.6 | 2553.9 | 2.07 | 1.50 |
+| 64 | 3958.5 | 2647.3 | 8.00 | 1.50 |
+| 128 | 7824.6 | 5247.1 | 8.07 | 1.49 |
+| 273 | 19336.4 | 12962.9 | 6.97 | 1.49 |
+
+要点：n=k=1280 时 TC 到 18 TFLOPS；lm_head 只在 2–8 TFLOPS——小 m 时每个 block
+仅 1 个 warp 做 mma，n 方向未拆给多 warp，是后续调优点（见 tAgent 优先级 4）。
 
 
 ## 3. 数值对齐

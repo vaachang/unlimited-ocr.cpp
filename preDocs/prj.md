@@ -198,8 +198,8 @@ RTX 5060 Ti 的 448 GB/s 带宽意味着**每个 byte 都珍贵**。内核设计
 | **端到端** | 单页 TTFT P50 | 文本 128 token：BF16 192 ms / INT4 127 ms（未含视觉编码） |
 | | TPOT P50（decode 稳定态, batch=1） | **INT4 full graph 5.43 ms**（BF16 5.45 ms） |
 | | 解码第 40 页 vs 第 1 页 TPOT 比 | ≈1.0（R-SWA 常数缓存；`--steps 140` 验证 ring 覆写） |
-| **吞吐** | batch=8 输出 token 吞吐 | INT4 105.7 tok/s / BF16 74.3 tok/s（prompt64，含串行 prefill） |
-| | batch=16 输出 token 吞吐 | INT4 117.6 tok/s / BF16 73.5 tok/s |
+| **吞吐** | batch=8 输出 token 吞吐 | INT4 256 tok/s / BF16 265 tok/s（prompt64，ragged prefill + bf16 TC GEMM） |
+| | batch=16 输出 token 吞吐 | INT4 366 tok/s / BF16 411 tok/s（同上；见 `BENCHMARKS.md` §2.7） |
 | | GPU SM 利用率（decode 阶段） | 未测（本机无 ncu/nsys） |
 | **显存** | batch=8 峰值显存（INT4） | 2456 MB（权重常驻，含 lm_head bf16） |
 | | batch=16 峰值显存（INT4） | 2656 MB |

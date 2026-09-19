@@ -135,10 +135,32 @@ scale/zero），显存从 9.2GB 降到 2.2GB。`moe_experts_masked_int4` 在 ker
 
 `matvec_bf16`（warp-per-output，每 lane 向量化读 2 个 bf16）与 expert MLP 的
 gate_up/down 内核修复了“相邻线程按行 stride 读权重”导致的 ~16× 带宽浪费。
-prefill 的 `matmul_t_bf16` 改为 64×64 分块 + shared memory staging（panel 补 1 列
-避免 bank conflict）。
+`matmul_t_bf16` 的 CUDA-core 参考版保留为 64×64 分块 + shared memory staging
+（panel 补 1 列避免 bank conflict），见 §5.5 的 tensor-core 取代。
 
-### 5.5 连续批处理（P2 收尾，2026-09-19）
+### 5.5 bf16 tensor-core GEMM（P2，2026-09-19）
+
+`matmul_t_bf16`（dense/shared 投影与 lm_head 的主力）从 CUDA-core 分块 GEMM
+换成 `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`：
+
+- block = 4 warps 计算 64(m)×64(n) tile，`kTCM=64/kTCN=64/kTCK=16`。激活值 staging
+  时 `__float2bfloat16`；权重已是 bf16 直接搬。A 用 `ldmatrix.x4`、B（`W[n][k]`
+  行主序 = mma 的 col-major）用 `ldmatrix.x2`，每个 warp 负责 16 行 m、遍历 8 个
+  n8 子块。grid = `(ceil(n/64), ceil(m/64))`，block=128 线程。
+- **小 m 不浪费**：m 不足 64 时，16 行切片完全越界的 warp 跳过 mma 循环（仍参与
+  `__syncthreads`），因此 decode 的 m=16 不会为 64 行 tile 付出 4× 计算。
+- **回退/对照**：`matmul_t_bf16_ref`（原 CUDA-core 分块内核）保留，供单测 A/B；
+  单测在 `m∈{16,64,3,273}`、`k∈{48,128,160,256}` 上 TC vs ref rel_l2 ≤ 0.0018。
+- `batch_decode`/ragged prefill 的 lm_head 在行数 ==1 时走 `matvec_bf16`
+  （避免用 GEMM 处理单行）。
+- 微基准（`bench/bench_bf16_gemm_*.txt`，RTX 5060 Ti）：
+  - n=k=1280：m=16 时 84.6→36.1µs（2.3×），m=273 时 216.8→48.5µs（4.5×，18.4 TFLOPS）。
+  - lm_head n=129280、k=1280：m=16 时 3830→2554µs（1.5×，2.1 TFLOPS）——小 m 下
+    block 只有 1 个 warp 做 mma，是后续调优点（n 方向拆给多 warp）。
+- 真实模型连续批处理（`BENCHMARKS.md` §2.7）：BF16 batch=16 294.8→**402.3** tok/s，
+  整波 prefill 367→217ms；INT4 batch=16 307.0→365.6 tok/s。
+
+### 5.6 连续批处理（P2 收尾，2026-09-19）
 
 - **per-slot R-SWA KV**：`GpuDecoder::batch_configure(slots, capacity)` 为每个 slot
   分配独立 `[capacity, kv_heads, head_dim]` K/V 与 `d_len/d_ring_pos`（`[layers*slots]`
@@ -163,7 +185,7 @@ prefill 的 `matmul_t_bf16` 改为 64×64 分块 + shared memory staging（panel
   - `EngineConfig::use_device_moe_prefill`（默认 true）控制单请求 prefill
     （`prefill_embeds`，OCR 路径）走 masked device MoE。
 
-### 5.6 Batched CUDA Graph（P2，2026-09-19）
+### 5.7 Batched CUDA Graph（P2，2026-09-19）
 
 单请求 decode 早已整步捕获，但连续批处理的每一步仍由 host 逐 kernel 发射
 （每步约 `13 × ~20` 个 launch）。本项把 batched decode 也纳入 Graph：

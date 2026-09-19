@@ -246,3 +246,21 @@ position_ids = arange(past_key_values_length, seq_length + past_key_values_lengt
   捕获时必然 early-return，但把顺序写对才稳。
 - 另注：`graph_scope=="attn_dense"` 的逐层图是给单请求 seq=1 设计的，batched
   decode 在该 scope 下自动回退到逐 kernel 路径。
+
+## 15. bf16 tensor-core GEMM（2026-09-19）
+
+把 `matmul_t_bf16` 从 CUDA-core 分块换成 `mma.m16n8k16.bf16` 时的几个点：
+
+- **fragment 布局直接复用 INT4 TC 内核**：A（激活，`[m,k]` 行主序）用
+  `ldmatrix.x4`，B（权重 `W[n][k]`，正好是 mma 的 col-major k×n）用
+  `ldmatrix.x2`。`sA[64][16]`/`sW[64][16]` 的行跨度 32B，`col∈{0,8}` 时地址
+  16B 对齐，满足 `ldmatrix` 要求。
+- **小 m 的 4× 浪费**：原来 CUDA-core kernel 的 BM=64，m=16 时仍算满 64 行。
+  TC 内核让 16 行切片越界的 warp **跳过 mma 循环**（但仍参与 `__syncthreads`），
+  这样 m=16 不再付 64 行的计算。别用 `return` 提前退出——那会让剩下的 warp 卡在
+  同步上。
+- **lm_head 仍是短板**：m 小时 `active` 只有 1 个 warp，n 方向没有拆给多 warp，
+  实测 n=129280 只有 ~2 TFLOPS（dense 形状能到 18 TFLOPS）。这是后续调优点，
+  不是正确性问题。
+- 保留 CUDA-core 版为 `matmul_t_bf16_ref`，单测在多种 m/n/k 上做 A/B，
+  rel_l2 ≤ 0.0018（差异来自激活值 bf16 舍入，与参考 bf16 推理一致）。

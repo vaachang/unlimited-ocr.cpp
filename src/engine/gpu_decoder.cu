@@ -1098,7 +1098,10 @@ void GpuDecoder::batch_prefill_embeds(const float* host_embeds, const std::vecto
                  "ragged logits");
         batch_logits_cap_ = requests;
     }
-    cuda::matmul_t_bf16(d_normed_, lm_head_.w, nullptr, d_logits_batch_, requests, V, h, 0);
+    if (requests == 1)
+        cuda::matvec_bf16(d_normed_, lm_head_.w, nullptr, d_logits_batch_, V, h, 0);
+    else
+        cuda::matmul_t_bf16(d_normed_, lm_head_.w, nullptr, d_logits_batch_, requests, V, h, 0);
     cu_check(cudaStreamSynchronize(0), "ragged sync");
     std::vector<float> buf(static_cast<std::size_t>(requests) * V);
     cu_check(cudaMemcpy(buf.data(), d_logits_batch_, buf.size() * sizeof(float),
@@ -1153,7 +1156,10 @@ void GpuDecoder::batch_decode(const std::vector<int>& tokens, const std::vector<
                  "batch logits");
         batch_logits_cap_ = batch;
     }
-    cuda::matmul_t_bf16(d_normed_, lm_head_.w, nullptr, d_logits_batch_, batch, V, h, 0);
+    if (batch == 1)
+        cuda::matvec_bf16(d_normed_, lm_head_.w, nullptr, d_logits_batch_, V, h, 0);
+    else
+        cuda::matmul_t_bf16(d_normed_, lm_head_.w, nullptr, d_logits_batch_, batch, V, h, 0);
     cu_check(cudaEventRecord(ev_b_, 0), "batch ev b");
     cu_check(cudaStreamSynchronize(0), "batch sync");
     cu_check(cudaEventElapsedTime(&last_forward_ms_, ev_a_, ev_b_), "batch elapsed");
