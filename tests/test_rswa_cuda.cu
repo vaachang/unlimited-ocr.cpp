@@ -501,7 +501,8 @@ int main() {
     // ---- bf16 tensor-core GEMM vs CUDA-core reference (various m/n/k) ----
     {
         struct Shape { int m, n, k; };
-        const Shape shapes[] = {{16, 64, 128}, {64, 128, 256}, {3, 40, 48}, {273, 96, 160}};
+        const Shape shapes[] = {{16, 64, 128}, {64, 128, 256}, {3, 40, 48},
+                                {40, 96, 64},  {273, 96, 160}};
         float worst_rel = 0.0f;
         for (const Shape& s : shapes) {
             const int m = s.m, n = s.n, k = s.k;

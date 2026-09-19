@@ -1,20 +1,20 @@
-[16:16:06][INFO] decoder weights loaded from models/model-00001-of-000001.safetensors  (/home/admin/MyDocs/unlimited-ocr.cpp/src/runtime/weights.cpp:214)
-[16:16:08][INFO] engine created (CUDA backend)  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:57)
-[16:16:09][INFO] batch done: 1 requests, 16 decode tokens, 124.3 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
-[16:16:09][INFO] batch done: 1 requests, 16 decode tokens, 122.6 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
-[16:16:09][INFO] batch done: 2 requests, 32 decode tokens, 306.7 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
-[16:16:09][INFO] batch done: 2 requests, 32 decode tokens, 308.7 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
-[16:16:10][INFO] batch done: 4 requests, 64 decode tokens, 377.1 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
-[16:16:10][INFO] batch done: 4 requests, 64 decode tokens, 383.7 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
-[16:16:11][INFO] batch done: 8 requests, 128 decode tokens, 489.2 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
-[16:16:11][INFO] batch done: 8 requests, 128 decode tokens, 499.7 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
-[16:16:12][INFO] batch done: 16 requests, 256 decode tokens, 718.2 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
-[16:16:12][INFO] batch done: 16 requests, 256 decode tokens, 698.9 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
+[16:24:55][INFO] decoder weights loaded from models/model-00001-of-000001.safetensors  (/home/admin/MyDocs/unlimited-ocr.cpp/src/runtime/weights.cpp:214)
+[16:24:57][INFO] engine created (CUDA backend)  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:57)
+[16:24:58][INFO] batch done: 1 requests, 16 decode tokens, 124.2 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
+[16:24:58][INFO] batch done: 1 requests, 16 decode tokens, 122.2 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
+[16:24:58][INFO] batch done: 2 requests, 32 decode tokens, 299.2 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
+[16:24:58][INFO] batch done: 2 requests, 32 decode tokens, 298.5 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
+[16:24:59][INFO] batch done: 4 requests, 64 decode tokens, 362.9 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
+[16:24:59][INFO] batch done: 4 requests, 64 decode tokens, 364.4 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
+[16:25:00][INFO] batch done: 8 requests, 128 decode tokens, 479.6 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
+[16:25:00][INFO] batch done: 8 requests, 128 decode tokens, 476.2 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
+[16:25:01][INFO] batch done: 16 requests, 256 decode tokens, 699.5 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
+[16:25:01][INFO] batch done: 16 requests, 256 decode tokens, 684.2 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
 device: NVIDIA GeForce RTX 5060 Ti (sm_120, 36 SMs, 15.6 GB)
 prompt=64 steps=16 max_batch=16 experts=INT4 graph=on
  batch   prefill_ms    decode_ms          tok/s       peakMB
-     1         50.1        122.6          130.5       2270.0
-     2         91.1        308.7          103.6       2324.0
-     4        121.6        383.9          166.7       2426.0
-     8        155.0        499.8          256.1       2642.0
-    16        222.8        699.0          366.2       3050.0
+     1         49.8        122.3          130.8       2270.0
+     2         90.9        298.6          107.2       2324.0
+     4        118.8        364.5          175.6       2426.0
+     8        158.4        476.3          268.7       2642.0
+    16        227.0        684.3          374.1       3050.0

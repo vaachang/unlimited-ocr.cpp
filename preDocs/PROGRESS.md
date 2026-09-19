@@ -237,6 +237,7 @@ tok/s；batch=16 整波 prefill 16×88ms→279ms(INT4)/370ms(BF16)。同时修�
 
 2026-09-19 补充：batched decode 已纳入 CUDA Graph（`CORE_TECH.md` §5.7、
 `PITFALLS.md` §14、`BENCHMARKS.md` §2.7）；bf16 dense/shared + lm_head 已换
-tensor-core GEMM（`CORE_TECH.md` §5.5、`BENCHMARKS.md` §2.7–2.8）。真实模型
-BF16 batch=16 298→411 tok/s、整波 prefill 367→216ms。原始数据见
+tensor-core GEMM，并加 m≤16 的 n 方向拆 warp 小 m 变体（`CORE_TECH.md` §5.5、
+`BENCHMARKS.md` §2.7–2.8）。真实模型 BF16 batch=16 298→417 tok/s、整波 prefill
+367→207ms；INT4 batch=16 308→374 tok/s。原始数据见
 `bench/bench_batch_real_*_{graph,plain}.txt`、`bench/bench_bf16_gemm_*.txt`。

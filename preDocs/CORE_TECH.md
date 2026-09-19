@@ -149,16 +149,21 @@ gate_up/down 内核修复了“相邻线程按行 stride 读权重”导致的 ~
   n8 子块。grid = `(ceil(n/64), ceil(m/64))`，block=128 线程。
 - **小 m 不浪费**：m 不足 64 时，16 行切片完全越界的 warp 跳过 mma 循环（仍参与
   `__syncthreads`），因此 decode 的 m=16 不会为 64 行 tile 付出 4× 计算。
+- **小 m 变体**（m ≤ 16）：另一个 BM=16/BN=64 的内核让 4 个 warp **沿 n 方向**
+  各算 16 列（各 2 个 n8 子块），避免上面 64 行内核在 m=16 时只有 1 个 warp 做
+  mma。`matmul_t_bf16` 在 m ≤ 16 时分派到它；n=k=1280、m=16 时
+  36.1→30.1µs（1.74 TFLOPS，+20%）。
 - **回退/对照**：`matmul_t_bf16_ref`（原 CUDA-core 分块内核）保留，供单测 A/B；
-  单测在 `m∈{16,64,3,273}`、`k∈{48,128,160,256}` 上 TC vs ref rel_l2 ≤ 0.0018。
+  单测在 `m∈{3,16,40,64,273}`、`k∈{48,64,128,160,256}` 上 TC vs ref
+  rel_l2 ≤ 0.0018。
 - `batch_decode`/ragged prefill 的 lm_head 在行数 ==1 时走 `matvec_bf16`
   （避免用 GEMM 处理单行）。
 - 微基准（`bench/bench_bf16_gemm_*.txt`，RTX 5060 Ti）：
-  - n=k=1280：m=16 时 84.6→36.1µs（2.3×），m=273 时 216.8→48.5µs（4.5×，18.4 TFLOPS）。
-  - lm_head n=129280、k=1280：m=16 时 3830→2554µs（1.5×，2.1 TFLOPS）——小 m 下
-    block 只有 1 个 warp 做 mma，是后续调优点（n 方向拆给多 warp）。
-- 真实模型连续批处理（`BENCHMARKS.md` §2.7）：BF16 batch=16 294.8→**402.3** tok/s，
-  整波 prefill 367→217ms；INT4 batch=16 307.0→365.6 tok/s。
+  - n=k=1280：m=16 时 84.7→30.1µs（2.8×），m=273 时 217.4→48.7µs（4.5×，18.4 TFLOPS）。
+  - lm_head n=129280、k=1280：m=16 时 3832→2652µs（1.44×，2.0 TFLOPS）——即使 4 个
+    warp 全用上仍受权重读取/同步限制，是后续调优点（split-K、更大 BN、`cp.async`）。
+- 真实模型连续批处理（`BENCHMARKS.md` §2.7）：BF16 batch=16 298→**417** tok/s，
+  整波 prefill 367→207ms；INT4 batch=16 308→**374** tok/s。
 
 ### 5.6 连续批处理（P2 收尾，2026-09-19）
 

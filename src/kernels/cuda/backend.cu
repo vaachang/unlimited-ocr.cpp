@@ -191,6 +191,92 @@ __global__ void matmul_t_bf16_tc_kernel(const float* __restrict__ x,
     }
 }
 
+// Small-m tensor-core GEMM: BM=16 rows, BN=64 columns, with the 4 warps
+// splitting the n dimension (16 columns each).  Used when m <= 16 so the mma
+// work is spread over all warps instead of leaving three of them idle (the
+// 64-row kernel above only activates one warp for m=16).  This is the hot path
+// for the lm_head projection during decode.
+constexpr int kTSM = 16;  // rows per block
+constexpr int kTSN = 64;  // columns per block
+constexpr int kTSK = 16;  // k per step
+
+__global__ void matmul_t_bf16_tc_small_kernel(const float* __restrict__ x,
+                                              const std::uint16_t* __restrict__ w,
+                                              const float* __restrict__ bias, float* __restrict__ y,
+                                              int m, int n, int k) {
+    __shared__ __nv_bfloat16 sA[kTSM][kTSK];
+    __shared__ __nv_bfloat16 sW[kTSN][kTSK];
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int m0 = blockIdx.y * kTSM;
+    const int n0 = blockIdx.x * kTSN;
+    // Each warp owns two adjacent n8 sub-tiles: columns [warp*16, warp*16+16).
+    const int nt_base = warp * 2;
+
+    float c[2][4] = {};
+
+    for (int k0 = 0; k0 < k; k0 += kTSK) {
+#pragma unroll
+        for (int l = 0; l < (kTSM * kTSK) / 128; ++l) {
+            const int idx = tid + l * 128;
+            const int r = idx / kTSK, cc = idx % kTSK;
+            const int gm = m0 + r, gk = k0 + cc;
+            sA[r][cc] = (gm < m && gk < k)
+                            ? __float2bfloat16(x[static_cast<std::size_t>(gm) * k + gk])
+                            : __float2bfloat16(0.0f);
+        }
+#pragma unroll
+        for (int l = 0; l < (kTSN * kTSK) / 128; ++l) {
+            const int idx = tid + l * 128;
+            const int r = idx / kTSK, cc = idx % kTSK;
+            const int gn = n0 + r, gk = k0 + cc;
+            sW[r][cc] = (gn < n && gk < k)
+                            ? __ushort_as_bfloat16(w[static_cast<std::size_t>(gn) * k + gk])
+                            : __float2bfloat16(0.0f);
+        }
+        __syncthreads();
+
+        const __nv_bfloat16* a_ptr = &sA[lane & 15][(lane >> 4) * 8];
+        unsigned a0, a1, a2, a3;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                     : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+                     : "r"(smem_addr(a_ptr)));
+#pragma unroll
+        for (int t = 0; t < 2; ++t) {
+            const __nv_bfloat16* b_ptr = &sW[(nt_base + t) * 8 + (lane & 7)][((lane >> 3) & 1) * 8];
+            unsigned b0, b1;
+            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                         : "=r"(b0), "=r"(b1)
+                         : "r"(smem_addr(b_ptr)));
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+                : "+f"(c[t][0]), "+f"(c[t][1]), "+f"(c[t][2]), "+f"(c[t][3])
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+        }
+        __syncthreads();
+    }
+
+    const int r0 = m0 + (lane >> 2);
+    const int r1 = r0 + 8;
+    const int tig = lane & 3;
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+        const int c0 = n0 + (nt_base + t) * 8 + tig * 2;
+        const int c1 = c0 + 1;
+        if (r0 < m) {
+            if (c0 < n) y[static_cast<std::size_t>(r0) * n + c0] = c[t][0] + (bias ? bias[c0] : 0.0f);
+            if (c1 < n) y[static_cast<std::size_t>(r0) * n + c1] = c[t][1] + (bias ? bias[c1] : 0.0f);
+        }
+        if (r1 < m) {
+            if (c0 < n) y[static_cast<std::size_t>(r1) * n + c0] = c[t][2] + (bias ? bias[c0] : 0.0f);
+            if (c1 < n) y[static_cast<std::size_t>(r1) * n + c1] = c[t][3] + (bias ? bias[c1] : 0.0f);
+        }
+    }
+}
+
 // One warp per output row.  Lanes read consecutive bf16 pairs so every load
 // transaction is fully coalesced (the naive one-thread-per-row layout strides
 // by `k` between lanes and wastes ~16x bandwidth).
@@ -248,7 +334,13 @@ void matmul_t_bf16_ref(const float* x, const std::uint16_t* w, const float* bias
 void matmul_t_bf16(const float* x, const std::uint16_t* w, const float* bias, float* y, int m,
                    int n, int k, cudaStream_t stream) {
     if (m <= 0 || n <= 0 || k <= 0) return;
-    const dim3 block(128);  // 4 warps -> a 64x64 tile
+    const dim3 block(128);  // 4 warps
+    if (m <= kTSM) {
+        // Spread the mma work over all four warps along n (lm_head decode).
+        const dim3 grid((n + kTSN - 1) / kTSN, (m + kTSM - 1) / kTSM);
+        matmul_t_bf16_tc_small_kernel<<<grid, block, 0, stream>>>(x, w, bias, y, m, n, k);
+        return;
+    }
     const dim3 grid((n + kTCN - 1) / kTCN, (m + kTCM - 1) / kTCM);
     matmul_t_bf16_tc_kernel<<<grid, block, 0, stream>>>(x, w, bias, y, m, n, k);
 }

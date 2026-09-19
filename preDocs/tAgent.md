@@ -46,9 +46,9 @@
    改为 `ldmatrix`/`mma.m16n8k16` bf16 TC GEMM，并保留 CUDA-core 参考做 A/B
    （rel_l2 ≤ 0.0018）。真实模型 BF16 batch=16 298→411 tok/s、整波 prefill
    367→216ms，详见 `CORE_TECH.md` §5.5、`BENCHMARKS.md` §2.7–2.8。
-3. **TC 进一步调优**（当前首要剩余项）：lm_head 小 m 时 TC 仅 2 TFLOPS（每 block
-   仅 1 warp 做 mma，n 方向未拆给多 warp）；另 `swizzle` 减 bank conflict、
-   split-K、`cp.async` 双缓冲。参考 `BENCHMARKS.md` §2.8。
+3. **TC 进一步调优**（进行中）：小 m 变体已完成（m ≤ 16 沿 n 拆 warp，见
+   `CORE_TECH.md` §5.5）；lm_head 大 n 仍 2–8 TFLOPS，剩余 `swizzle` 减 bank
+   conflict、split-K、`cp.async` 双缓冲。参考 `BENCHMARKS.md` §2.8。
 4. **Prefill KV 分区写入优化**（prj.md 创新点三）：prefill 时按位置分区
    （视觉区/环形区/gap 丢弃），节省 ~70% prefill KV 写入带宽（当前按参考语义
    保留全部 prefill KV）。
@@ -176,8 +176,10 @@
       rel_l2 ≤ 0.0018。微基准 n=k=1280 最高 18.4 TFLOPS（m=273，4.5×）；真实模型
       BF16 batch=16 298→411 tok/s、整波 prefill 367→216ms。见 `CORE_TECH.md` §5.5、
       `BENCHMARKS.md` §2.7–2.8。
-- [ ] 剩余：lm_head 小 m 时 n 方向拆给多 warp（当前每 block 仅 1 warp 做 mma，
-      2 TFLOPS）；swizzle / split-K / `cp.async`。
+- [x] 小 m 变体（2026-09-19）：m ≤ 16 时 4 warp 沿 n 拆分（BM=16/BN=64），
+      n=k=1280 m=16 36.1→30.1µs；真实模型各 batch 再 +2~5%。
+- [ ] 剩余：lm_head（大 n）仍 2–8 TFLOPS，受权重读取/同步限制；`swizzle`、
+      split-K、`cp.async` 双缓冲。
 
 ### P2 连续批处理（已完成 2026-09-19）
 - [x] `GpuDecoder` per-slot R-SWA KV cache + `attention_block_batch` /
