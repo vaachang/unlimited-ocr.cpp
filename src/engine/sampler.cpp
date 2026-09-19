@@ -73,22 +73,29 @@ int Sampler::sample(const float* logits, int n) {
 
 void Sampler::apply_no_repeat_ngram(float* logits, int vocab, const std::vector<int>& history,
                                     int ngram, int window) {
-    if (ngram <= 0 || static_cast<int>(history.size()) < ngram) return;
-    const int start = std::max(0, static_cast<int>(history.size()) - window);
-    const std::vector<int> suffix(history.end() - ngram, history.end());
+    // Mirrors `SlidingWindowNoRepeatNgramProcessor`: ban the continuation of any
+    // (ngram-1)-prefix within the sliding window that matches the current
+    // suffix (the reference processor is called with the full input_ids).
+    if (ngram <= 0) return;
+    const int n = static_cast<int>(history.size());
+    if (n < ngram) return;
+    const int search_start = std::max(0, n - window);
+    const int search_end = n - ngram + 1;
+    if (search_end <= search_start) return;
 
-    for (int i = start; i + ngram < static_cast<int>(history.size()); ++i) {
+    const int plen = ngram - 1;  // current prefix length
+    const std::size_t base = static_cast<std::size_t>(n - plen);
+    for (int idx = search_start; idx < search_end; ++idx) {
         bool match = true;
-        for (int j = 0; j < ngram; ++j) {
-            if (history[static_cast<std::size_t>(i + j)] != suffix[static_cast<std::size_t>(j)]) {
+        for (int j = 0; j < plen; ++j) {
+            if (history[static_cast<std::size_t>(idx + j)] != history[base + static_cast<std::size_t>(j)]) {
                 match = false;
                 break;
             }
         }
-        if (match) {
-            const int banned = history[static_cast<std::size_t>(i + ngram)];
-            if (banned >= 0 && banned < vocab) logits[banned] = -std::numeric_limits<float>::infinity();
-        }
+        if (!match) continue;
+        const int banned = history[static_cast<std::size_t>(idx + ngram - 1)];
+        if (banned >= 0 && banned < vocab) logits[banned] = -std::numeric_limits<float>::infinity();
     }
 }
 

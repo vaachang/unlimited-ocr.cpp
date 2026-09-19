@@ -5,7 +5,8 @@ set(UOCR_TEST_SOURCES
     test_scheduler.cpp
     test_decoder.cpp
     test_moe_gate.cpp
-    test_tokenizer.cpp)
+    test_tokenizer.cpp
+    test_sampler.cpp)
 
 add_executable(uocr_tests ${UOCR_TEST_SOURCES})
 target_include_directories(uocr_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

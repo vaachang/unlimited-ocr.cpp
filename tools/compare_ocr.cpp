@@ -28,6 +28,7 @@
 #include "uocr/log.h"
 #include "uocr/prompt.h"
 #include "uocr/safetensors.h"
+#include "uocr/sampler.h"
 #include "uocr/tokenizer.h"
 #include "uocr/weights.h"
 
@@ -187,17 +188,24 @@ int main(int argc, char** argv) {
     std::vector<float> ref_logits = load_f32(ref_dir, T.at("prefill_logits"));
     report("prefill_logits", our_logits, ref_logits);
 
-    // ---- 5. greedy decode ----
+    // ---- 5. greedy decode (with optional no-repeat-ngram processor) ----
     const json& steps = manifest.at("decode_steps");
+    const int ngram = manifest.value("ngram_size", 0);
+    const int ngram_window = manifest.value("ngram_window", 0);
     int pos = seq;
     int token_matches = 0, token_total = 0;
     std::vector<float> cur_logits = our_logits;
+    std::vector<int> history = layout.input_ids;
     for (std::size_t s = 0; s < steps.size(); ++s) {
         int want = steps[s].at("token").get<int>();
+        if (ngram > 0 && ngram_window > 0)
+            Sampler::apply_no_repeat_ngram(cur_logits.data(), cfg.vocab_size, history, ngram,
+                                           ngram_window);
         int got = 0;
         float best = -1e30f;
         for (std::size_t i = 0; i < cur_logits.size(); ++i)
             if (cur_logits[i] > best) { best = cur_logits[i]; got = static_cast<int>(i); }
+        history.push_back(got);
         ++token_total;
         if (got == want) ++token_matches;
         std::printf("decode step %zu           : token ours=%d ref=%d %s\n", s, got, want,

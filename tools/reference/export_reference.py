@@ -318,13 +318,35 @@ def run_ocr(args, model):
     manifest["num_visual_tokens"] = int(visual.shape[0])
     manifest["hidden"] = int(visual.shape[1])
 
-    # greedy decode
+    # greedy decode (optionally with the sliding-window no-repeat-ngram processor)
+    use_ngram = args.ngram_size > 0 and args.ngram_window > 0
+    manifest["ngram_size"] = args.ngram_size
+    manifest["ngram_window"] = args.ngram_window
     cache = res.past_key_values
     steps = []
     pos = len(ids)
+    all_ids = list(ids)
     for step in range(args.decode_steps):
-        logits = res.logits[0, -1]
+        logits = res.logits[0, -1].clone()
+        if use_ngram:
+            seq = all_ids
+            if len(seq) >= args.ngram_size:
+                search_start = max(0, len(seq) - args.ngram_window)
+                search_end = len(seq) - args.ngram_size + 1
+                if search_end > search_start:
+                    if args.ngram_size > 1:
+                        prefix = tuple(seq[-(args.ngram_size - 1):])
+                    else:
+                        prefix = tuple()
+                    banned = set()
+                    for idx in range(search_start, search_end):
+                        ng = seq[idx:idx + args.ngram_size]
+                        if args.ngram_size == 1 or tuple(ng[:-1]) == prefix:
+                            banned.add(ng[-1])
+                    for b in banned:
+                        logits[b] = float("-inf")
         tokid = int(torch.argmax(logits).item())
+        all_ids.append(tokid)
         cur = torch.tensor([[tokid]], dtype=torch.long, device=model.device)
         with torch.no_grad():
             res = model(input_ids=cur, past_key_values=cache, use_cache=True,
@@ -359,6 +381,8 @@ def main():
     ap.add_argument("--no-crop-mode", dest="crop_mode", action="store_false")
     ap.add_argument("--ocr-width", type=int, default=500)
     ap.add_argument("--ocr-height", type=int, default=400)
+    ap.add_argument("--ngram-size", type=int, default=0)
+    ap.add_argument("--ngram-window", type=int, default=0)
     args = ap.parse_args()
 
     from transformers import AutoModel
