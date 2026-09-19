@@ -197,17 +197,20 @@ bf16 激活舍入。详见 `ALIGNMENT.md` §4、`PITFALLS.md` §9。CPU 完整�
 5. **M5 CUDA**：四个内核 + 对照测试。
 6. **M6 文档与验证**：真实权重加载、量化误差、基准、本文档。
 
-## 7. 后续计划
+## 7. 状态与后续
 
-> **P0 端到端图像 OCR 对齐（E0–E5）已于 2026-09-19 完成**，详见上文与
-> `tAgent.md`。下一步按 `tAgent.md` 的 P1/P2 推进。
+已完成：P0（E0–E5 端到端 OCR 24/24）、P1（R-SWA 环形覆写、attention 逐层对比）、
+P2（device router + 固定调度掩码 kernel + CUDA Graph、device INT4 权重、合并访存内核、
+指标表、可选 reference CTest）。最终回归：`compare_ocr` layout OK、
+visual rel_l2 0.04187、greedy **24/24**。
 
-1. **P1 降低路由翻转**：MoE gate 前把激活按 bf16 舍入以复刻参考数值；
-   逐层对比 attention q/k/v、O 投影；用 `--decode-steps 140` 覆盖环形覆写。
-2. **P1 CUDA 主路径**：把 `MoEDecoder` 的 `Linear::forward` / attention 分派到
-   `uocr::cuda::*`，实现 device 上的 KV cache（当前 `RSWACache` 为 host 内存）。
-3. **P2 CUDA Graph**：按 prj.md 的"路由在 Graph 外、expert 计算在 Graph 内全调度 + 掩码跳过"
-   方案捕获解码稳态。
-4. **P2 Tensor Core INT4 GEMM**：把 `moe_gemm_int4.cu` 的标量版替换为
-   `mma.sync.aligned.m16n8k32.s4.s4.s32`。
-5. **性能记录表**：补齐 `prj.md` 第 7.2 节所有指标（设备端 TTFT/TPOT/吞吐/显存）。
+仍待完成（见 `tAgent.md`）：
+
+1. **P2 Tensor Core 路径优化**：`moe_gemm_int4_tc` 仍是寄存器内标量反量化 + `mma`，
+   未用 `ldmatrix`/shared-memory staging/split-K。它是正确性基线与 plain（非 Graph）
+   路径在用；生产 decode 走 `moe_experts_masked_int4`（已合并访存），故不影响当前
+   TPOT 指标。
+2. **批处理**：`Engine` 当前单请求，prj.md §7.2 的 batch=8/16 吞吐/显存、GPU SM 利用率
+   依赖连续批处理接入 device decoder。
+3. **精度评测**：OmniDocBench v1.6（AWQ vs BF16）未接入。
+4. **Prefill KV 分区写入**：仍按参考语义保留全部 prefill KV（prj.md 的优化未做）。
