@@ -170,8 +170,8 @@ gate_up/down 内核修复了“相邻线程按行 stride 读权重”导致的 ~
   - n=k=1280：m=16 时 84.7→30.1µs（2.8×），m=273 时 217.4→48.7µs（4.5×，18.4 TFLOPS）。
   - lm_head n=129280、k=1280：m=16 时 3832→2652µs（1.44×，2.0 TFLOPS）——即使 4 个
     warp 全用上仍受权重读取/同步限制，是后续调优点（split-K、更大 BN、`cp.async`）。
-- 真实模型连续批处理（`BENCHMARKS.md` §2.7）：BF16 batch=16 298→**417** tok/s，
-  整波 prefill 367→207ms；INT4 batch=16 308→**374** tok/s。
+- 真实模型连续批处理（`BENCHMARKS.md` §2.6）：BF16 batch=16 298→**416** tok/s、
+  整波 prefill 367→**212 ms**；INT4 batch=16 308→**387** tok/s、prefill 279→**204 ms**。
 
 ### 5.6 连续批处理（P2 收尾，2026-09-19）
 
@@ -194,7 +194,7 @@ gate_up/down 内核修复了“相邻线程按行 stride 读权重”导致的 ~
   - 前向结束后按请求取最后一行做 final norm + lm_head，得到每个请求的首 token logits。
   - MoE 选择：每专家 token 数 ≤2 时用 masked matvec（`dev_moe=true`），否则用逐专家
     tensor-core GEMM（`moe_gemm_int4_tc`，M 即该专家 token 数）——大批量时权重只读
-    一次，prefill 从串行 16×88ms 降到整波 279ms(INT4)。
+    一次，prefill 从"16 请求逐串行"变成整波一次（当前耗时见 `BENCHMARKS.md` §2.6）。
   - `EngineConfig::use_device_moe_prefill`（默认 true）控制单请求 prefill
     （`prefill_embeds`，OCR 路径）走 masked device MoE。
 

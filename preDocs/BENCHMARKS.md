@@ -100,64 +100,33 @@ down 形状 n=1280, k=896（`bench_int4_gemm_down.txt`）同样 bn=8 最优（m=
 循环”，bn=8 下 m=96 50.2µs（旧版同形状约 ~65µs）、m=273 110µs（旧 136µs），
 **约 +20%**。结果与标量路径 rel_l2 ≤ 0.0026（`uocr_cuda_tests`，含 ragged M/K）。
 
-## 2.6 连续批处理吞吐（`bench/bench_batch_*.txt`）
+## 2.6 连续批处理吞吐（真实模型）
 
-`Engine::generate_batch`（scheduler + device batched decoder），prompt=64，steps=16；
-吞吐按总生成 token / 总墙钟计。`prefill_ms` 列是**整波 ragged prefill 的墙钟**
-（每请求 ttft 都记同一值，表格取平均）。2026-09-19 三项优化后：
+`Engine::generate_batch`（scheduler + device batched decoder），prompt=64、steps=16、
+max_batch=16。下面表格的 tok/s 含整波 prefill，括号内为 `decode_ms` 减去 prefill 墙钟
+得到的纯 decode 吞吐；`bench_cuda_batch` 先跑一次不计时的 `generate_batch` 做 warmup
+（捕获 Graph 并复用分配），因此是**稳态**数字。原始输出见
+`bench/bench_batch_real_*.txt`。
 
-| batch | BF16 tok/s | BF16 peak | INT4 tok/s | INT4 peak |
-|---|---|---|---|---|
-| 1 | 99.4 | 9264 MB | 89.4 | 2268 MB |
-| 2 | 89.4 | 9318 MB | 82.3 | 2322 MB |
-| 4 | 115.1 | 9420 MB | 134.3 | 2424 MB |
-| 8 | 189.8 | 9636 MB | 216.5 | 2640 MB |
-| 16 | **298.0** | 10044 MB | **310.7** | 3048 MB |
+设计与优化（按加入顺序）：
 
-优化前对照（同命令，本轮改动前；prefill 逐请求串行、masked MoE）：
-
-| batch | BF16 tok/s | INT4 tok/s | prefill/请求 |
-|---|---|---|---|
-| 8 | 74.3 | 105.7 | 88 ms |
-| 16 | 73.5 | 117.6 | 88 ms |
-
-三项优化：
-
-1. **Batched attention kernel**：`rswa_append_decode_batch` + `rswa_attention_batch`
+1. **batched attention**：`rswa_append_decode_batch` + `rswa_attention_batch`
    （grid=`(B, heads)`，行→slot 由 `d_slots` 指定）把每步 attention 的 kernel 数从
-   `O(B·L)` 降到 `O(L)`。合成小模型（launch-bound）batch=16 吞吐 2828 → 8365 tok/s。
-2. **ragged 多请求 prefill**：一步内新请求打包成一次 `forward_ragged`，
-   K/V 用 `rswa_write_prefill_ragged` 直接散写到各自 slot，attention 用
-   `rswa_attention_ragged`（每行按自己的 slot/局部位置做 causal）。当每专家 token 数
-   >2 时走逐专家 tensor-core GEMM（`moe_gemm_int4_tc`，M≈96），否则走 masked matvec。
-   prefill 从“16×88ms 串行”降到整波 **279ms(INT4)/370ms(BF16)**。
-3. **prefill device MoE（小批量）**：每专家 token 少时（≤2）复用解码的 masked
-   专家内核，避免逐专家小 GEMM 的发射开销。
+   `O(B·L)` 降到 `O(L)`。
+2. **ragged 多请求 prefill**：一步内新请求打包成一次 `forward_ragged`，K/V 用
+   `rswa_write_prefill_ragged` 散写到各自 slot，`rswa_attention_ragged` 逐行 causal；
+   K/V 按 slot 索引、激活按行索引（`CORE_TECH.md` §5.6）。
+3. **prefill MoE 路径选择**：每专家 token 少时走 masked device MoE，多时走逐专家
+   tensor-core GEMM（`moe_gemm_int4_tc`）。
+4. **bf16 TC GEMM**（`CORE_TECH.md` §5.5）：dense/shared + lm_head 走上 `ldmatrix`/
+   `mma`；行数 1 的 lm_head 走 `matvec_bf16`。
+5. **Batched CUDA Graph**（`CORE_TECH.md` §5.7）：`forward_batch + final rmsnorm`
+   按行数 B 缓存；活跃 slot 变化靠设备端映射免重捕获。
+6. **INT4 专家 GEMM 调优**（§2.5）：BN 模板 + staging 重写。
 
-正确性：新增单测把 ragged 多请求 prefill 的 logits 与逐请求 `prefill_tokens` 对比
-（rel_l2 = 0）；`Engine batch` / slot 复用 / 非恒等 slot 排列 / `GpuDecoder prefill` /
-`Engine CUDA greedy` 全部通过。
+当前结果（`--no-graph` 对照差异在 ±3% 噪声内）：
 
-剩余瓶颈：`matmul_t_bf16` 曾是 CUDA-core tiled GEMM（~2 TFLOPS，未用 TC）；
-lm_head 小 m 下 TC 利用率偏低。
-
-### 2.7 连续批处理：bf16 TC GEMM + Batched CUDA Graph
-（`bench/bench_batch_real_*_{graph,plain}.txt`）
-
-本轮两项改动叠加：
-
-1. **bf16 tensor-core GEMM**（`CORE_TECH.md` §5.5）：`matmul_t_bf16`（dense/shared
-   投影 + lm_head）走 `ldmatrix`/`mma.m16n8k16`；行数 1 的 lm_head 走 `matvec_bf16`。
-2. **Batched CUDA Graph**（`CORE_TECH.md` §5.7）：`forward_batch + final rmsnorm`
-   按行数 B 缓存 Graph；活跃 slot 变化靠设备端映射免重捕获。基准先跑一次不计时的
-   `generate_batch` 做 warmup（捕获 Graph 并复用分配），表中的数字是**稳态**，
-   不含一次性捕获开销。`--no-graph` 关闭 Graph 做对照。
-
-prompt=64、steps=16、max_batch=16，`graph=on` + warmup 稳态；tok/s 含整波 prefill，
-括号内为 `decode_ms` 减去 prefill 墙钟得到的纯 decode 吞吐。同命令加 `--no-graph`
-的对照差异在 run-to-run 噪声（±3%）内（`bench_batch_real_*_plain.txt`）。
-
-| batch | BF16 graph (tok/s) | INT4 graph (tok/s) |
+| batch | BF16 tok/s | INT4 tok/s |
 |---|---|---|
 | 1 | 149.4 (213) | 130.9 (220) |
 | 2 | 122.3 (155) | 107.3 (154) |
@@ -165,23 +134,20 @@ prompt=64、steps=16、max_batch=16，`graph=on` + warmup 稳态；tok/s 含整�
 | 8 | 272.3 (423) | 275.1 (398) |
 | 16 | **415.9 (634)** | **386.8 (559)** |
 
-**与上一轮（无 TC、无 batched graph）对比**（同样命令、warmup 稳态）：
+累计提升（同一命令、warmup 稳态）：
 
-| 配置 | 上一轮 | 现在 | 备注 |
-|---|---|---|---|
-| BF16 batch=16 整波 prefill | 367 ms | **212 ms** | bf16 TC GEMM −42% |
-| BF16 batch=16 tok/s | 298.0 | **415.9** | +40% |
-| INT4 batch=16 整波 prefill | 279 ms | **204 ms** | bf16 TC + INT4 专家 GEMM staging −27% |
-| INT4 batch=16 tok/s | 307.6 | **386.8** | +26% |
-| BF16 batch=1 tok/s | 99.4 | **149.4** | TC + matvec lm_head +50% |
-| INT4 batch=1 tok/s | 91.4 | **130.9** | +43% |
+| 配置 | 起始值 | 现在 |
+|---|---|---|
+| BF16 batch=16 tok/s | 73.5 | **415.9** |
+| INT4 batch=16 tok/s | 117.6 | **386.8** |
+| 整波 prefill（16 请求） | 16 × 88 ms 串行 | **212 ms** BF16 / **204 ms** INT4 |
+| BF16 / INT4 batch=1 tok/s | 99.4 / 91.4 | 149.4 / 130.9 |
 
-结论：
+要点：
 
-- **TC GEMM 是主要收益**（prefill 与 decode 的 dense/shared/投影 + lm_head 全线提速）。
-- **Graph 本身收益仍在噪声内**（±3%）：负载已接近带宽/占用受限，host 发射不是
-  瓶颈；其价值是每步 host 侧只剩 1 次 graph launch + 1 次 lm_head launch。正确性
-  上 graph vs plain 逐位一致（单测 rel_l2=0）。
+- 收益主要来自 **TC GEMM**（prefill 与 decode 的 dense/shared/投影 + lm_head 全线提速）
+  与 **INT4 专家 GEMM 调优**；**Graph 本身在带宽受限负载下收益在噪声内**，价值是每步
+  host 侧只剩 1 次 graph launch + 1 次 lm_head launch（正确性 graph vs plain 逐位一致）。
 - 复现：
   ```bash
   ./build-cuda/benchmarks/bench_cuda_batch --real      --prompt 64 --steps 16 --max-batch 16
@@ -190,7 +156,7 @@ prompt=64、steps=16、max_batch=16，`graph=on` + warmup 稳态；tok/s 含整�
   ./build-cuda/benchmarks/bench_cuda_batch --real --int4 --no-graph --prompt 64 --steps 16 --max-batch 16
   ```
 
-### 2.8 bf16 tensor-core GEMM 微基准（`bench/bench_bf16_gemm_*.txt`）
+## 2.7 bf16 tensor-core GEMM 微基准（`bench/bench_bf16_gemm_*.txt`）
 
 `bench_bf16_gemm` 对比 `matmul_t_bf16_ref`（CUDA-core tiled）与 `matmul_t_bf16`
 （TC），iters=300/20（`2*m*n*k` 计 FLOP）：
@@ -224,7 +190,7 @@ m=8/16 从 ~36µs 降到 ~30µs（+20%）。lm_head 只在 2–8 TFLOPS——大
 每 k-step 两次 `__syncthreads` 限制了流水，是后续调优点（split-K、更大 BN、
 `cp.async` 双缓冲）。
 
-### 2.9 nsys kernel 分解（`bench/bench_nsys_batch_int4.txt`）
+## 2.8 nsys kernel 分解（`bench/bench_nsys_batch_int4.txt`）
 
 命令（INT4，`steps=4` 以缩小 trace；包含 B=1..16 与 warmup，故是 prefill+decode 的
 混合统计）：
@@ -255,36 +221,21 @@ CUDA Graph 确实把逐步发射压到常数级。
 - **prefill 的逐专家 `moe_gemm_int4_tc` 是最大头**：12096 次小 GEMM（avg 55µs）。
   每个 prefill 波对 11 层 × 64 专家 × {gate,up,down} 各发一次，M≈tokens/expert。
   **已做**：staging 重写 + bn=8 使 kernel 快 ~20%，整波 prefill 227→204ms
-  （§2.5/§2.7）。**剩余**：发射次数仍需 grouped GEMM（一层一次 launch，block 映射
+  （§2.5/§2.6）。**剩余**：发射次数仍需 grouped GEMM（一层一次 launch，block 映射
   到 (expert,n-tile)）或合并 gate/up 来消除。
 - decode 的 masked INT4 专家（gate_up+down 18.9%）是第二块；其权重读取受带宽限制，
   但每专家仅 1–2 token 时也偏延迟受限，可考虑小批量 grouped GEMM。
 - `rswa_attn_ragged` 7%：prefill attention 的 grid=(total,heads)，total 大时较可观。
 
 
-## 3. 数值对齐
+## 3. 回归快照
 
-### 3.1 端到端 OCR（`bench/compare_ocr.txt`）
+数值对齐的方法、逐项结果与根因分析统一记录在 **`ALIGNMENT.md`**（端到端 OCR
+greedy 24/24、视觉对 f32 参考 rel_l2 ≤ 5.8e-4、逐层 attention q/k/v/o、R-SWA
+环形覆写、decoder logits 等）；原始输出在 `bench/compare_*.txt`。此处只保留
+CUDA 单元测试一览。
 
-500×400 图，prompt `<image>\nFree OCR.`，crop_mode，decode 24，ngram 35/1024：
-
-```
-summary: layout=OK visual_rel_l2=0.04187 greedy=24/24
-```
-
-### 3.2 Decoder + attention 逐层（`bench/compare_reference.txt`）
-
-| 项 | 结果 |
-|---|---|
-| prefill attention q/k/v/o worst rel_l2 | 0.0245 / 0.0233 / 0.0437 / 0.0567 |
-| prefill 逐层 q rel_l2 (layer0→11) | 0.0018 → 0.0245（随深度累积） |
-| prefill logits | rel_l2 0.00896 |
-| prefill router | 176 token，13 个集合翻转 |
-| decode logits | rel_l2 ≤ 0.021 |
-
-结论：除路由外残差为 bf16 激活累积漂移，非实现 bug；最终 logits <1%，greedy 一致。
-
-### 3.3 CUDA 单元测试（`ctest --test-dir build-cuda`）
+CUDA 单元测试（`ctest --test-dir build-cuda` 的 `uocr_cuda_tests`）：
 
 | 测试 | 结果 |
 |---|---|

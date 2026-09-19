@@ -1,6 +1,7 @@
 # Unlimited-OCR 高性能推理引擎 — 项目文档
 
 > 本文件是**原始需求（只读参考）**。开发入口见 `tAgent.md`，文档导航见 `README.md`。
+> 文中 §7.2 的实测值如有出入，**以 `BENCHMARKS.md` 为准**。
 
 **项目定位**：面向百度 Unlimited-OCR 模型的 C++17/CUDA 原生推理引擎，从零实现 R-SWA 注意力、MoE INT4 解码与连续批处理调度，不依赖 Python 运行时。
 **目标硬件**：NVIDIA RTX 5060 Ti 16GB（Blackwell GB206, sm_120, 4608 CUDA Cores, 448 GB/s 带宽）
@@ -201,7 +202,7 @@ RTX 5060 Ti 的 448 GB/s 带宽意味着**每个 byte 都珍贵**。内核设计
 | | TPOT P50（decode 稳定态, batch=1） | **INT4 full graph 5.43 ms**（BF16 5.45 ms） |
 | | 解码第 40 页 vs 第 1 页 TPOT 比 | ≈1.0（R-SWA 常数缓存；`--steps 140` 验证 ring 覆写） |
 | **吞吐** | batch=8 输出 token 吞吐 | INT4 275 tok/s / BF16 272 tok/s（prompt64，ragged prefill + TC GEMM） |
-| | batch=16 输出 token 吞吐 | INT4 387 tok/s / BF16 416 tok/s（同上；见 `BENCHMARKS.md` §2.7） |
+| | batch=16 输出 token 吞吐 | INT4 387 tok/s / BF16 416 tok/s（同上；见 `BENCHMARKS.md` §2.6） |
 | | GPU SM 利用率（decode 阶段） | 未测（已安装 ncu/nsys） |
 | **显存** | batch=8 峰值显存（INT4） | 2456 MB（权重常驻，含 lm_head bf16） |
 | | batch=16 峰值显存（INT4） | 2656 MB |

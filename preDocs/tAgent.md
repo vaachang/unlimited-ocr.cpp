@@ -32,7 +32,7 @@
   | 整波 prefill（16 请求） | **212 ms** BF16 / **204 ms** INT4 |
   | batch=1 吞吐 | 149.4 BF16 / 130.9 INT4 tok/s |
 
-- 性能数据明细见 `BENCHMARKS.md` §2.5–2.9；历史进度见 `PROGRESS.md` §7。
+- 性能数据明细见 `BENCHMARKS.md` §2.5–2.8；历史进度见 `PROGRESS.md` §4。
 
 **快速验证**：
 
@@ -60,7 +60,7 @@ ctest --test-dir build-cuda --output-on-failure
 - **验收**：`bench_bf16_gemm` / `bench_int4_gemm` 峰值 TFLOPS 显著提升；真实模型
   prefill 与 tok/s 改善；所有 TC 单测 rel_l2 不退化。
 - **涉及**：`src/kernels/cuda/backend.cu`、`src/kernels/cuda/moe_gemm_int4.cu`；
-  先看 `CORE_TECH.md` §5.3/§5.5、`BENCHMARKS.md` §2.5/§2.8。
+  先看 `CORE_TECH.md` §5.3/§5.5、`BENCHMARKS.md` §2.5/§2.7。
 
 ### 2.2 Grouped expert GEMM（与 2.1 合并做收益最大）
 
@@ -115,7 +115,7 @@ ctest --test-dir build-cuda --output-on-failure
 ### 2.8 性能记录补全
 
 - **方案**：用 ncu 采 SM/DRAM 峰值利用率（nsys kernel 分解已完成，见
-  `BENCHMARKS.md` §2.9）；KV Cache 碎片率；纯 decode 的 TTFT/TPOT 分解。
+  `BENCHMARKS.md` §2.8）；KV Cache 碎片率；纯 decode 的 TTFT/TPOT 分解。
 
 ### 2.9 权重加载优化（prj.md 6.1）
 
@@ -144,16 +144,17 @@ ctest --test-dir build-cuda --output-on-failure
 
 ## 4. 已完成里程碑（简表）
 
-明细（每一步的做法、命令、测试值）见 `PROGRESS.md` §8；实现细节见 `CORE_TECH.md`。
+> 结果为该阶段完成时的快照（非当前最优）；**当前性能与回归见 §1**。
+> 历程见 `PROGRESS.md` §4，实现细节见 `CORE_TECH.md`。
 
-| 阶段 | 内容 | 结果 |
+| 阶段 | 内容 | 结果（阶段快照） |
 |---|---|---|
 | M1 调研 | 读参考 modeling，确定 R-SWA 精确语义 | `CORE_TECH.md` §1 |
 | M2 骨架 | CMake 双后端、Tensor/ops、config、safetensors | 可编译 |
 | M3 调度 | ring KV cache、block manager（引用计数）、memory pool、连续批处理 | `CORE_TECH.md` §1/§4 |
 | M4 引擎 | MoEDecoder、DeepEncoder、Sampler、Engine | `CORE_TECH.md` §2 |
 | M5 CUDA | R-SWA attn / INT4 GEMM / rmsnorm / rope 内核 + 对照测试 | `CORE_TECH.md` §5 |
-| M6 验证 | 真实权重 mmap、量化误差、基准 | `PROGRESS.md` §5 |
+| M6 验证 | 真实权重 mmap、量化误差、基准 | `PROGRESS.md` §5、`BENCHMARKS.md` |
 | P0 E0 | DeepSeek BPE 预分词复刻 | 43/43 |
 | P0 E1 | prompt / `<image>` 布局 | 11/11 |
 | P0 E2 | PIL 兼容图像预处理 | ≤1 LSB |

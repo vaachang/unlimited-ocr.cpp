@@ -9,7 +9,7 @@
 |---|---|---|
 | **`tAgent.md`** | **开发入口**：当前状态速览、下一步任务（含验收口径）、GPU 卸载审计、技术债、环境备注 | **每次开发先读；完成任务后更新** |
 | `prj.md` | 原始项目需求与架构/创新点/指标定义（需求方文档） | 需要对照需求时 |
-| `PROGRESS.md` | 开发历程与完成度、目录结构、构建命令、真实权重数据、历史里程碑明细 | 了解"做过什么/怎么做" |
+| `PROGRESS.md` | 开发历程、完成度清单、目录结构、构建命令、模型与权重数据 | 了解"做过什么/怎么做" |
 | `CORE_TECH.md` | 核心技术实现说明（R-SWA、MoE、量化、CUDA 内核、Graph、连续批处理等） | 改代码前理解实现 |
 | `BENCHMARKS.md` | 所有性能/微基准数据的汇总（原始输出在 `bench/`） | 记录或核对性能 |
 | `ALIGNMENT.md` | 与 PyTorch 参考的数值对齐方法与结果 | 关心正确性/对齐时 |
@@ -47,8 +47,5 @@ cmake -S . -B build-cuda -DENGINE_BACKEND=CUDA -DENGINE_REFERENCE_DIR=/path/to/r
 
 ## 文档维护约定
 
-- **每完成一项任务**：更新 `tAgent.md` 的「当前状态」与「下一步任务」；细节写入
-  `CORE_TECH.md`（实现）/ `PITFALLS.md`（坑）/ `BENCHMARKS.md`（数据）/
-  `ALIGNMENT.md`（对齐）/ `PROGRESS.md`（历史），然后 `git commit` 并 push。
-- 原始基准输出统一放 `bench/`，正文只放汇总表。
-- 不要把"下一步计划"散落到多处，统一以 `tAgent.md` 为准。
+见 `tAgent.md` §7（工作方式）。核心原则：**计划只在 `tAgent.md` 维护一处**；每完成
+一项更新 `tAgent.md` 并沉淀到对应文档；原始基准输出放 `bench/`；然后 commit + push。
