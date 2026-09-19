@@ -70,6 +70,7 @@ add_library(uocr_core
     src/runtime/log.cpp
     src/runtime/safetensors.cpp
     src/runtime/tokenizer.cpp
+    src/runtime/prompt.cpp
     src/runtime/quant.cpp
     src/runtime/weights.cpp
     src/scheduler/kv_cache.cpp
