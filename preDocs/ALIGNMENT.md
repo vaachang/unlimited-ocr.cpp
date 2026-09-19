@@ -1,5 +1,7 @@
 # 与 PyTorch 参考实现的数值对齐
 
+> 开发入口见 `tAgent.md`；文档导航见 `README.md`。
+
 本文件记录 `tools/reference/export_reference.py` 导出的参考激活与 C++ 引擎
 （`tools/compare_reference.cpp`、`tools/compare_vision.cpp`）的对比结果。
 

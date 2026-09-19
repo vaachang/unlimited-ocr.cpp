@@ -1,274 +1,206 @@
-按照preDocs/prj.md中的内容实现这个项目。
-实现这个项目的过程中，有不明白、不清楚的地方问我。需要安装第三方依赖时请让我做决定，不要擅自安装。
-保留中间进度文档、重要性能测试结果、踩过的坑、核心技术实现等内容，放在preDocs目录下。
-使用g++作为C++编译器。
-记得使用git保存项目。
+# Unlimited-OCR 引擎 — 开发入口（tAgent）
+
+> **下次继续开发请从本文件开始。** 顶部是当前状态与下一步任务；历史明细、实现细节、
+> 数据、踩坑分别在 `PROGRESS.md` / `CORE_TECH.md` / `BENCHMARKS.md` / `PITFALLS.md` /
+> `ALIGNMENT.md`。文档导航见 `README.md`；原始需求见 `prj.md`。
+
+## 0. 项目要求（原始任务）
+
+1. 按 `prj.md` 实现项目。
+2. 有不明白/不清楚的地方先问；安装第三方依赖需先征得同意，不要擅自安装。
+3. 中间进度文档、重要性能测试结果、踩过的坑、核心技术实现保留在 `preDocs/`。
+4. 使用 g++ 作为 C++ 编译器。
+5. 用 git 保存项目。
 
 ---
 
-## 下一阶段任务计划（2026-09-19 四次更新）
+## 1. 当前状态（2026-09-19 快照）
 
-进度与结果见 `PROGRESS.md`、`ALIGNMENT.md`、`PITFALLS.md`、`CORE_TECH.md`、
-`BENCHMARKS.md`（含 `bench/` 原始输出）。
+- **后端**：CPU 参考（OpenMP）+ CUDA 生产（sm_120），`-DENGINE_BACKEND=CPU|CUDA` 双构建。
+- **完成度**：M1–M6、P0（端到端 OCR 对齐 E0–E5）、P1（R-SWA 环形覆写 / CUDA 设备端
+  decoder）、P2（TC INT4 GEMM、CUDA Graph、device INT4 权重、连续批处理、batched graph、
+  bf16 TC GEMM、INT4 专家 GEMM 调优）均已完成。**约 85–90%**（对照 `prj.md`）。
+- **回归**：`compare_ocr` greedy **24/24**（CPU 参考路径）；`uocr_tests` **20/20**；
+  `uocr_cuda_tests` **全过**（batched 排列 / ragged prefill / slot 复用 / batched graph /
+  TC vs ref）。
+- **性能**（真实 `baidu/Unlimited-OCR`，prompt=64, steps=16, max_batch=16, warmup 稳态）：
 
-**已完成里程碑**：M1 调研 → M2 骨架 → M3 调度 → M4 引擎 → M5 CUDA 内核
-→ M6 视觉对齐 → P0 端到端 OCR 对齐（E0–E5）→ P1 R-SWA 环形覆写验证
-→ P1 CUDA 设备端 decoder + Engine CUDA 分支 → P2 Tensor Core W4A16 GEMM
-→ P2 CUDA Graph（device router + 固定调度掩码跳过）→ P2 device INT4 专家权重
-→ P2 合并访存内核与分块 prefill GEMM → P1 attention 逐层残差定位
-→ P2 TC `ldmatrix`/shared-memory staging → 连续批处理接入 device decoder
-→ batched R-SWA attention/append 内核 → ragged 多请求 prefill → slot 映射 bug 修复
-→ **batched decode 纳入 CUDA Graph** → **bf16 tensor-core GEMM（dense/shared + lm_head）**
-→ **bf16 小 m 变体** → **INT4 专家 GEMM bn 调优 / staging 重写**。
+  | 指标 | 值 |
+  |---|---|
+  | BF16 batch=16 吞吐 | **415.9 tok/s** |
+  | INT4 batch=16 吞吐 | **386.8 tok/s**（显存 2.2GB） |
+  | 整波 prefill（16 请求） | **212 ms** BF16 / **204 ms** INT4 |
+  | batch=1 吞吐 | 149.4 BF16 / 130.9 INT4 tok/s |
 
-最终回归：`compare_ocr` greedy **24/24**（CPU 参考路径）；`uocr_cuda_tests` 全过
-（含 batched 排列 / ragged prefill / slot 复用 / batched graph / TC vs ref）；
-`uocr_tests` 20/20。
+- 性能数据明细见 `BENCHMARKS.md` §2.5–2.9；历史进度见 `PROGRESS.md` §7。
 
-**连续批处理性能（真实模型，prompt=64，steps=16，max_batch=16，warmup 稳态）**：
+**快速验证**：
 
-| 配置 | 起始值 | 现在 |
-|---|---|---|
-| BF16 tok/s（batch=16） | 73.5 | **415.9** |
-| INT4 tok/s（batch=16） | 117.6 | **386.8** |
-| 整波 prefill（16 请求） | 16 × 88 ms 串行 | **204 ms** INT4 / **212 ms** BF16 |
-| BF16 / INT4 batch=1 tok/s | 99.4 / 91.4 | 149.4 / 130.9 |
+```bash
+cmake -S . -B build-cuda -DENGINE_BACKEND=CUDA -DCMAKE_BUILD_TYPE=Release
+cmake --build build-cuda -j8
+ctest --test-dir build-cuda --output-on-failure
+./build-cuda/benchmarks/bench_cuda_batch --real --int4 --prompt 64 --steps 16 --max-batch 16
+```
 
-> 累计改动：① batched attention（O(B·L)→O(L)）；② ragged prefill；③ 按专家规模选
-> masked matvec / TC GEMM；④ batched decode CUDA Graph；⑤ bf16 TC GEMM（dense/shared
-> + lm_head，含小 m 变体）；⑥ INT4 专家 GEMM bn 调优 + staging 重写。
-> 详见 `BENCHMARKS.md` §2.5–2.9、`CORE_TECH.md` §5.5–5.7。
+---
 
-**下一步优先级**（按收益/成本排序）：
+## 2. 下一步任务（开发从这里开始）
 
-1. **高性能 TC GEMM 重写**（当前最大剩余项）：现有 TC 内核每个 warp 每 k-step 只发
-   1 个 mma + 2 次 `__syncthreads`，流水太短，实测仅 4–18 TFLOPS（硬件上限 ~80）。
-   做更大 tile（128×128 / 256×128）+ register tiling + `cp.async` 双缓冲 + swizzle。
-   收益覆盖：prefill 专家 GEMM（nsys 占 55% kernel 时间）、bf16 dense/shared、
-   lm_head（大 n 仅 1.5–8 TFLOPS）。可与第 2 项合并做。
-2. **Grouped expert GEMM**：`forward_ragged` 每层逐专家发 3×64 个
-   `moe_gemm_int4_tc`（12096 次/整轮、avg 55µs）。改为“一层一次 launch，block 映射到
-   (expert, m-tile, n-tile)”可去除 ~2000 次小发射；与第 1 项一起做收益最大。
-3. **DeepEncoder CUDA 移植**（GPU 卸载缺口，工作量最大、潜力也大）：视觉编码器
-   （SAM-ViT + CLIP-ViT + projector，~1.5GB FP16）**目前是纯 CPU/OpenMP**，
-   `src/engine/deep_encoder.cpp` 无任何 CUDA；`Engine::image_embeddings` 在 CUDA
-   后端也走它，单图编码约 1–2 分钟。`prj.md` 架构图写的是「DeepEncoder (FP16,
-   CUDA Graph)」，应补齐：把 patch/pos embed、12 层 SAM block、neck、CLIP×24、
-   projector 做成设备内核并常驻 FP16 权重；可复用现有 `rmsnorm`/`matmul_t`/
-   attention 内核。**验收**：`tools/compare_vision` 在 CUDA 后端输出与 CPU/f32
-   参考 rel_l2 ≤ 6e-4，单图编码进入亚秒级。
-4. **大批量 prefill 的 device router**：`GpuDecoder::mlp_block(dev_moe=false)` 分支
-   （ragged 大批量 prefill 走此分支）每层把 router logits D2H + host top-k/分组 +
-   每专家 H2D 索引，形成同步点。把 top-k 下放设备端（复用 `moe_router_topk`），
-   为第 2 项的 grouped GEMM 提供设备端分组表。
-5. **device embedding / position 查表**：当前每步 `host_weights_->embed_tokens.row()`
-   在 host 查表再 H2D（`GpuDecoder` 的 `h_embed_pinned_`）。把 embedding 表常驻设备，
-   用 token id 在设备端 gather，省掉每步小 H2D（batch 越大越明显）。
-6. **Prefill KV 分区写入优化**（prj.md 创新点三）：按位置分区（视觉区/环形区/gap
-   丢弃），省 ~70% prefill KV 写入带宽。**注意**：参考实现并不丢弃 gap
-   （`PITFALLS.md` §1），改动会偏离参考数值，需先确认是否接受。
-7. **精度评测**：OmniDocBench v1.6（AWQ vs BF16 综合分）、AWQ vs 朴素 INT4 消融。
-8. **性能记录补全**：ncu 采 SM/DRAM 峰值利用率（nsys kernel 分解已完成，见
-   `BENCHMARKS.md` §2.9）、KV Cache 碎片率、纯 decode 的 TTFT/TPOT 分解。
-9. **权重加载优化**（prj.md 6.1）：`mmap` + `cudaHostRegister` pinned DMA 直通
-   （nsys 显示权重上传 2.08GB H2D 占 host API 76%）。
+按收益/成本排序。每项给出目标、方案、验收与涉及文件；完成后在本文档勾掉并更新 §1。
 
-> 第 3–5 项是「能上 GPU 但仍在 CPU」的模型部分（见本文档「GPU 卸载现状」小节）；
-> 其余（tokenizer、图像预处理、采样/ngram、调度）留在 CPU 属合理设计。
+### 2.1 高性能 TC GEMM 重写（最大剩余项）
 
-**已知遗留/技术债**：
-- `GpuDecoder::mlp_block` 的 host 路由分支（`dev_moe=false`，ragged 大批量 prefill
-  走此分支）每层做一次 router D2H + host top-k；见优先级 4。
-- **DeepEncoder 仅 CPU 实现**（优先级 3）；`Engine` 的 CUDA 后端在
-  `image_embeddings` 时仍调 CPU 编码器。
-- **embedding 查表在 host**（优先级 5），lm_head 已在设备。
-- `mlp_block_batch` 为未定义的空声明，可删除。
-- `batch_import_prefill` 已无调用者，可删除。
-- 真实 INT4 模型下 CUDA 端 greedy 尚未与参考 OCR 做端到端回归（当前 OCR 对齐
-  走 CPU 参考路径）。
-- release 构建下 `matmul_t_bf16_ref` 仅用于单测 A/B，保留。
+- **问题**：现有 TC 内核每个 warp 每 k-step 只发 1 个 mma + 2 次 `__syncthreads`，
+  流水太短，实测仅 4–18 TFLOPS（硬件上限 ~80）。nsys 显示 prefill 逐专家
+  `moe_gemm_int4_tc` 占 **55%** kernel 时间。
+- **方案**：更大 tile（128×128 / 256×128）+ register tiling + `cp.async` 双缓冲 +
+  shared-memory swizzle；先做 bf16 版（`matmul_t_bf16`），再套到 INT4 专家 GEMM。
+- **收益面**：prefill 专家 GEMM、bf16 dense/shared、lm_head（大 n 仅 1.5–8 TFLOPS）。
+- **验收**：`bench_bf16_gemm` / `bench_int4_gemm` 峰值 TFLOPS 显著提升；真实模型
+  prefill 与 tok/s 改善；所有 TC 单测 rel_l2 不退化。
+- **涉及**：`src/kernels/cuda/backend.cu`、`src/kernels/cuda/moe_gemm_int4.cu`；
+  先看 `CORE_TECH.md` §5.3/§5.5、`BENCHMARKS.md` §2.5/§2.8。
 
-### GPU 卸载现状（2026-09-19 审计）
+### 2.2 Grouped expert GEMM（与 2.1 合并做收益最大）
+
+- **问题**：`forward_ragged` 每层逐专家发 3×64 个 `moe_gemm_int4_tc`
+  （整轮 12096 次、avg 55µs），发射与低占用开销大。
+- **方案**：一层一次 launch，block 映射到 `(expert, m-tile, n-tile)`；设备端维护
+  每专家 token 分组表（依赖 2.4）。
+- **验收**：prefill 的 `moe_gemm_int4_tc` kernel 数量大幅下降，整波 prefill 下降；
+  logits 与逐专家路径一致。
+- **涉及**：`src/kernels/cuda/moe_gemm_int4.cu`、`src/engine/gpu_decoder.cu`
+  （`mlp_block` / `forward_ragged`）。
+
+### 2.3 DeepEncoder CUDA 移植（GPU 卸载缺口，工作量最大）
+
+- **问题**：视觉编码器（SAM-ViT + CLIP-ViT + projector，~1.5GB FP16）**纯 CPU/OpenMP**，
+  `src/engine/deep_encoder.cpp` 无任何 CUDA；`Engine::image_embeddings` 在 CUDA 后端也
+  调它，单图编码约 1–2 分钟。`prj.md` 架构图写的是「DeepEncoder (FP16, CUDA Graph)」。
+- **方案**：patch/pos embed、12 层 SAM block、neck、CLIP×24、projector 做成设备内核，
+  FP16 权重常驻；可复用现有 `rmsnorm`/`matmul_t`/attention 内核。
+- **验收**：`tools/compare_vision` 在 CUDA 后端输出与 CPU/f32 参考 rel_l2 ≤ 6e-4；
+  单图编码进入亚秒级。
+- **涉及**：新增 `src/engine/deep_encoder.cu` / `GpuEncoder`，改造 `DeepEncoder` 接口
+  以支持后端分派；参考 `CORE_TECH.md` §5.1、`PITFALLS.md` §4/§9、`ALIGNMENT.md` §4。
+
+### 2.4 大批量 prefill 的 device router
+
+- **问题**：`GpuDecoder::mlp_block(dev_moe=false)` 分支（ragged 大批量 prefill 走此分支）
+  每层 router logits D2H + host top-k/分组 + 每专家 H2D 索引，形成同步点。
+- **方案**：把 top-k 下放设备端（复用 `moe_router_topk`），输出设备端分组表，供 2.2。
+- **验收**：ragged prefill 每层无 D2H 同步；logits 与 host 路由一致。
+- **涉及**：`src/engine/gpu_decoder.cu`（`mlp_block`）、`src/kernels/cuda/moe_device.cu`。
+
+### 2.5 device embedding / position 查表
+
+- **问题**：每步 `host_weights_->embed_tokens.row()` 在 host 查表再 H2D
+  （`h_embed_pinned_`）。
+- **方案**：embedding 表常驻设备，token id 在设备端 gather；position 同理。
+- **验收**：每步无 embedding H2D；batch 越大收益越明显；greedy token 不变。
+- **涉及**：`src/engine/gpu_decoder.cu`（`decode_token`/`batch_decode`/`run_graph_decode`）。
+
+### 2.6 Prefill KV 分区写入优化（prj.md 创新点三）
+
+- **方案**：prefill 时按位置分区（视觉区/环形区/gap 丢弃），省 ~70% KV 写入带宽。
+- **注意**：参考实现并不丢弃 gap（`PITFALLS.md` §1），改动会偏离参考数值，**先确认是否接受**。
+- **涉及**：`src/kernels/cuda/rswa_attention.cu`（写出逻辑）、`GpuRSWACache`。
+
+### 2.7 精度评测
+
+- **方案**：接入 OmniDocBench v1.6（AWQ vs BF16 综合分）、AWQ vs 朴素 INT4 消融。
+- **注意**：需下载外部工具链/数据，**先询问确认**。
+
+### 2.8 性能记录补全
+
+- **方案**：用 ncu 采 SM/DRAM 峰值利用率（nsys kernel 分解已完成，见
+  `BENCHMARKS.md` §2.9）；KV Cache 碎片率；纯 decode 的 TTFT/TPOT 分解。
+
+### 2.9 权重加载优化（prj.md 6.1）
+
+- **方案**：`mmap` + `cudaHostRegister` pinned DMA 直通（nsys 显示权重上传 2.08GB H2D
+  占 host API 76%）。
+
+> 2.3–2.5 是「能上 GPU 但仍在 CPU」的模型部分（见 §3）；tokenizer、图像预处理、
+> 采样/ngram、调度留 CPU 属设计选择。
+
+---
+
+## 3. GPU 卸载现状（2026-09-19 审计）
 
 | 模型/计算部分 | 执行位置 | 备注 |
 |---|---|---|
 | 文本解码器（12 层 MoE：RMSNorm/QKV/O/RoPE/R-SWA/dense/shared/专家） | **GPU** | `GpuDecoder`，权重常驻 |
 | lm_head | **GPU** | 设备副本 + `matvec`/`matmul_t_bf16` |
 | MoE router / top-k（decode、小批量 prefill） | **GPU** | `moe_router_topk` |
-| MoE router / top-k（ragged 大批量 prefill） | **CPU** | 每层 router D2H + host top-k（优先级 4） |
-| token embedding 查表 | **CPU** | host gather + 每步 H2D（优先级 5） |
-| **DeepEncoder 视觉编码器（SAM+CLIP+projector, ~1.5GB）** | **CPU / OpenMP** | **无 CUDA 实现**（优先级 3） |
+| MoE router / top-k（ragged 大批量 prefill） | **CPU** | 每层 router D2H + host top-k（任务 2.4） |
+| token embedding 查表 | **CPU** | host gather + 每步 H2D（任务 2.5） |
+| **DeepEncoder 视觉编码器（SAM+CLIP+projector, ~1.5GB）** | **CPU / OpenMP** | **无 CUDA 实现**（任务 2.3） |
 | 采样 / no-repeat-ngram | CPU | 每步 D2H logits 后采样，属设计选择 |
 | tokenizer / 图像预处理 / 调度 | CPU | 设计如此 |
 
+---
 
-### P0 视觉编码器数值对齐（已完成 2026-09-15）
-- [x] 跑完 `tools/compare_vision.cpp`。`DeepEncoder::encode` 输出 273×1280 与
-      参考 `visual_embeddings`：对 f32 参考 rel-L2 ≤ 5.8e-4，对 bf16 参考 3.2%。
-- [x] 分段对比：已加 `DeepEncoder::encode_stages` + `--dump-stages` +
-      `tools/reference/export_vision_stages.py`，定位并修复了 SAM 相对位置漏乘
-      query、CLIP 漏加 QKV bias 两个 bug。CPU 侧启用 OpenMP（8 线程约 2 分钟）。
-      详见 `ALIGNMENT.md` §4、`PITFALLS.md` §9。
+## 4. 已完成里程碑（简表）
 
-### P0 端到端图像 OCR 对齐（已完成 2026-09-19）
-目标：C++ `Engine` 输入单张真实页面图 + 文本 prompt，输出与参考
-`UnlimitedOCRForCausalLM.infer()` 一致的 token 序列；先对齐首 token logits，
-再逐步覆盖 greedy。**E0–E5 全部完成，端到端 greedy 24/24 与参考一致。**
+明细（每一步的做法、命令、测试值）见 `PROGRESS.md` §8；实现细节见 `CORE_TECH.md`。
 
-1. [x] **DeepSeek BPE 预分词对齐**（E0）
-   - `src/runtime/tokenizer.cpp` 已改为复刻 `tokenizer.json` 的 3 条 `Split`
-     正则（`\p{N}{1,3}`、CJK、主标点/单词正则），Unicode 类别表由
-     `tools/gen_unicode_tables.py` 生成到 `include/uocr/unicode_tables.h`。
-   - 回归：`tools/compare_tokenizer` + `tools/reference/export_tokenizer_cases.py`
-     在 43 个用例上 pretok/ids **43/43**；单测 `tokenizer_deepseek_pretokenizer`。
-2. [x] **prompt 与 `<image>` 布局**（E1）
-   - `include/uocr/prompt.h` + `src/runtime/prompt.cpp` 的 `build_ocr_prompt`。
-   - `tools/compare_layout` + `tools/reference/export_layout_cases.py`：
-     11 个用例 ids/mask **11/11**（含 crop `[1,1]/[2,1]/[1,2]/[2,2]/[3,2]`）。
-3. [x] **图像预处理**（E2）
-   - `include/uocr/image.h` + `src/runtime/image.cpp`：PIL 兼容 bicubic、
-     `ImageOps.pad`（含 Python round-half-even 中心对齐）、`dynamic_preprocess`、
-     `BasicImageTransform`。
-   - `tools/compare_image` + `tools/reference/export_image_cases.py`：
-     与 Pillow 逐像素 ≤1 LSB，crop ratio 全对。
-4. [x] **Engine 注入视觉 embedding**（E3）
-   - `MoEDecoder::prefill_embeds`、`Engine::generate_from_image`、
-     `Engine::image_embeddings`（含 `<= image_size` 时 crop_ratio=[1,1] 规则）。
-5. [x] **端到端参考导出与对比**（E4）
-   - `export_reference.py --mode ocr` 导出 `input_ids`/`images_seq_mask`/
-     `image_global`/`visual_scattered`/`prefill_logits`/greedy；
-     `tools/compare_ocr` 逐项对比。500×400 图：visual rel_l2 4.2%、
-     prefill logits rel_l2 6.4% 且 top-1 一致、greedy 24/24。
-6. [x] **采样与输出文本**（E5）
-   - 按参考/SGLang 语义修正 `Sampler::apply_no_repeat_ngram`
-     （匹配 `ngram-1` 前缀 + 滑动窗口），单测 `test_sampler`；
-     24 步 greedy 在 `no_repeat_ngram_size=35, ngram_window=1024` 下 **24/24**。
+| 阶段 | 内容 | 结果 |
+|---|---|---|
+| M1 调研 | 读参考 modeling，确定 R-SWA 精确语义 | `CORE_TECH.md` §1 |
+| M2 骨架 | CMake 双后端、Tensor/ops、config、safetensors | 可编译 |
+| M3 调度 | ring KV cache、block manager（引用计数）、memory pool、连续批处理 | `CORE_TECH.md` §1/§4 |
+| M4 引擎 | MoEDecoder、DeepEncoder、Sampler、Engine | `CORE_TECH.md` §2 |
+| M5 CUDA | R-SWA attn / INT4 GEMM / rmsnorm / rope 内核 + 对照测试 | `CORE_TECH.md` §5 |
+| M6 验证 | 真实权重 mmap、量化误差、基准 | `PROGRESS.md` §5 |
+| P0 E0 | DeepSeek BPE 预分词复刻 | 43/43 |
+| P0 E1 | prompt / `<image>` 布局 | 11/11 |
+| P0 E2 | PIL 兼容图像预处理 | ≤1 LSB |
+| P0 E3–E4 | 视觉注入 + 首 token logits | visual 4.2%、logits 6.4%、top-1 一致 |
+| P0 E5 | `no_repeat_ngram` 采样 | greedy **24/24** |
+| P0 Vision | DeepEncoder 分段对齐 | f32 rel_l2 ≤ 5.8e-4；修 2 个 bug |
+| P1 路由/attention | bf16 舍入尝试、逐层 q/k/v/o 对比 | 确认 bf16 漂移非 bug |
+| P1 R-SWA ring | `--decode-steps 140` 覆盖环形覆写 | final K/V ≤0.03 |
+| P1 CUDA 主路径 | device KV + `GpuDecoder` + Engine CUDA 分支 | 显存 9.2GB → 2.2GB |
+| P2 CUDA Graph | device router + 固定调度掩码 + 单请求整步图 | TPOT 26.7 → 5.4 ms |
+| P2 TC INT4 GEMM | W4A16 `ldmatrix` 路径 | rel_l2 0.0024 |
+| P2 连续批处理 | batched attention + ragged prefill + slot 修复 | 298/311 tok/s |
+| P2 batched graph | 按行数 B 缓存图，活跃集合变化免重捕获 | graph vs plain rel_l2 = 0 |
+| P2 bf16 TC GEMM | dense/shared + lm_head + 小 m 变体 | BF16 batch16 → 415.9 tok/s |
+| P2 INT4 专家调优 | BN 模板 + staging 重写 | 整波 prefill −10% |
 
-### P1 降低路由翻转（提升对齐精度）
-- [x] 在 MoE gate 前把激活按 bf16 舍入，复刻参考数值。（2026-09-19 尝试：
-      `MoEDecoder::set_bf16_rounding`，默认关闭；实测 set_mismatch 仍为 13，
-      **未能降低翻转**。翻转来自 attention/expert 的 f32-vs-bf16 累积漂移，
-      需要整链路 bf16 才可能对齐，暂缓。）
-- [x] 逐层对比 attention 的 q/k/v、O 投影输出（2026-09-19）：`export_reference.py`
-      增加 q/k/v/o hook，`MoEDecoder::set_trace_attn` + `compare_reference` 输出逐层
-      rel_l2，q/k/v/o 分别 ≤0.024/0.023/0.044/0.057。误差随层数累积，确认除路由外
-      的残差是 **bf16 激活累积漂移**（非 bug），详见 `ALIGNMENT.md` §7。
-- [x] 增加 `--decode-steps 140`，覆盖 ring 真正发生覆写的阶段，验证 R-SWA
-      环形覆写路径与参考一致。（已验证：ring 完成后 final K/V rel_l2
-      ≤ 0.03，decode logits rel_l2 ≤ 0.084。见 `ALIGNMENT.md` §6。）
+---
 
-### P1 CUDA 主路径接入（prj.md 要求 CUDA 生产构建）
-- [x] device KV cache + CUDA attention 调度（2026-09-19）：新增
-      `GpuRSWACache`（`include/uocr/gpu_cache.h`, `src/kernels/cuda/gpu_cache.cu`）
-      与通用 `cuda::rswa_attention`（causal prefill / decode）。
-      `tests/test_rswa_cuda.cu` 验证：环形覆写 cache K/V 完全一致、
-      decode 与 prefill causal 误差 ≤1e-6。
-- [x] 设备端完整前向（2026-09-19）：`GpuDecoder`
-      （`include/uocr/gpu_decoder.h`, `src/engine/gpu_decoder.cu`）把 RMSNorm、
-      QKV/O 投影、RoPE、R-SWA attention、dense/MoE 全部放到 GPU；MoE 路由
-      在 GPU 算 logits，top-k/按专家分组在 host 调度。
-- [x] 权重常驻 device（当前 bf16，加载时上传一次）；embedding 与 lm_head
-      仍在 host（每步仅取/算一行）。`tests/test_rswa_cuda.cu` 验证
-      `GpuDecoder` vs CPU `MoEDecoder`：prefill rel_l2 0.0019、decode 0.0021。
-- [x] `Engine` 的 CUDA 执行分支：`Engine(..., Backend::CUDA)` 构造 `GpuDecoder`，
-      `generate` / `generate_from_image` 自动走设备路径；测试中 CPU/CUDA
-      greedy token 一致。
-- [x] device 端 INT4 专家权重（2026-09-19）：`upload_expert_table` 上传 AWQ
-      打包权重（连续 `[n_experts,rows,cols]`），`moe_experts_masked_int4` 内核内
-      反量化。真实模型显存 9.2GB → **2.2GB**。
-- [x] resident KV / CUDA Graph（见下）。
+## 5. 已知遗留 / 技术债
 
-> 构建结构调整：CUDA 源文件直接并入 `uocr_core`（`UOCR_ENGINE_LIB` 恒为
-> `uocr_core`），避免 Engine 与 CUDA 静态库的循环依赖；CPU 构建不编译 `.cu`。
+- `GpuDecoder::mlp_block` 的 host 路由分支（ragged 大批量 prefill）每层 router D2H +
+  host top-k；见任务 2.4。
+- **DeepEncoder 仅 CPU 实现**；CUDA 后端 `image_embeddings` 仍调 CPU 编码器；见任务 2.3。
+- **embedding 查表在 host**（lm_head 已在设备）；见任务 2.5。
+- `GpuDecoder::mlp_block_batch` 为未定义的空声明，可删除。
+- `GpuDecoder::batch_import_prefill` 已无调用者，可删除。
+- 真实 INT4 模型下 CUDA 端 greedy 尚未与参考 OCR 做端到端回归（当前 OCR 对齐走
+  CPU 参考路径）。
+- `matmul_t_bf16_ref` 仅用于单测 A/B，release 构建保留。
 
-### P2 CUDA Graph 与创新点落地（已完成 2026-09-19）
-- [x] device 端 router + top-k kernel（`moe_router_topk`），去掉每层 D2H/host top-k。
-- [x] “全 expert 固定调度 + 路由掩码跳过”（`moe_experts_masked[_int4]`），网格静态。
-- [x] 捕获解码稳态：`GpuDecoder` 首次 decode 时捕获，之后 replay；对比见
-      `bench_cuda_decode`（plain 6.8ms → full graph 5.4ms / token，INT4）。
-- [x] 持久化 R-SWA KV 索引：`rswa_append_decode` 设备端推进 `len/ring_pos`，
-      `rswa_attention_devlen` 读设备长度，同一 Graph 覆盖 warmup→ring。
-- [x] `EngineConfig.graph_scope` 支持 `full` / `attn_dense` 两种范围（消融）。
-- [ ] Prefill KV 分区写入优化（当前按参考语义保留全部 prefill KV）。
-- 说明：`matvec_bf16` / expert MLP 改为 warp-per-output 合并访存后，TPOT 从
-  26.7ms 降到 5.4ms；详见 `PITFALLS.md` §11-12。
+---
 
-### P2 Tensor Core INT4 GEMM
-- [x] 补充张量核 W4A16 路径（2026-09-19）：`moe_gemm_int4_tc` 在寄存器内把
-      INT4 权重反量化为 bf16，用 `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`
-      计算，保留标量版 `moe_gemm_int4` 做正确性基线。
-      测试：`[8,64]x[256,256]` rel_l2 0.0024、ragged `M/K` rel_l2 0.0026。
-- [ ] **注意**：`prj.md` 写的 `s4.s4.s32` 要求 A/B 都是 INT4（即 W4A4），与同段的
-      “激活值 BF16 输入”矛盾。经确认采用 W4A16（内核内 INT4→BF16 反量化 +
-      bf16 tensor core），既保留权重带宽收益又保留 BF16 激活精度。
+## 6. 环境与依赖备注
 
-### P2 Tensor Core 性能优化（部分完成 2026-09-19）
-- [x] `moe_gemm_int4_tc` 改用 shared-memory staging + `ldmatrix.x4/x2`：block=4
-      warps 计算 64×BN tile。**bn 调优结论：专家 GEMM 用 bn=8**（n=896/1280 时
-      block 数足够；bn≥16 会让 block 数掉到 SM 数以下）。反量化 staging 改为
-      128 线程按元素循环后，bn=8 下 m=96 50.2µs、m=273 110µs（旧版 ~65/~136µs，
-      **约 +20%**）。微基准 `bench/bench_int4_gemm{,_down}.txt`，`moe_gemm_int4_tc_n`
-      可扫 bn∈{8,16,32,64}。
-- [x] **prefill INT4 专家 GEMM 提速**（2026-09-19）：整波 prefill（B=16）
-      227→204ms（−10%），INT4 batch=16 374→387 tok/s。见 `BENCHMARKS.md` §2.5/§2.7。
-- [ ] 剩余：prefill 每层仍逐专家发 3×64 个 GEMM（nsys 12096 次、占 55% kernel
-      时间）——下一步做 grouped GEMM（一层一次 launch，block 映射到
-      (expert,n-tile)），或合并 gate/up。另 `swizzle`/split-K/`cp.async`。
-- [x] **bf16 tensor-core GEMM**（2026-09-19）：`matmul_t_bf16` 改为 block=4 warps、
-      64(m)×64(n) tile、`ldmatrix.x4/x2` + `mma.m16n8k16.bf16`；m 不足 64 时越界
-      warp 跳过 mma（小 m 不浪费）。保留 `matmul_t_bf16_ref` 做 A/B，单测
-      rel_l2 ≤ 0.0018。微基准 n=k=1280 最高 18.4 TFLOPS（m=273，4.5×）；真实模型
-      BF16 batch=16 298→411 tok/s、整波 prefill 367→216ms。见 `CORE_TECH.md` §5.5、
-      `BENCHMARKS.md` §2.7–2.8。
-- [x] 小 m 变体（2026-09-19）：m ≤ 16 时 4 warp 沿 n 拆分（BM=16/BN=64），
-      n=k=1280 m=16 36.1→30.1µs；真实模型各 batch 再 +2~5%。
-- [ ] 剩余：lm_head（大 n）仍 2–8 TFLOPS，受权重读取/同步限制；`swizzle`、
-      split-K、`cp.async` 双缓冲。
+- GPU：RTX 5060 Ti 16GB（sm_120, 36 SM）；CUDA 13.4；g++ 16.2.1；CMake 4.4.3。
+- 唯一第三方 C++ 依赖：系统 `nlohmann/json`（已安装）；未用 `spdlog`（自研 log）。
+  OpenMP 用于 CPU 内核（视觉编码器）。
+- Python 参考环境在 `.venv`（torch 2.10.0+cu128 / transformers 4.57.1）；
+  安装依赖需经代理 `http://192.168.1.164:7897`。
+- **新增系统依赖或 Python 包前先询问确认。**
 
-### P2 连续批处理（已完成 2026-09-19）
-- [x] `GpuDecoder` per-slot R-SWA KV cache + `attention_block_batch` /
-      `forward_batch` / `batch_decode`。
-- [x] `Engine::generate_batch` 由 `ContinuousBatchScheduler` 驱动：admit/prefill →
-      所有活跃 slot 一起 decode → 完成即释放 slot。
-- [x] 修复 CUDA 下 host `MemoryPool` 按 `max_seq_len×max_batch` 预分配数十 GB 的
-      问题（CUDA 后端改用小 arena）。
-- [x] `bench_cuda_batch`（2026-09-19 三次更新后）：INT4 batch=16
-      **310.7 tok/s / 3048MB**；BF16 **298.0 tok/s / 10044MB**
-      （batched attention + ragged prefill + 按专家规模选 MoE 路径，见 §2.6）。
-      测试 `Engine batch`（4 个不同长度 prompt）batch == sequential == CPU。
-- [x] batched attention kernel（`rswa_append_decode_batch` / `rswa_attention_batch`）。
-- [x] **ragged 多请求 prefill**：`batch_prefill_embeds` + `forward_ragged`，
-      K/V 用 `rswa_write_prefill_ragged` 按 slot 散写，attention 用
-      `rswa_attention_ragged` 逐行 causal；一步内新请求一次前向完成。
-      单测与逐请求 prefill logits rel_l2 = 0。
-- [x] **slot 映射修复**：`batch_decode(tokens, positions, slots, logits)` 显式传入
-      “行→slot”映射（此前按行号当 slot，请求顺序与 slot 顺序不一致时会读错
-      KV）。见 `PITFALLS.md` §13。
-- [x] **待优化**：dense/shared 投影上 tensor core（已于 2026-09-19 完成，见上）。
+---
 
-### P2 Batched CUDA Graph（已完成 2026-09-19）
-- [x] `forward_batch + final rmsnorm` 整步捕获；按行数 B 缓存
-      `batch_graphs_[B-1]`，第一次遇到该 B 时捕获、之后 replay。
-- [x] 活跃 slot 集合 / 行→slot 排列 / position / embedding 每步写入地址固定的
-      `d_batch_slots_/d_pos_/d_xin_`，replay 时读取 → **活跃集合变化无需重捕获**。
-- [x] 失效条件：scratch 扩容、`router_cap_` 扩容、`batch_configure` 重分配；统一
-      `invalidate_batch_graphs()`。`batch_configure` 形状不变时复用分配与图。
-- [x] 测试：batched graph vs plain（非恒等 slot、W=8、14 步含环形覆写）
-      logits rel_l2=0；`Engine batch` 二次调用复用图后 token 不变。
-- [x] 基准：`bench_cuda_batch --no-graph` 对照 + warmup 稳态计时，
-      原始数据 `bench/bench_batch_real_*_{graph,plain}.txt`，汇总见
-      `BENCHMARKS.md` §2.7。带宽受限下收益有限（BF16 batch=16 纯 decode +6.7%）。
+## 7. 工作方式（维护约定）
 
-### P2 分词器与性能记录
-- [x] 分词器对齐已提前到 P0/E0 执行（43/43），此处只保留性能与回归项。
-- [x] 补齐 prj.md §7.2 大部分指标（TTFT/TPOT/吞吐/峰值显存），见 `BENCHMARKS.md`
-      与 `prj.md §7.2`；§7.3 完成 INT4 vs BF16、Graph 范围消融。
-- [x] `compare_reference` / `compare_vision` 等纳入可选 CTest
-      （`-DENGINE_REFERENCE_DIR=...`，默认跳过）。
-- [ ] 仍缺：GPU SM 利用率（已安装 ncu/nsys）、KV Cache 碎片率、AWQ vs 朴素 INT4。
-
-### 环境与依赖备注
-- 仅第三方 C++ 依赖：系统 `nlohmann/json`（已安装）；未用 `spdlog`（自研 log）。
-- Python 参考环境在 `.venv`（torch 2.10.0+cu128 / transformers 4.57.1），
-  安装依赖前需经代理 `http://192.168.1.164:7897`。
-- 若需新增系统依赖或 Python 包，先询问确认后再安装。
+- 每完成一项任务：更新本文件 §1「当前状态」与 §2「下一步任务」；把细节写入
+  `CORE_TECH.md`（实现）/ `PITFALLS.md`（坑）/ `BENCHMARKS.md`（数据，原始输出进
+  `bench/`）/ `ALIGNMENT.md`（对齐）/ `PROGRESS.md`（历史），跑回归后 `git commit` 并 push。
+- 「下一步计划」只以本文件 §2 为准，其他文档不重复维护计划。
+- 改了 CUDA 内核/引擎，务必重跑 `ctest --test-dir build-cuda` 与相关 benchmark。

@@ -1,5 +1,7 @@
 # Unlimited-OCR 高性能推理引擎 — 项目文档
 
+> 本文件是**原始需求（只读参考）**。开发入口见 `tAgent.md`，文档导航见 `README.md`。
+
 **项目定位**：面向百度 Unlimited-OCR 模型的 C++17/CUDA 原生推理引擎，从零实现 R-SWA 注意力、MoE INT4 解码与连续批处理调度，不依赖 Python 运行时。
 **目标硬件**：NVIDIA RTX 5060 Ti 16GB（Blackwell GB206, sm_120, 4608 CUDA Cores, 448 GB/s 带宽）
 **构建系统**：CMake ≥ 3.24 + CUDA ≥ 12.8 + C++17

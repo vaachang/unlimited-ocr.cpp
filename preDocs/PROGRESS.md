@@ -1,6 +1,7 @@
-# Unlimited-OCR 引擎 — 开发进度
+# Unlimited-OCR 引擎 — 开发进度与历程
 
-> 本文件记录实现过程、已完成模块、当前状态与后续计划。对应任务见 `preDocs/tAgent.md`。
+> 本文件记录**已完成的内容与历史**（环境、完成度、目录、构建、实测数据、里程碑明细）。
+> **下一步计划以开发入口 `tAgent.md` 为准**；文档导航见 `README.md`，原始需求见 `prj.md`。
 
 ## 1. 环境
 
@@ -248,22 +249,81 @@ staging 重写、指标表、nsys kernel 分解、可选 reference CTest）。
    （12096 次小 GEMM）；decode masked INT4 专家 ~19%；TC dense ~16%；ragged attention
    7%；graph launch 30 次 vs 普通路径 27584 次 `cudaLaunchKernel`。`BENCHMARKS.md` §2.9。
 
-仍待完成（详见 `tAgent.md` 顶部「下一步优先级」）：
-
-1. **高性能 TC GEMM 重写**（最大剩余项）：更大 tile + register tiling +
-   `cp.async` 双缓冲 + swizzle，目标把 4–18 TFLOPS 拉到数十 TFLOPS。
-2. **Grouped expert GEMM**：一层一次 launch，去掉每波 ~2000 次小 GEMM 发射
-   （可与 1 合并）。
-3. **DeepEncoder CUDA 移植**（GPU 卸载缺口）：视觉编码器目前纯 CPU/OpenMP，
-   单图 1–2 分钟；`prj.md` 原计划是 FP16 CUDA（含 CUDA Graph）。
-4. **大批量 prefill device router**：消除每层 router D2H + host top-k。
-5. **device embedding/position 查表**：省每步小 H2D。
-6. **Prefill KV 分区写入**（prj.md 创新点三；与参考对齐有取舍，需确认）。
-7. **精度评测**：OmniDocBench v1.6（AWQ vs BF16）、AWQ vs 朴素 INT4。
-8. **性能记录补全**：ncu SM/DRAM 峰值利用率、KV 碎片率。
-9. **权重加载优化**：`mmap` + `cudaHostRegister` pinned DMA。
+> **后续计划以 `tAgent.md` 为准**（该文件是开发入口）；本文件只记录"做过什么"。
 
 > GPU 卸载审计（2026-09-19）：文本解码器（含 lm_head、decode router）已在 GPU；
 > 仍在 CPU 的模型部分是 **DeepEncoder**、**大批量 prefill 的 MoE 路由**、
 > **token embedding 查表**；采样/tokenizer/预处理/调度留 CPU 属设计选择。
+> 详见 `tAgent.md` §3。
+
+---
+
+## 8. 历史里程碑明细
+
+> 这些是各阶段的原始 checklist，保留作实现/验证记录；当前计划见 `tAgent.md`。
+
+### P0 视觉编码器数值对齐（2026-09-15）
+- [x] `tools/compare_vision.cpp`：`DeepEncoder::encode` 输出 273×1280 与参考
+      `visual_embeddings`，对 f32 参考 rel-L2 ≤ 5.8e-4，对 bf16 参考 3.2%。
+- [x] 分段对比：`DeepEncoder::encode_stages` + `--dump-stages` +
+      `tools/reference/export_vision_stages.py`，定位并修复 SAM 相对位置漏乘 query、
+      CLIP 漏加 QKV bias 两个 bug。CPU 侧 OpenMP（8 线程约 2 分钟）。
+      详见 `ALIGNMENT.md` §4、`PITFALLS.md` §9。
+
+### P0 端到端图像 OCR 对齐（2026-09-19，E0–E5）
+1. [x] **DeepSeek BPE 预分词**（E0）：`tokenizer.json` 的 3 条 `Split` 正则复刻；
+     Unicode 类别表 `tools/gen_unicode_tables.py` → `include/uocr/unicode_tables.h`；
+     43 个用例 pretok/ids 43/43。
+2. [x] **prompt 与 `<image>` 布局**（E1）：`prompt.h`/`prompt.cpp::build_ocr_prompt`；
+     11 个用例 ids/mask 11/11（含 crop `[1,1]/[2,1]/[1,2]/[2,2]/[3,2]`）。
+3. [x] **图像预处理**（E2）：PIL 兼容 bicubic、`ImageOps.pad`（Python round-half-even
+     中心对齐）、`dynamic_preprocess`、`BasicImageTransform`；与 Pillow 逐像素 ≤1 LSB。
+4. [x] **Engine 注入视觉 embedding**（E3）：`MoEDecoder::prefill_embeds`、
+     `Engine::generate_from_image`、`Engine::image_embeddings`。
+5. [x] **端到端参考导出与对比**（E4）：`export_reference.py --mode ocr` +
+     `tools/compare_ocr`；500×400 图 visual rel_l2 4.2%、prefill logits 6.4%、
+     top-1 一致、greedy 24/24。
+6. [x] **采样与输出文本**（E5）：修正 `Sampler::apply_no_repeat_ngram`（匹配 `ngram-1`
+     前缀 + 滑动窗口）；24 步 greedy **24/24**。
+
+### P1 降低路由翻转 / R-SWA 环形覆写（2026-09-19）
+- [x] MoE gate 前 bf16 舍入尝试（`MoEDecoder::set_bf16_rounding`，默认关）：
+      实测 set_mismatch 仍为 13，未降低翻转；翻转源于 f32-vs-bf16 累积漂移，暂缓。
+- [x] 逐层对比 attention q/k/v/o（`set_trace_attn` + `compare_reference`）：
+      q/k/v/o 分别 ≤0.024/0.023/0.044/0.057，误差随层累积，确认非 bug。
+      `ALIGNMENT.md` §7。
+- [x] `--decode-steps 140` 覆盖环形覆写：final K/V rel_l2 ≤ 0.03、decode logits ≤ 0.084。
+      `ALIGNMENT.md` §6。
+
+### P1 CUDA 主路径接入（2026-09-19）
+- [x] `GpuRSWACache` + `cuda::rswa_attention`（causal prefill / decode）；环形覆写
+      cache 完全一致、decode/prefill 误差 ≤1e-6。
+- [x] `GpuDecoder`：RMSNorm/QKV/O/RoPE/R-SWA/dense/MoE 全放 GPU；权重常驻。
+      vs CPU `MoEDecoder`：prefill rel_l2 0.0019、decode 0.0021。
+- [x] `Engine(..., Backend::CUDA)` 走 `GpuDecoder`，`generate`/`generate_from_image`
+      自动分派；CPU/CUDA greedy token 一致。
+- [x] device INT4 专家权重：`upload_expert_table` + `moe_experts_masked_int4`；
+      显存 9.2GB → 2.2GB。
+
+### P2 CUDA Graph 与创新点（2026-09-19）
+- [x] device `moe_router_topk`；"全 expert 固定调度 + 掩码跳过"（网格静态）。
+- [x] 单请求整步 Graph：plain 6.8ms → full graph 5.4ms/token（INT4）。
+- [x] `rswa_append_decode` 设备端推进 `len/ring_pos`，同一 Graph 覆盖 warmup→ring。
+- [x] `EngineConfig.graph_scope = full | attn_dense`（消融）。
+- [x] `batch_prefill_embeds` + `forward_ragged` + `rswa_write_prefill_ragged` /
+      `rswa_attention_ragged`；与逐请求 prefill logits rel_l2 = 0。
+- [x] **slot 映射修复**：`batch_decode` 显式接收"行→slot"映射（`PITFALLS.md` §13）。
+- [x] batched CUDA Graph：按行数 B 缓存图；graph vs plain rel_l2 = 0。
+
+### P2 Tensor Core / 连续批处理（2026-09-19）
+- [x] INT4 W4A16 `ldmatrix` 路径；保留标量 `moe_gemm_int4` 做基线；rel_l2 ≤ 0.0026。
+      注：`prj.md` 的 `s4.s4.s32`（W4A4）与"激活 BF16 输入"矛盾，最终采用 W4A16。
+- [x] `moe_gemm_int4_tc` `BN` 模板 + bn 扫描：专家形状 bn=8 最优；staging 重写
+      kernel +20%，整波 prefill −10%。`moe_gemm_int4_tc_n` 可扫 bn。
+- [x] bf16 TC GEMM `matmul_t_bf16`（dense/shared + lm_head）：64×64 tile、`ldmatrix`、
+      小 m 越界 warp 跳过 mma；小 m 变体（m≤16 沿 n 拆 warp）；`matmul_t_bf16_ref`
+      做 A/B，rel_l2 ≤ 0.0018；n=k=1280 最高 18.4 TFLOPS。
+- [x] nsys kernel 分解（`BENCHMARKS.md` §2.9）。
+- [x] 分词器对齐提前到 E0（43/43）；可选 reference CTest。
+
 

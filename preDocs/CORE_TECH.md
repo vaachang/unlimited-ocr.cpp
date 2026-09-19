@@ -1,5 +1,7 @@
 # 核心技术实现说明
 
+> 开发入口见 `tAgent.md`；文档导航见 `README.md`。
+
 本文说明本项目关键模块的设计与实现位置。代码路径均为相对仓库根目录。
 
 ## 1. R-SWA KV Cache（`include/uocr/kv_cache.h`, `src/scheduler/kv_cache.cpp`）
