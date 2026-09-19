@@ -18,41 +18,39 @@
       query、CLIP 漏加 QKV bias 两个 bug。CPU 侧启用 OpenMP（8 线程约 2 分钟）。
       详见 `ALIGNMENT.md` §4、`PITFALLS.md` §9。
 
-### P0 端到端图像 OCR 对齐（下一阶段重点）
+### P0 端到端图像 OCR 对齐（已完成 2026-09-19）
 目标：C++ `Engine` 输入单张真实页面图 + 文本 prompt，输出与参考
 `UnlimitedOCRForCausalLM.infer()` 一致的 token 序列；先对齐首 token logits，
-再逐步覆盖 greedy。
+再逐步覆盖 greedy。**E0–E5 全部完成，端到端 greedy 24/24 与参考一致。**
 
-依赖顺序（建议按此顺序实现）：
-
-1. [ ] **DeepSeek BPE 预分词对齐**（E0，前置）
-   - 从 `models/tokenizer.json` 的 `pre_tokenizer` 读取 3 条 `Split` 正则
-     （`\p{N}{1,3}`、CJK `[一-龥\u3040-ゟ゠-ヿ]+`、主标点/单词正则），
-     替换当前 `src/runtime/tokenizer.cpp` 的 GPT-2 风格近似切分。
-   - 加回归测试：C++ `Tokenizer::encode` 与 HF `tokenizer` 在语料上逐条比对
-     （可写 `tools/reference/export_tokenizer_cases.py` 生成期望 id）。
-2. [ ] **prompt 与 `<image>` 布局**（E1）
-   - 复刻 `conversation.py` / `format_messages(sft_format='plain')` 的模板。
-   - 按 `infer()` 语义生成 273 个 `<image>` token：`num_queries=16`，
-     `([id]*16+[id])*16+[id]`；`images_seq_mask` 对应位置为 True，其余 False；
-     序列首部 prepend `bos`（mask=False）。
-   - 对比参考 `prefill_input_ids` 长度与 id 是否逐位一致。
-3. [ ] **图像预处理**（E2）
-   - `BasicImageTransform(mean=std=0.5)`、`ImageOps.pad`、非整除时的中心填充色
-     = `mean*255`；`dynamic_preprocess`（crop/base 与 gundam 两种模式）。
-   - 默认参数按 README：`base_size=1024, image_size=640, crop_mode=True`
-     （先用单图 `crop_mode=False` 做最小闭环，再补 crop/gundam）。
-4. [ ] **Engine 注入视觉 embedding**（E3）
-   - `MoEDecoder` 增加 `prefill_embeds(cache, inputs_embeds, ...)`：文本 token 走
-     `embed_tokens`，`<image>` 位置用 `DeepEncoder::encode` 的 `[273,1280]` 填充。
-   - `Engine` 增加 `generate_from_image(image_chw, h, w, prompt_tokens, ...)`。
-5. [ ] **端到端参考导出与对比**（E4）
-   - 扩展 `tools/reference/export_reference.py`：用确定性/真实图片跑参考
-     `forward`/`infer`，导出 `inputs_embeds`、首步 logits、前 N 步 greedy token。
-   - 新增/扩展对比工具，先比首 token logits（rel-L2 / top-1），再比若干步。
-6. [ ] **采样与输出文本**（E5）
-   - 复刻 README 的 `no_repeat_ngram_size=35, ngram_window=1024`
-     （`SlidingWindowNoRepeatNgramProcessor`），验证输出文本连通。
+1. [x] **DeepSeek BPE 预分词对齐**（E0）
+   - `src/runtime/tokenizer.cpp` 已改为复刻 `tokenizer.json` 的 3 条 `Split`
+     正则（`\p{N}{1,3}`、CJK、主标点/单词正则），Unicode 类别表由
+     `tools/gen_unicode_tables.py` 生成到 `include/uocr/unicode_tables.h`。
+   - 回归：`tools/compare_tokenizer` + `tools/reference/export_tokenizer_cases.py`
+     在 43 个用例上 pretok/ids **43/43**；单测 `tokenizer_deepseek_pretokenizer`。
+2. [x] **prompt 与 `<image>` 布局**（E1）
+   - `include/uocr/prompt.h` + `src/runtime/prompt.cpp` 的 `build_ocr_prompt`。
+   - `tools/compare_layout` + `tools/reference/export_layout_cases.py`：
+     11 个用例 ids/mask **11/11**（含 crop `[1,1]/[2,1]/[1,2]/[2,2]/[3,2]`）。
+3. [x] **图像预处理**（E2）
+   - `include/uocr/image.h` + `src/runtime/image.cpp`：PIL 兼容 bicubic、
+     `ImageOps.pad`（含 Python round-half-even 中心对齐）、`dynamic_preprocess`、
+     `BasicImageTransform`。
+   - `tools/compare_image` + `tools/reference/export_image_cases.py`：
+     与 Pillow 逐像素 ≤1 LSB，crop ratio 全对。
+4. [x] **Engine 注入视觉 embedding**（E3）
+   - `MoEDecoder::prefill_embeds`、`Engine::generate_from_image`、
+     `Engine::image_embeddings`（含 `<= image_size` 时 crop_ratio=[1,1] 规则）。
+5. [x] **端到端参考导出与对比**（E4）
+   - `export_reference.py --mode ocr` 导出 `input_ids`/`images_seq_mask`/
+     `image_global`/`visual_scattered`/`prefill_logits`/greedy；
+     `tools/compare_ocr` 逐项对比。500×400 图：visual rel_l2 4.2%、
+     prefill logits rel_l2 6.4% 且 top-1 一致、greedy 24/24。
+6. [x] **采样与输出文本**（E5）
+   - 按参考/SGLang 语义修正 `Sampler::apply_no_repeat_ngram`
+     （匹配 `ngram-1` 前缀 + 滑动窗口），单测 `test_sampler`；
+     24 步 greedy 在 `no_repeat_ngram_size=35, ngram_window=1024` 下 **24/24**。
 
 ### P1 降低路由翻转（提升对齐精度）
 - [ ] 在 MoE gate 前把激活按 bf16 舍入，复刻参考数值，减少近似并列的专家翻转。

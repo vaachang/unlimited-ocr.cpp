@@ -28,10 +28,24 @@
 ✅ PyTorch 参考环境（.venv, torch 2.10+cu128, transformers 4.57.1）
 ✅ Decoder 数值对齐（11/12 层 hidden <1%，logits <1%）
 ✅ Vision 对齐完成（对 f32 参考全链路 rel_l2 ≤ 6e-4；对 bf16 参考 3.2%）
-⬜ 端到端图像 OCR 对齐（视觉 token 数已确认 273，与文本一致）
+✅ 端到端图像 OCR 对齐（E0–E5：布局、预处理、视觉注入、greedy 24/24）
 ⬜ CUDA Graph 捕获（当前为普通 kernel 启动）
 ⬜ CUDA 版 MoE/decoder 调度接入（当前 CUDA 仅提供内核与测试，主推理走 CPU）
 ```
+
+### 端到端 OCR 对齐（E0–E5，2026-09-19）
+
+| 阶段 | 工具 | 结果 |
+|---|---|---|
+| E0 BPE 预分词 | `compare_tokenizer` | pretok/ids 43/43 |
+| E1 prompt/`<image>` 布局 | `compare_layout` | ids/mask 11/11 |
+| E2 图像预处理 | `compare_image` | 与 Pillow ≤1 LSB，crop ratio 全对 |
+| E3/E4 视觉注入 + 首 token | `compare_ocr` | visual rel_l2 4.2%、logits rel_l2 6.4%、top-1 一致 |
+| E5 no-repeat-ngram | `compare_ocr` | greedy 24/24 |
+
+典型结果（500×400，`<image>\nFree OCR.`，crop_mode=True）：
+`layout OK → visual 273 tokens, rel_l2 0.0419 → prefill_logits rel_l2 0.0637
+(top-1=3051) → greedy 24/24`（`no_repeat_ngram_size=35, ngram_window=1024`）。
 
 ## 3. 目录结构
 
@@ -42,11 +56,13 @@ unlimited-ocr.cpp/
 ├── include/uocr/               # 公共头文件
 │   ├── common.h tensor.h ops.h
 │   ├── config.h safetensors.h tokenizer.h quant.h weights.h
+│   ├── unicode_tables.h image.h prompt.h
 │   ├── kv_cache.h block_manager.h memory_pool.h continuous_batch.h
 │   ├── moe_decoder.h deep_encoder.h sampler.h engine.h
 │   └── cuda_ops.h
 ├── src/
 │   ├── runtime/    config.cpp safetensors.cpp tokenizer.cpp quant.cpp weights.cpp log.cpp
+│   │                prompt.cpp image.cpp
 │   ├── scheduler/  kv_cache.cpp block_manager.cpp memory_pool.cpp continuous_batch.cpp
 │   ├── engine/     moe_decoder.cpp deep_encoder.cpp sampler.cpp engine.cpp
 │   └── kernels/
@@ -57,7 +73,11 @@ unlimited-ocr.cpp/
 │                   test_tokenizer.cpp test_rswa_cuda.cu
 ├── benchmarks/     bench_decode.cpp bench_throughput.cpp
 ├── tools/          inspect_model.cpp compare_reference.cpp compare_vision.cpp
-│                   reference/export_reference.py
+│                   compare_tokenizer.cpp compare_layout.cpp compare_image.cpp
+│                   compare_ocr.cpp gen_unicode_tables.py
+│                   reference/ export_reference.py export_vision_stages.py
+│                              export_tokenizer_cases.py export_layout_cases.py
+│                              export_image_cases.py
 ├── .venv/          （gitignore，PyTorch 参考环境）
 └── models/         （.gitignore，包含下载的真实权重与远程代码）
 ```
@@ -137,19 +157,15 @@ bf16 激活舍入。详见 `ALIGNMENT.md` §4、`PITFALLS.md` §9。CPU 完整�
 
 ## 7. 后续计划
 
-> **下一步（2026-09-15 决定）**：端到端图像 OCR 对齐。执行顺序 E0 分词器对齐 →
-> E1 `<image>`/`images_seq_mask` 布局 → E2 图像预处理 → E3 Engine 注入视觉
-> embedding → E4 首 token logits/greedy 对比 → E5 `no_repeat_ngram_size=35`。
-> 详细子任务见 `tAgent.md`。
+> **P0 端到端图像 OCR 对齐（E0–E5）已于 2026-09-19 完成**，详见上文与
+> `tAgent.md`。下一步按 `tAgent.md` 的 P1/P2 推进。
 
-1. **端到端数值对齐**：用 PyTorch 参考实现跑一张图，导出每层/每步 logits，
-   与 C++ 输出逐层对比；优先校准 DeepEncoder 与图像 token 布局。
-2. **CUDA 主路径**：把 `MoEDecoder` 的 `Linear::forward` / attention 分派到
+1. **P1 降低路由翻转**：MoE gate 前把激活按 bf16 舍入以复刻参考数值；
+   逐层对比 attention q/k/v、O 投影；用 `--decode-steps 140` 覆盖环形覆写。
+2. **P1 CUDA 主路径**：把 `MoEDecoder` 的 `Linear::forward` / attention 分派到
    `uocr::cuda::*`，实现 device 上的 KV cache（当前 `RSWACache` 为 host 内存）。
-3. **CUDA Graph**：按 prj.md 的"路由在 Graph 外、expert 计算在 Graph 内全调度 + 掩码跳过"
+3. **P2 CUDA Graph**：按 prj.md 的"路由在 Graph 外、expert 计算在 Graph 内全调度 + 掩码跳过"
    方案捕获解码稳态。
-4. **Tensor Core INT4 GEMM**：把 `moe_gemm_int4.cu` 的标量版替换为
+4. **P2 Tensor Core INT4 GEMM**：把 `moe_gemm_int4.cu` 的标量版替换为
    `mma.sync.aligned.m16n8k32.s4.s4.s32`。
-5. **BPE 预分词对齐**：当前分词器为 GPT-2 风格近似，需对齐 DeepSeek 的
-   `\p{N}{1,3}` / CJK / 标点 split 正则。
-6. **性能记录表**：补齐 `prj.md` 第 7.2 节所有指标（设备端 TTFT/TPOT/吞吐/显存）。
+5. **性能记录表**：补齐 `prj.md` 第 7.2 节所有指标（设备端 TTFT/TPOT/吞吐/显存）。

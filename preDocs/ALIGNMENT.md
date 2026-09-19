@@ -145,3 +145,51 @@ C++ 输出的 `visual_embeddings` 为 `[273,1280]`，与参考形状一致。
    C++ 只做了 `qkv_w.matmul`，未加 `qkv_b`。
 
 修复后，Decode 阶段仍保持 <1% 的既有对齐（见第 3 节）。
+
+## 5. 端到端图像 OCR 对齐（E0–E5，已完成）
+
+参考导出与 C++ 对比，全部工具在 `tools/`：
+
+```bash
+# 参考（GPU）
+./.venv/bin/python tools/reference/export_tokenizer_cases.py --model models \
+    --out /tmp/opencode/ref_tokenizer
+./.venv/bin/python tools/reference/export_layout_cases.py --model models \
+    --out /tmp/opencode/ref_layout
+./.venv/bin/python tools/reference/export_image_cases.py --out /tmp/opencode/ref_image
+./.venv/bin/python tools/reference/export_reference.py --model models \
+    --out /tmp/opencode/ref_ocr --mode ocr --prompt $'<image>\nFree OCR.' \
+    --crop-mode --ocr-width 500 --ocr-height 400 --decode-steps 24 \
+    --ngram-size 35 --ngram-window 1024
+# C++
+./build/tools/compare_tokenizer --model models --ref /tmp/opencode/ref_tokenizer/tokenizer_cases.json
+./build/tools/compare_layout    --model models --ref /tmp/opencode/ref_layout/layout_cases.json
+./build/tools/compare_image     --ref /tmp/opencode/ref_image
+OMP_NUM_THREADS=8 ./build/tools/compare_ocr --model models --ref /tmp/opencode/ref_ocr
+```
+
+| 阶段 | 项目 | 结果 |
+|---|---|---|
+| E0 | 预分词 / ids（43 用例） | 43/43 |
+| E1 | prompt/`<image>` 布局 ids + mask（11 用例） | 11/11 |
+| E2 | 预处理 vs Pillow | ≤1 LSB，crop ratio 全对 |
+| E3/E4 | `image_global` | rel_l2 6.6e-5 |
+| E3/E4 | `visual_embeddings`（273 token） | rel_l2 **0.0419** |
+| E4 | `prefill_logits` | rel_l2 0.0637，top-1 一致（3051） |
+| E5 | greedy（ngram 35/1024） | **24/24** |
+
+说明：视觉/首 token 的 4–6% 误差与第 4 节一致，来源是参考端 bf16 激活舍入
+（C++ 为 f32）；参考 prefill logits 本身用 bf16 计算。**greedy token 序列完全一致**，
+说明该误差不影响生成结果。
+
+### 5.1 修复的 bug
+
+1. **`crop_ratio` 判定**：参考 `infer()` 对 `w,h <= 640` 的图直接设
+   `crop_ratio=[1,1]`，不调用 `dynamic_preprocess`。C++ 最初无条件调用，导致
+   视觉 token 由 273 变 2473。已在 `Engine::image_embeddings` 修复。
+2. **`ImageOps.pad` 中心对齐**：Python `round()` 为 round-half-to-even，
+   C++ `std::lround` 为 round-half-away-from-zero，半像素时偏 1 行/列。
+   已改用 `std::nearbyint`（`py_round`）。
+3. **no-repeat-ngram 语义**：参考/SGLang 是"匹配 `ngram-1` 前缀并禁用其延续词、
+   在 `[len-window, len-ngram+1)` 内搜索"，原实现按完整 n-gram 匹配。
+   已在 `Sampler::apply_no_repeat_ngram` 修正。
