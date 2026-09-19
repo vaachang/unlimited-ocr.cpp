@@ -1,0 +1,8 @@
+# real BF16, prefill=128, steps=32
+[14:25:17][INFO] decoder weights loaded from models/model-00001-of-000001.safetensors  (/home/admin/MyDocs/unlimited-ocr.cpp/src/runtime/weights.cpp:214)
+device: NVIDIA GeForce RTX 5060 Ti (sm_120, 36 SMs, 15.6 GB)
+weights: real models (experts BF16, group=128)
+prefill=128 steps=32 layers=12
+plain      prefill=189.41 ms  TPOT(first)=6.601 ms  TPOT(steady)=6.765 ms  VRAM=9212.0 MB  [fwd=5.863 logits=1.190]
+full       prefill=195.35 ms  TPOT(first)=7.214 ms  TPOT(steady)=5.549 ms  VRAM=9212.0 MB  [fwd=4.589 logits=1.140]
+attn_dense prefill=191.51 ms  TPOT(first)=5.801 ms  TPOT(steady)=5.576 ms  VRAM=9212.0 MB  [fwd=0.000 logits=0.000]

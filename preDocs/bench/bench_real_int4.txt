@@ -1,0 +1,8 @@
+# real INT4 (AWQ group=128), prefill=128, steps=32
+[14:25:49][INFO] decoder weights loaded from models/model-00001-of-000001.safetensors  (/home/admin/MyDocs/unlimited-ocr.cpp/src/runtime/weights.cpp:214)
+device: NVIDIA GeForce RTX 5060 Ti (sm_120, 36 SMs, 15.6 GB)
+weights: real models (experts INT4, group=128)
+prefill=128 steps=32 layers=12
+plain      prefill=127.21 ms  TPOT(first)=14.438 ms  TPOT(steady)=14.871 ms  VRAM=2216.0 MB  [fwd=13.675 logits=1.124]
+full       prefill=129.85 ms  TPOT(first)=6.438 ms  TPOT(steady)=5.526 ms  VRAM=2216.0 MB  [fwd=4.594 logits=1.121]
+attn_dense prefill=126.24 ms  TPOT(first)=5.755 ms  TPOT(steady)=5.656 ms  VRAM=2216.0 MB  [fwd=0.000 logits=0.000]

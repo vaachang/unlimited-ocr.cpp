@@ -1,0 +1,41 @@
+# decoder + attention alignment (seq=16, decode 4)
+[14:29:54][INFO] decoder weights loaded from models/model-00001-of-000001.safetensors  (/home/admin/MyDocs/unlimited-ocr.cpp/src/runtime/weights.cpp:214)
+loading decoder weights (BF16 views) ...
+bf16 activation rounding: off
+== prefill attention projections: worst rel_l2 q=0.02447 k=0.02325 v=0.04367 o=0.05671
+   per-layer q rel_l2 (layer0..): 0.0018 0.0047 0.0043 0.0066 0.0064 0.0121 0.0188 0.0199 0.0191 0.0245 0.0232 0.0195
+
+== prefill: per-layer hidden states (torch hidden_0) ==
+  layer  0: max_abs=0.10735 rel_l2=0.00530 ref_rms=0.234 ref_max=16.75
+  layer  1: max_abs=1.69144 rel_l2=0.00756 ref_rms=1.871 ref_max=186.00
+  layer  2: max_abs=1.36696 rel_l2=0.00605 ref_rms=1.973 ref_max=197.00
+  layer 11: max_abs=67.80151 rel_l2=1.39752 ref_rms=0.596 ref_max=17.62
+  worst prefill rel_l2 = 1.39752
+== prefill logits: max_abs=0.3109 rel_l2=0.00896
+== prefill router: 176 tokens, set_mismatch=13, weight_max_abs=0.8423
+   per-layer mismatches (layer1..layer11): 0 0 0 2 2 1 0 4 1 2 1
+  K layer  0: max_abs=0.0274 rel_l2=0.00272
+  K layer  1: max_abs=0.0567 rel_l2=0.00465
+  K layer  2: max_abs=0.0401 rel_l2=0.00420
+  K layer  3: max_abs=0.1109 rel_l2=0.00732
+  K layer  4: max_abs=0.0534 rel_l2=0.00649
+  K layer  5: max_abs=0.1429 rel_l2=0.01152
+  K layer  6: max_abs=0.1980 rel_l2=0.01742
+  K layer  7: max_abs=0.3637 rel_l2=0.01559
+  K layer  8: max_abs=0.2517 rel_l2=0.01833
+  K layer  9: max_abs=0.2750 rel_l2=0.02336
+  K layer 10: max_abs=0.2265 rel_l2=0.02187
+  K layer 11: max_abs=0.2460 rel_l2=0.02002
+== prefill K cache: 12 layers, worst rel_l2=0.02336
+
+== decode steps ==
+  step 0 tok=  5235 pos= 16  hidden rel_l2=0.57109 max_abs=4.5758 | logits rel_l2=0.01171
+           router: tokens=11 set_mismatch=1 weight_max_abs=0.1296
+== decode0 attention projections: worst rel_l2 q=0.02222 k=0.02500 v=0.04725 o=0.04142
+  step 1 tok=   201 pos= 17  hidden rel_l2=0.55786 max_abs=8.7577 | logits rel_l2=0.01551
+           router: tokens=11 set_mismatch=0 weight_max_abs=0.2373
+== decode1 attention projections: worst rel_l2 q=0.01233 k=0.01257 v=0.02158 o=0.02908
+  step 2 tok=128818 pos= 18  hidden rel_l2=1.34721 max_abs=18.5468 | logits rel_l2=0.02014
+  step 3 tok=  2067 pos= 19  hidden rel_l2=0.77029 max_abs=13.2087 | logits rel_l2=0.02101
+== decode worst: hidden rel_l2=1.34721 (step 2), logits rel_l2=0.02101
+== final cache: worst K rel_l2=0.02114, worst V rel_l2=0.04128 (len=20)

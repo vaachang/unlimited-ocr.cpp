@@ -1,0 +1,38 @@
+# end-to-end OCR alignment (500x400, <image>\nFree OCR., decode 24, ngram 35/1024)
+[14:25:57][INFO] tokenizer loaded: 128827 tokens, 127741 merges, 830 specials  (/home/admin/MyDocs/unlimited-ocr.cpp/src/runtime/tokenizer.cpp:382)
+[14:25:57][INFO] decoder weights loaded from models/model-00001-of-000001.safetensors  (/home/admin/MyDocs/unlimited-ocr.cpp/src/runtime/weights.cpp:214)
+[14:25:57][INFO] engine created (CPU backend)  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:47)
+[14:25:57][INFO] vision weights loaded  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/deep_encoder.cpp:106)
+[14:25:57][INFO] decoder weights loaded from models/model-00001-of-000001.safetensors  (/home/admin/MyDocs/unlimited-ocr.cpp/src/runtime/weights.cpp:214)
+layout                 : ids=278 mask_true=273  OK
+image_global           max_abs=0.00784314 rel_l2=6.59067e-05 top1(ours=871407 ref=871407)
+loading vision weights (this takes a while) ...
+visual_embeddings      max_abs=0.153631 rel_l2=0.0418683 top1(ours=211 ref=211)
+num_visual_tokens      : ours=273 ref=273
+prefill_logits         max_abs=1.46878 rel_l2=0.063715 top1(ours=3051 ref=3051)
+decode step 0           : token ours=3051 ref=3051 OK
+decode step 1           : token ours=201 ref=201 OK
+decode step 2           : token ours=128818 ref=128818 OK
+decode step 3           : token ours=10253 ref=10253 OK
+decode step 4           : token ours=5598 ref=5598 OK
+decode step 5           : token ours=2245 ref=2245 OK
+decode step 6           : token ours=9595 ref=9595 OK
+decode step 7           : token ours=764 ref=764 OK
+decode step 8           : token ours=18 ref=18 OK
+decode step 9           : token ours=14 ref=14 OK
+decode step 10           : token ours=223 ref=223 OK
+decode step 11           : token ours=18 ref=18 OK
+decode step 12           : token ours=14 ref=14 OK
+decode step 13           : token ours=223 ref=223 OK
+decode step 14           : token ours=8834 ref=8834 OK
+decode step 15           : token ours=14 ref=14 OK
+decode step 16           : token ours=223 ref=223 OK
+decode step 17           : token ours=8834 ref=8834 OK
+decode step 18           : token ours=63 ref=63 OK
+decode step 19           : token ours=128819 ref=128819 OK
+decode step 20           : token ours=671 ref=671 OK
+decode step 21           : token ours=4609 ref=4609 OK
+decode step 22           : token ours=7272 ref=7272 OK
+decode step 23           : token ours=1119 ref=1119 OK
+
+summary: layout=OK visual_rel_l2=0.04187 greedy=24/24

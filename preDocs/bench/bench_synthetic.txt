@@ -1,0 +1,7 @@
+# synthetic: hidden=256, 4 layers, prefill=128, steps=64
+device: NVIDIA GeForce RTX 5060 Ti (sm_120, 36 SMs, 15.6 GB)
+weights: synthetic
+prefill=128 steps=64 layers=4
+plain      prefill=3.94 ms  TPOT(first)=0.865 ms  TPOT(steady)=0.799 ms  VRAM=12.0 MB  [fwd=0.815 logits=0.026]
+full       prefill=2.96 ms  TPOT(first)=1.198 ms  TPOT(steady)=0.589 ms  VRAM=12.0 MB  [fwd=0.634 logits=0.035]
+attn_dense prefill=2.89 ms  TPOT(first)=0.670 ms  TPOT(steady)=0.588 ms  VRAM=12.0 MB  [fwd=0.000 logits=0.000]
