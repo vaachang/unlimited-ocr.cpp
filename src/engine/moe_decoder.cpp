@@ -198,6 +198,15 @@ void MoEDecoder::prefill(RSWACache& cache, const std::vector<int>& tokens, int s
     forward(inputs, positions, cache, true, start_pos, true, logits);
 }
 
+void MoEDecoder::prefill_embeds(RSWACache& cache, const Tensor& inputs, std::vector<float>& logits,
+                                std::vector<Tensor>* layer_outputs) {
+    const int seq = static_cast<int>(inputs.dim(0));
+    cache.reset(seq);
+    std::vector<int> positions(seq);
+    for (int i = 0; i < seq; ++i) positions[i] = i;
+    forward(inputs, positions, cache, true, 0, true, logits, layer_outputs);
+}
+
 void MoEDecoder::decode(RSWACache& cache, int token, int pos, std::vector<float>& logits) {
     Tensor inputs = embed({token});
     std::vector<int> positions{pos};

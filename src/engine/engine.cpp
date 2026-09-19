@@ -1,6 +1,8 @@
 #include "uocr/engine.h"
 
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <limits>
 
@@ -113,6 +115,127 @@ GenerationResult Engine::generate(const std::vector<int>& prompt, int max_new_to
 
     if (!doc_key.empty()) block_mgr_->release_prefix(doc_key);
     return res;
+}
+
+GenerationResult Engine::generate_from_image(const std::vector<int>& prompt,
+                                             const std::vector<std::uint8_t>& images_seq_mask,
+                                             const std::vector<float>& visual_embeddings,
+                                             int hidden, int max_new_tokens,
+                                             const std::string& doc_key) {
+    UOCR_CHECK(images_seq_mask.size() == prompt.size(),
+               "generate_from_image: mask size must match prompt size");
+    const int seq = static_cast<int>(prompt.size());
+    UOCR_CHECK(hidden == mcfg_.hidden_size, "generate_from_image: hidden size mismatch");
+
+    Tensor inputs = decoder_->embed(prompt);
+    int v = 0;
+    const int total_v = hidden > 0 ? static_cast<int>(visual_embeddings.size() / hidden) : 0;
+    for (int i = 0; i < seq; ++i) {
+        if (!images_seq_mask[static_cast<std::size_t>(i)]) continue;
+        UOCR_CHECK(v < total_v, "generate_from_image: not enough visual embeddings");
+        std::memcpy(inputs.data() + static_cast<std::size_t>(i) * hidden,
+                    visual_embeddings.data() + static_cast<std::size_t>(v) * hidden,
+                    static_cast<std::size_t>(hidden) * sizeof(float));
+        ++v;
+    }
+    UOCR_CHECK(v == total_v, "generate_from_image: visual embedding count mismatch");
+
+    GenerationResult res;
+    res.prefill_tokens = seq;
+    auto cache = std::make_shared<RSWACache>(mcfg_.num_hidden_layers, mcfg_.num_key_value_heads,
+                                             mcfg_.head_dim(), mcfg_.sliding_window);
+
+    std::vector<float> logits;
+    const double t0 = now_ms();
+    decoder_->prefill_embeds(*cache, inputs, logits);
+    const double t1 = now_ms();
+    res.ttft_ms = t1 - t0;
+
+    if (!doc_key.empty())
+        block_mgr_->acquire_prefix(doc_key, seq, kv_bytes_per_request(seq));
+
+    const int limit = max_new_tokens > 0 ? max_new_tokens : ecfg_.max_new_tokens;
+    std::vector<int> history = prompt;
+    const double td0 = now_ms();
+    int pos = seq;
+    for (int step = 0; step < limit; ++step) {
+        if (ecfg_.no_repeat_ngram_size > 0 &&
+            static_cast<int>(history.size()) >= ecfg_.no_repeat_ngram_size)
+            Sampler::apply_no_repeat_ngram(logits.data(), mcfg_.vocab_size, history,
+                                           ecfg_.no_repeat_ngram_size, ecfg_.ngram_window);
+        const int tok = sampler_->sample(logits.data(), mcfg_.vocab_size);
+        if (tok == mcfg_.eos_token_id) break;
+        res.tokens.push_back(tok);
+        history.push_back(tok);
+        if (step + 1 >= limit) break;
+        decoder_->decode(*cache, tok, pos, logits);
+        ++pos;
+    }
+    const double td1 = now_ms();
+    res.decode_ms = td1 - td0;
+    res.decode_tokens = static_cast<int>(res.tokens.size());
+    res.tpot_ms = res.decode_tokens > 0 ? res.decode_ms / res.decode_tokens : 0.0;
+
+    if (!doc_key.empty()) block_mgr_->release_prefix(doc_key);
+    return res;
+}
+
+std::vector<float> Engine::image_embeddings(const ImageRGB& image, bool crop_mode, int base_size,
+                                            int image_size) {
+    UOCR_CHECK(vision_ != nullptr, "image_embeddings: vision encoder not set");
+    if (base_size <= 0) base_size = mcfg_.base_size;
+    if (image_size <= 0) image_size = mcfg_.candidate_image_size;
+    const int hidden = mcfg_.hidden_size;
+    const int patch = mcfg_.patch_size;
+    const int ds = mcfg_.downsample_ratio;
+
+    auto encode_view = [&](const ImageRGB& view, int size) {
+        std::vector<float> chw = to_tensor_normalized(view);
+        Tensor out;
+        vision_->encode(chw.data(), size, size, out);
+        return out;
+    };
+
+    std::vector<float> result;
+
+    if (!crop_mode) {
+        ImageRGB view = resize_bicubic(image, image_size, image_size);
+        view = pad_square(view, image_size, 127);
+        Tensor g = encode_view(view, image_size);
+        result.assign(g.data(), g.data() + g.numel());
+        return result;
+    }
+
+    // global view at base_size (crop_mode=True)
+    ImageRGB gview = pad_square(image, base_size, 127);
+    Tensor global = encode_view(gview, base_size);
+
+    const int nq = static_cast<int>(
+        std::ceil(static_cast<double>(image_size / patch) / ds));
+    // Reference `infer`: images that already fit within image_size use a single
+    // global view (crop_ratio [1,1]); otherwise run dynamic_preprocess.
+    const bool fits = image.width <= image_size && image.height <= image_size;
+    DynamicPreprocess dp;
+    if (!fits) dp = dynamic_preprocess(image, image_size);
+    const bool use_local = !fits && (dp.width_crop_num > 1 || dp.height_crop_num > 1);
+    if (!use_local) {
+        result.assign(global.data(), global.data() + global.numel());
+        return result;
+    }
+
+    // local crops: each encode returns rows*(cols)+1; drop its view_seperator
+    const int global_total = static_cast<int>(global.dim(0));
+    const int global_no_sep = global_total - 1;
+    for (const ImageRGB& crop : dp.crops) {
+        Tensor lf = encode_view(crop, image_size);
+        const int n = static_cast<int>(lf.dim(0)) - 1;  // drop view_seperator
+        result.insert(result.end(), lf.data(), lf.data() + static_cast<std::size_t>(n) * hidden);
+    }
+    result.insert(result.end(), global.data(),
+                  global.data() + static_cast<std::size_t>(global_no_sep) * hidden);
+    result.insert(result.end(), weights_.view_seperator.begin(), weights_.view_seperator.end());
+    (void)nq;
+    return result;
 }
 
 }  // namespace uocr

@@ -194,16 +194,171 @@ def run_vision(args, model):
     print(f"[vision] visual tokens={emb.shape[0]} dim={emb.shape[1]} -> {out_dir}/manifest.json")
 
 
+def det_rgb(w, h, seed):
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:h, 0:w]
+    base = ((xx / max(w - 1, 1)) * 180 + (yy / max(h - 1, 1)) * 60).astype(np.int32)
+    noise = rng.integers(-20, 21, (h, w)).astype(np.int32)
+    r = np.clip(base + noise, 0, 255).astype(np.uint8)
+    g = np.clip(base * 2 // 3 + noise, 0, 255).astype(np.uint8)
+    b = np.clip(255 - base // 2 + noise, 0, 255).astype(np.uint8)
+    return np.stack([r, g, b], axis=-1)
+
+
+def run_ocr(args, model):
+    """End-to-end image+prompt case (E3/E4)."""
+    import math
+
+    from PIL import Image, ImageOps
+    from tokenizers import Tokenizer
+
+    out = args.out
+    os.makedirs(out, exist_ok=True)
+    manifest = {"mode": "ocr", "tensors": {}}
+    base_size, image_size = 1024, 640
+    crop_mode = args.crop_mode
+
+    tok = Tokenizer.from_file(os.path.join(args.model, "tokenizer.json"))
+    image_token_id, bos_id = 128815, 0
+    prompt = args.prompt.strip()
+    text_splits = prompt.split("<image>")
+    assert len(text_splits) == 2, "run_ocr expects exactly one <image>"
+
+    w, h = args.ocr_width, args.ocr_height
+    arr = det_rgb(w, h, args.seed)
+    arr.tofile(os.path.join(out, "ocr_image.bin"))
+    manifest["image_hw"] = [h, w]
+    manifest["prompt"] = prompt
+    manifest["crop_mode"] = crop_mode
+
+    im = Image.fromarray(arr)
+    mean = np.array([0.5, 0.5, 0.5], dtype=np.float32).reshape(3, 1, 1)
+    std = np.array([0.5, 0.5, 0.5], dtype=np.float32).reshape(3, 1, 1)
+    pad_color = tuple(int(x * 255) for x in mean.reshape(-1))
+
+    def transform(x):
+        a = np.asarray(x).astype(np.float32) / 255.0
+        return (a.transpose(2, 0, 1) - mean) / std
+
+    crop_ratio = [1, 1]
+    if crop_mode:
+        global_view = ImageOps.pad(im, (base_size, base_size), color=pad_color)
+        images_ori = transform(global_view)
+    else:
+        sq = im.resize((image_size, image_size))
+        global_view = ImageOps.pad(sq, (image_size, image_size), color=pad_color)
+        images_ori = transform(global_view)
+    images_crop = np.zeros((1, 3, base_size, base_size), dtype=np.float32)
+
+    # token layout
+    patch_size, downsample_ratio = 16, 4
+    num_queries = math.ceil((image_size // patch_size) / downsample_ratio)
+    num_queries_base = math.ceil((base_size // patch_size) / downsample_ratio)
+
+    ids, mask = [], []
+    for text_sep in text_splits[:-1]:
+        t = tok.encode(text_sep, add_special_tokens=False).ids
+        ids += t
+        mask += [0] * len(t)
+        if crop_mode:
+            img = ([image_token_id] * num_queries_base + [image_token_id]) * num_queries_base
+            img += [image_token_id]
+        else:
+            img = ([image_token_id] * num_queries + [image_token_id]) * num_queries
+            img += [image_token_id]
+        ids += img
+        mask += [1] * len(img)
+    t = tok.encode(text_splits[-1], add_special_tokens=False).ids
+    ids += t
+    mask += [0] * len(t)
+    ids = [bos_id] + ids
+    mask = [0] + mask
+
+    input_ids = torch.tensor([ids], dtype=torch.long, device=model.device)
+    images_seq_mask = torch.tensor([mask], dtype=torch.bool, device=model.device)
+    spatial = torch.tensor([crop_ratio], dtype=torch.long, device=model.device)
+
+    model.config._ring_window = args.window
+    model.config.sliding_window = None
+
+    images_ori_t = torch.from_numpy(images_ori)[None].to(model.device, torch.bfloat16)
+    images_crop_t = torch.from_numpy(images_crop).to(model.device, torch.bfloat16)
+    gate_out = {}
+    first_dense = model.config.first_k_dense_replace
+    handles = []
+
+    def make_hook(li):
+        def hook(module, inp, output):
+            idx, weight, _aux = output
+            gate_out[li] = (idx.detach().to(torch.float32).cpu(),
+                            weight.detach().to(torch.float32).cpu())
+        return hook
+
+    for li in range(first_dense, len(model.model.layers)):
+        handles.append(model.model.layers[li].mlp.gate.register_forward_hook(make_hook(li)))
+
+    with torch.no_grad():
+        res = model(input_ids=input_ids, images=[(images_crop_t, images_ori_t)],
+                    images_seq_mask=images_seq_mask, images_spatial_crop=spatial,
+                    use_cache=True, output_hidden_states=True, return_dict=True)
+    for hh in handles:
+        hh.remove()
+
+    hidden0 = res.hidden_states[0][0]
+    mask_t = torch.tensor(mask, dtype=torch.bool, device=hidden0.device)
+    visual = hidden0[mask_t]
+
+    manifest["tensors"]["input_ids"] = save_np(out, "input_ids", torch.tensor(ids))
+    manifest["tensors"]["images_seq_mask"] = save_np(out, "images_seq_mask",
+                                                     torch.tensor(mask, dtype=torch.float32))
+    manifest["tensors"]["image_global"] = save_np(out, "image_global", torch.from_numpy(images_ori))
+    manifest["tensors"]["inputs_embeds_scattered"] = save_np(out, "inputs_embeds_scattered", hidden0)
+    manifest["tensors"]["visual_scattered"] = save_np(out, "visual_scattered", visual)
+    manifest["tensors"]["prefill_logits"] = save_np(out, "prefill_logits", res.logits[0, -1])
+    manifest["num_visual_tokens"] = int(visual.shape[0])
+    manifest["hidden"] = int(visual.shape[1])
+
+    # greedy decode
+    cache = res.past_key_values
+    steps = []
+    pos = len(ids)
+    for step in range(args.decode_steps):
+        logits = res.logits[0, -1]
+        tokid = int(torch.argmax(logits).item())
+        cur = torch.tensor([[tokid]], dtype=torch.long, device=model.device)
+        with torch.no_grad():
+            res = model(input_ids=cur, past_key_values=cache, use_cache=True,
+                        output_hidden_states=True, return_dict=True)
+        cache = res.past_key_values
+        manifest["tensors"][f"decode_token_{step}"] = save_np(
+            out, f"decode_token_{step}", torch.tensor([tokid]))
+        manifest["tensors"][f"decode_logits_{step}"] = save_np(
+            out, f"decode_logits_{step}", res.logits[0, -1])
+        steps.append({"token": tokid, "position": pos})
+        pos += 1
+    manifest["decode_steps"] = steps
+
+    with open(os.path.join(out, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"[ocr] ids={len(ids)} visual_tokens={visual.shape[0]} "
+          f"prefill_tok={steps[0]['token'] if steps else -1} -> {out}/manifest.json")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="models")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--mode", choices=["decoder", "vision", "all"], default="decoder")
+    ap.add_argument("--mode", choices=["decoder", "vision", "ocr", "all"], default="decoder")
     ap.add_argument("--seq", type=int, default=16)
     ap.add_argument("--decode-steps", type=int, default=8)
     ap.add_argument("--window", type=int, default=128)
     ap.add_argument("--image-size", type=int, default=1024)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--prompt", default="<image>\nFree OCR.")
+    ap.add_argument("--crop-mode", action="store_true", default=True)
+    ap.add_argument("--no-crop-mode", dest="crop_mode", action="store_false")
+    ap.add_argument("--ocr-width", type=int, default=500)
+    ap.add_argument("--ocr-height", type=int, default=400)
     args = ap.parse_args()
 
     from transformers import AutoModel
@@ -219,6 +374,8 @@ def main():
         run_decoder(args, model)
     if args.mode in ("vision", "all"):
         run_vision(args, model)
+    if args.mode in ("ocr", "all"):
+        run_ocr(args, model)
 
 
 if __name__ == "__main__":

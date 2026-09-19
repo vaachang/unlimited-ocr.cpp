@@ -16,6 +16,7 @@
 #include "uocr/config.h"
 #include "uocr/continuous_batch.h"
 #include "uocr/deep_encoder.h"
+#include "uocr/image.h"
 #include "uocr/moe_decoder.h"
 #include "uocr/sampler.h"
 #include "uocr/tokenizer.h"
@@ -54,6 +55,24 @@ public:
     // `doc_key` enables reference-region sharing across requests.
     GenerationResult generate(const std::vector<int>& prompt, int max_new_tokens = 64,
                               const std::string& doc_key = "");
+
+    // Like generate(), but `images_seq_mask` marks positions in `prompt` that
+    // must be filled with rows of `visual_embeddings` ([V, hidden] row-major)
+    // instead of token embeddings (E3).
+    GenerationResult generate_from_image(const std::vector<int>& prompt,
+                                         const std::vector<std::uint8_t>& images_seq_mask,
+                                         const std::vector<float>& visual_embeddings, int hidden,
+                                         int max_new_tokens = 64, const std::string& doc_key = "");
+
+    // Assemble the visual embeddings for one image exactly like the reference:
+    // global view, plus Gundam local crops when crop_mode and the dynamic grid
+    // is larger than 1x1.  Requires `set_vision()`.
+    std::vector<float> image_embeddings(const ImageRGB& image, bool crop_mode = true,
+                                        int base_size = 0, int image_size = 0);
+
+    // Text prompt -> embeddings (embed_tokens only).  Images are scattered by
+    // the caller / generate_from_image().
+    Tensor embed_tokens(const std::vector<int>& tokens) const { return decoder_->embed(tokens); }
 
     // Encode an image into visual embeddings (requires vision weights).
     void set_vision(std::shared_ptr<DeepEncoder> enc) { vision_ = std::move(enc); }

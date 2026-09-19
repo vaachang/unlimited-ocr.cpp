@@ -48,6 +48,9 @@ public:
     // Convenience wrappers.
     void prefill(RSWACache& cache, const std::vector<int>& tokens, int start_pos,
                  std::vector<float>& logits);
+    // Prefill from already-built embeddings (text + scattered visual tokens).
+    void prefill_embeds(RSWACache& cache, const Tensor& inputs, std::vector<float>& logits,
+                        std::vector<Tensor>* layer_outputs = nullptr);
     void decode(RSWACache& cache, int token, int pos, std::vector<float>& logits);
 
     // Router results for the last token (used by tests / introspection).
