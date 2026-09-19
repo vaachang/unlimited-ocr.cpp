@@ -95,6 +95,23 @@ CUDA 构建与 CPU 构建共用 `RSWACache`/`WeightMatrix` 的数据布局，因
 `tests/test_rswa_cuda.cu` 可以直接把 host cache 上传后与 CPU 参考逐元素对比
 （当前 max_err < 1e-5）。
 
+### 5.1 设备端 decoder（`GpuDecoder`）
+
+每层流程全部在 GPU 上：`rmsnorm → q/k/v matmul(bf16) → rope → GpuRSWACache
+(readonly/causal prefill 或 ring decode) → o matmul → residual → rmsnorm2 →
+dense MLP 或 MoE`。MoE 里 router logits 由 GPU 算出后拷回 host 做 top-k 与
+“按专家分组”，再对每个专家在 GPU 上批量 `gate/up/silu/down`，用
+`scatter_add_scaled` 按路由权重累加，最后加共享专家。权重在构造时上传一次
+（bf16，含全部专家），decode 每步只上传一行 embedding 与 position。
+
+构建上 CUDA 源文件并入 `uocr_core`（`UOCR_ENGINE_LIB` 恒为 `uocr_core`），
+`Engine(..., Backend::CUDA)` 内部持有 `GpuDecoder`，`generate` 与
+`generate_from_image` 自动分派；CPU 构建不编译 `.cu`、不包含该成员。
+
+> 该系统当前**不可直接 CUDA Graph 捕获**：每层 MoE 有 host 同步点（top-k），
+> 且专家 kernel 网格随分组动态变化。Graph 化需要 device router + 固定网格的
+> “全专家调度 + 掩码跳过”kernel（见 `tAgent.md` P2）。
+
 ## 6. 与 `prj.md` 三大创新点的对应
 
 | prj.md 创新点 | 本项目实现 | 状态 |

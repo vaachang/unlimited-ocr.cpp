@@ -6,9 +6,27 @@
 
 ---
 
-## 下一阶段任务计划（2026-09-15 更新）
+## 下一阶段任务计划（2026-09-19 更新）
 
 进度与结果见 `PROGRESS.md`、`ALIGNMENT.md`、`PITFALLS.md`、`CORE_TECH.md`。
+
+**已完成里程碑**：M1 调研 → M2 骨架 → M3 调度 → M4 引擎 → M5 CUDA 内核
+→ M6 视觉对齐 → P0 端到端 OCR 对齐（E0–E5）→ P1 R-SWA 环形覆写验证
+→ P1 CUDA 设备端 decoder + Engine CUDA 分支 → P2 Tensor Core W4A16 GEMM。
+
+**下一步优先级**（详见文末各节）：
+
+1. **CUDA Graph（P2，最大）**：需先把 MoE 改成 device router + “全专家固定
+   调度 + 掩码跳过”的静态 kernel 序列，再捕获 decode 稳态。当前 `GpuDecoder`
+   每层有 router D2H + host top-k 同步点、且专家 kernel 网格随分组变化，
+   无法直接捕获。三个子选项（需确认范围）：
+   - 3a 完整版：device router + 融合 masked-expert kernel + Graph 捕获；
+   - 3b 缩减版：只捕获 attention/dense 静态子图，MoE 留在图外；
+   - 3c 换方向：先做 device INT4 专家权重（省显存）+ 基准指标表。
+2. **P1 残留**：逐层对比 attention 的 q/k/v、O 投影输出，定位路由以外的残差。
+3. **P2 Tensor Core 性能**：`ldmatrix`/shared-memory staging + split-K。
+4. **P2 指标与回归**：补齐 prj.md §7.2 指标与 §7.3 ablation；对比工具纳入
+   可选 CTest。
 
 ### P0 视觉编码器数值对齐（已完成 2026-09-15）
 - [x] 跑完 `tools/compare_vision.cpp`。`DeepEncoder::encode` 输出 273×1280 与
@@ -84,11 +102,17 @@
 > 构建结构调整：CUDA 源文件直接并入 `uocr_core`（`UOCR_ENGINE_LIB` 恒为
 > `uocr_core`），避免 Engine 与 CUDA 静态库的循环依赖；CPU 构建不编译 `.cu`。
 
-### P2 CUDA Graph 与创新点落地
-- [ ] 按 prj.md 方案实现"路由 kernel 在 Graph 外、expert 计算在 Graph 内全调度 +
-      掩码跳过"，捕获解码稳态。
+### P2 CUDA Graph 与创新点落地（下一阶段重点，范围待确认）
+- [ ] **前置**：device 端 router + top-k kernel，去掉 `GpuDecoder` 每层的
+      router D2H / host top-k 同步点。
+- [ ] **前置**：实现 prj.md 的“全 expert 固定调度 + 路由掩码跳过”单个（或固定
+      序列）MoE kernel，网格静态，使 kernel 序列可被 Graph 捕获。
+- [ ] 按 prj.md 方案：路由 kernel 在 Graph 外、expert 计算在 Graph 内，捕获
+      解码稳态；对比捕获前后的 kernel launch 开销。
 - [ ] 持久化 R-SWA KV 索引 buffer，保证多次 replay 地址稳定。
 - [ ] 实现 prj.md 的 Prefill KV 分区写入优化（当前按参考语义保留全部 prefill KV）。
+- 决策点：完整版 / 缩减版（仅 attention+dense 子图）/ 先转 INT4 device 权重，
+  见开头“下一步优先级”。
 
 ### P2 Tensor Core INT4 GEMM
 - [x] 补充张量核 W4A16 路径（2026-09-19）：`moe_gemm_int4_tc` 在寄存器内把

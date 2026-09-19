@@ -136,6 +136,9 @@ cmake --build build-cuda -j8
 | INT4 MoE GEMM 标量（8×64×256, group=128） | max_err = 0.000010 |
 | INT4 MoE GEMM 张量核 W4A16（8×64×256） | rel_l2 = 0.0024 |
 | INT4 MoE GEMM 张量核 ragged（M=5,K=48） | rel_l2 = 0.0026 |
+| `GpuDecoder` vs CPU `MoEDecoder`（tiny，prefill） | rel_l2 = 0.0019 |
+| `GpuDecoder` vs CPU（tiny，6 步 decode） | worst rel_l2 = 0.0021 |
+| `Engine` CUDA vs CPU（tiny，greedy 4 步） | token 一致 |
 
 ### 5.4 DeepEncoder (Vision) 对齐
 
