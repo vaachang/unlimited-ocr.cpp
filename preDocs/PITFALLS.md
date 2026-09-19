@@ -151,3 +151,27 @@ cache 布局： [ prefill 区 (长度 P) ][ ring 区 (W=128) ]
   `block` 级输出（含 proj/residual/MLP）比较才定位准确。
 - C++ 的 `DeepEncoder` CPU 前向较慢，务必用 `OMP_NUM_THREADS=8`
   （CMake 已启用 OpenMP），否则 1024×1024 编码要十几分钟。
+
+## 10. R-SWA 参考导出的 position_ids 陷阱（2026-09-19）
+
+用 `tools/reference/export_reference.py` 做 teacher-forced 解码（直接调
+`model(input_ids=..., past_key_values=cache)`，不经过 `generate`）时，若不显式传
+`position_ids`，模型会走：
+
+```python
+past_key_values_length = past_key_values.get_seq_length()
+position_ids = arange(past_key_values_length, seq_length + past_key_values_length)
+```
+
+环形 cache 一旦写满（`P+W`），参考的 `SlidingWindowLlamaAttention` 是**原地覆写**
+`kcache[:, :, slot]`，`get_seq_length()` 恒等于 `P+W`，于是**所有后续 decode 的位置
+编码都被钉在 `P+W`**。表现：`--decode-steps > P+W` 时，从 `P+W+1` 步起参考 logits
+相对 C++ 阶跃偏大（rel_l2 从 0.005 跳到 0.3，最终到 1.19），但 `final K/V` 差异只有
+几十个最近槽位——极易误判成"环形覆写实现错误"。
+
+真实推理路径（`infer()` → `generate()`）在 `prepare_inputs_for_generation` 里用
+`attention_mask.cumsum(-1)-1` 得到**递增**的 `position_ids`，不存在该现象。因此：
+- 对比/导出脚本必须显式传 `position_ids`（见 `export_reference.py` decode 循环）；
+- C++ `Engine` 递增 `pos` 的语义是正确的，不要为了迁就该导出而去 clamp 位置。
+
+修正后 `--decode-steps 140`：ring 后 logits rel_l2 ≤ 0.036，final K/V ≤ 0.03。

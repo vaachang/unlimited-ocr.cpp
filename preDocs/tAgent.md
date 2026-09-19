@@ -53,10 +53,14 @@
      24 步 greedy 在 `no_repeat_ngram_size=35, ngram_window=1024` 下 **24/24**。
 
 ### P1 降低路由翻转（提升对齐精度）
-- [ ] 在 MoE gate 前把激活按 bf16 舍入，复刻参考数值，减少近似并列的专家翻转。
+- [x] 在 MoE gate 前把激活按 bf16 舍入，复刻参考数值。（2026-09-19 尝试：
+      `MoEDecoder::set_bf16_rounding`，默认关闭；实测 set_mismatch 仍为 13，
+      **未能降低翻转**。翻转来自 attention/expert 的 f32-vs-bf16 累积漂移，
+      需要整链路 bf16 才可能对齐，暂缓。）
 - [ ] 逐层对比 attention 的 q/k/v、O 投影输出，定位除路由外的残差。
-- [ ] 增加 `--decode-steps 140`，覆盖 ring 真正发生覆写的阶段，验证 R-SWA
-      环形覆写路径与参考一致。
+- [x] 增加 `--decode-steps 140`，覆盖 ring 真正发生覆写的阶段，验证 R-SWA
+      环形覆写路径与参考一致。（已验证：ring 完成后 final K/V rel_l2
+      ≤ 0.03，decode logits rel_l2 ≤ 0.084。见 `ALIGNMENT.md` §6。）
 
 ### P1 CUDA 主路径接入（prj.md 要求 CUDA 生产构建）
 - [ ] 新增 `GpuTensor` / device KV cache；将 `MoEDecoder` 的 `Linear::forward`

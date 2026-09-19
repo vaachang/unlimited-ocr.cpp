@@ -193,3 +193,39 @@ OMP_NUM_THREADS=8 ./build/tools/compare_ocr --model models --ref /tmp/opencode/r
 3. **no-repeat-ngram 语义**：参考/SGLang 是"匹配 `ngram-1` 前缀并禁用其延续词、
    在 `[len-window, len-ngram+1)` 内搜索"，原实现按完整 n-gram 匹配。
    已在 `Sampler::apply_no_repeat_ngram` 修正。
+
+## 6. R-SWA 环形覆写验证（P1，已完成）
+
+用 `--decode-steps 140` 跑过 `P+W=16+128=144` 的覆写拐点（`ref_decoder140`）：
+
+```bash
+./.venv/bin/python tools/reference/export_reference.py --model models \
+    --out /tmp/opencode/ref_decoder140 --mode decoder --seq 16 --decode-steps 140
+./build/tools/compare_reference --model models --ref /tmp/opencode/ref_decoder140
+```
+
+| 项目 | 结果 |
+|---|---|
+| decode logits rel_l2（ring 前，step ≤128） | ≤ 0.084 |
+| decode logits rel_l2（ring 后，step ≥129） | ≤ 0.036 |
+| final K cache rel_l2（144 槽，12 层） | **≤ 0.015** |
+| final V cache rel_l2 | **≤ 0.030** |
+
+结论：C++ `RSWACache::append_decode` 的 warmup/ring 指针与参考完全一致。
+
+### 6.1 一个导出侧陷阱（不是引擎 bug）
+
+`export_reference.py` 最初在直接调用 `model(...)` 做 teacher-forced 解码时**没有显式
+传 `position_ids`**。此时模型用 `arange(past_key_values.get_seq_length(), ...)` 生成
+位置，而环形 cache 写满后 `get_seq_length()` 恒为 `P+W`，导致**位置编码从第 145 步起
+被钉在 144**，参考 logits 出现阶跃误差（rel_l2 1.19）。真实 `infer()`/`generate` 用
+不断增长的 `attention_mask.cumsum` 得到递增位置，不存在该问题。导出脚本已显式传
+`position_ids`，修正后环后 logits rel_l2 回到 ≤0.036。详见 `PITFALLS.md` §10。
+
+### 6.2 bf16 舍入尝试（未生效）
+
+`MoEDecoder::set_bf16_rounding(true)` 会把 MLP/MoE 前的 RMSNorm 输出舍入到 bf16，
+以模仿参考 gate 的 `hidden_states.type(torch.float32)`。实测 prefill
+`set_mismatch` 仍为 13/176（per-layer 分布不变）。根因是 router 输入已经因
+attention/expert 的 f32 累积而偏离参考 bf16 激活超过 1 ulp，仅舍入最后一步无效。
+保留为可选开关，默认关闭。
