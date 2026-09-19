@@ -48,10 +48,18 @@ void rswa_attention(const float* q, const float* kcache, const float* vcache, in
                     cudaStream_t stream = 0);
 
 // MoE INT4 GEMM: y[m,n] = x[m,k] * dequant(W_int4[n,k]); W is packed 2-per-byte
-// with per-group affine scale/zero.
+// with per-group affine scale/zero.  Scalar reference (correctness baseline).
 void moe_gemm_int4(const float* x, const std::uint8_t* packed, const float* scales,
                    const float* zeros, int m, int n, int k, int group_size, float* y,
                    cudaStream_t stream = 0);
+
+// Tensor-core W4A16 variant: INT4 weights are dequantized to bf16 in registers
+// and multiplied with bf16 activations via `mma.sync.aligned.m16n8k16` with an
+// f32 accumulator.  Same signature and numerics (up to bf16 rounding) as
+// `moe_gemm_int4`.
+void moe_gemm_int4_tc(const float* x, const std::uint8_t* packed, const float* scales,
+                      const float* zeros, int m, int n, int k, int group_size, float* y,
+                      cudaStream_t stream = 0);
 
 // Device information.
 struct DeviceInfo {

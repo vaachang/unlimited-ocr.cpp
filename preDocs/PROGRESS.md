@@ -131,7 +131,9 @@ cmake --build build-cuda -j8
 | R-SWA decode attention（kv_len=307, heads=10, hd=128） | max_err = 0.000000 |
 | `GpuRSWACache` 环形覆写（W=8, P=4, 24 步） | cache K/V err = 0；decode err = 1e-6 |
 | `GpuRSWACache` prefill causal attention | max_err = 0.000001 |
-| INT4 MoE GEMM（8×64×256, group=128） | max_err = 0.000010 |
+| INT4 MoE GEMM 标量（8×64×256, group=128） | max_err = 0.000010 |
+| INT4 MoE GEMM 张量核 W4A16（8×64×256） | rel_l2 = 0.0024 |
+| INT4 MoE GEMM 张量核 ragged（M=5,K=48） | rel_l2 = 0.0026 |
 
 ### 5.4 DeepEncoder (Vision) 对齐
 

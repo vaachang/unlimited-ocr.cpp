@@ -80,8 +80,17 @@
 - [ ] 实现 prj.md 的 Prefill KV 分区写入优化（当前按参考语义保留全部 prefill KV）。
 
 ### P2 Tensor Core INT4 GEMM
-- [ ] 将 `moe_gemm_int4.cu` 的标量反量化版替换/补充为
-      `mma.sync.aligned.m16n8k32.s4.s4.s32`（sm_120），并保留标量版做正确性基线。
+- [x] 补充张量核 W4A16 路径（2026-09-19）：`moe_gemm_int4_tc` 在寄存器内把
+      INT4 权重反量化为 bf16，用 `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`
+      计算，保留标量版 `moe_gemm_int4` 做正确性基线。
+      测试：`[8,64]x[256,256]` rel_l2 0.0024、ragged `M/K` rel_l2 0.0026。
+- [ ] **注意**：`prj.md` 写的 `s4.s4.s32` 要求 A/B 都是 INT4（即 W4A4），与同段的
+      “激活值 BF16 输入”矛盾。经确认采用 W4A16（内核内 INT4→BF16 反量化 +
+      bf16 tensor core），既保留权重带宽收益又保留 BF16 激活精度。
+
+### P2 Tensor Core 性能优化（后续）
+- [ ] 目前 TC kernel 每线程标量读取权重/激活；应改用 `ldmatrix` / 共享内存
+      staging + swizzle，并做 split-K，才能接近峰值。
 
 ### P2 分词器与性能记录
 - [ ] 分词器对齐已提前到 P0/E0 执行（见上），此处只保留性能与回归项。

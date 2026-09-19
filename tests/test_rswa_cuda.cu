@@ -251,17 +251,100 @@ int main() {
         std::vector<float> gpu_y(cpu_y.size());
         CUDA_CHECK(cudaMemcpy(gpu_y.data(), d_y, gpu_y.size() * sizeof(float),
                               cudaMemcpyDeviceToHost));
-        cudaFree(d_x);
-        cudaFree(d_y);
-        cudaFree(d_p);
-        cudaFree(d_s);
-        cudaFree(d_z);
-
         float max_err = 0.0f;
         for (std::size_t i = 0; i < cpu_y.size(); ++i)
             max_err = std::max(max_err, std::fabs(cpu_y[i] - gpu_y[i]));
         std::printf("INT4 MoE GEMM: [%d,%d]x[%d,%d] max_err=%.6f\n", m, n, k, k, max_err);
         if (max_err > 1e-3f) {
+            std::printf("  FAIL\n");
+            ++failures;
+        } else {
+            std::printf("  OK\n");
+        }
+
+        // tensor-core W4A16 variant (same buffers)
+        CUDA_CHECK(cudaMemset(d_y, 0, cpu_y.size() * sizeof(float)));
+        cuda::moe_gemm_int4_tc(d_x, d_p, d_s, d_z, m, n, k, group, d_y);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<float> tc_y(cpu_y.size());
+        CUDA_CHECK(cudaMemcpy(tc_y.data(), d_y, tc_y.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        float tc_err = 0.0f, rel = 0.0f, den = 0.0f;
+        for (std::size_t i = 0; i < cpu_y.size(); ++i) {
+            tc_err = std::max(tc_err, std::fabs(cpu_y[i] - tc_y[i]));
+            rel += (cpu_y[i] - tc_y[i]) * (cpu_y[i] - tc_y[i]);
+            den += cpu_y[i] * cpu_y[i];
+        }
+        const float tc_rel = std::sqrt(rel / (den + 1e-30));
+        std::printf("INT4 MoE GEMM (tensor-core bf16): [%d,%d]x[%d,%d] max_err=%.6f rel_l2=%.5f\n",
+                    m, n, k, k, tc_err, tc_rel);
+        // bf16 rounding of both operands bounds the error to ~1e-2 relative.
+        if (tc_rel > 0.02f) {
+            std::printf("  FAIL\n");
+            ++failures;
+        } else {
+            std::printf("  OK\n");
+        }
+
+        cudaFree(d_x);
+        cudaFree(d_y);
+        cudaFree(d_p);
+        cudaFree(d_s);
+        cudaFree(d_z);
+    }
+
+    // ---- tensor-core W4A16 with non-multiple-of-16 K and M ----
+    {
+        const int m = 5, n = 24, k = 48, group = 16;
+        auto w = rand_vec(rng, static_cast<std::size_t>(n) * k);
+        auto x = rand_vec(rng, static_cast<std::size_t>(m) * k);
+        QuantizedMatrix qm = quantize_int4_awq(w.data(), n, k, group);
+        std::vector<float> wf;
+        qm.dequantize(wf);
+        std::vector<float> cpu_y(static_cast<std::size_t>(m) * n, 0.0f);
+        for (int i = 0; i < m; ++i)
+            for (int j = 0; j < n; ++j) {
+                float acc = 0.0f;
+                for (int c = 0; c < k; ++c)
+                    acc += x[static_cast<std::size_t>(i) * k + c] *
+                           wf[static_cast<std::size_t>(j) * k + c];
+                cpu_y[static_cast<std::size_t>(i) * n + j] = acc;
+            }
+
+        float *d_x, *d_y, *d_s, *d_z;
+        std::uint8_t* d_p;
+        CUDA_CHECK(cudaMalloc(&d_x, x.size() * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_y, cpu_y.size() * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_p, qm.packed.size()));
+        CUDA_CHECK(cudaMalloc(&d_s, qm.scales.size() * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_z, qm.zeros.size() * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(d_x, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_p, qm.packed.data(), qm.packed.size(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_s, qm.scales.data(), qm.scales.size() * sizeof(float),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_z, qm.zeros.data(), qm.zeros.size() * sizeof(float),
+                              cudaMemcpyHostToDevice));
+        cuda::moe_gemm_int4_tc(d_x, d_p, d_s, d_z, m, n, k, group, d_y);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<float> tc_y(cpu_y.size());
+        CUDA_CHECK(cudaMemcpy(tc_y.data(), d_y, tc_y.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        float err = 0.0f, rn = 0.0f, rd = 0.0f;
+        for (std::size_t i = 0; i < cpu_y.size(); ++i) {
+            err = std::max(err, std::fabs(cpu_y[i] - tc_y[i]));
+            rn += (cpu_y[i] - tc_y[i]) * (cpu_y[i] - tc_y[i]);
+            rd += cpu_y[i] * cpu_y[i];
+        }
+        const float rel = std::sqrt(rn / (rd + 1e-30));
+        cudaFree(d_x);
+        cudaFree(d_y);
+        cudaFree(d_p);
+        cudaFree(d_s);
+        cudaFree(d_z);
+        std::printf("INT4 MoE GEMM (tensor-core, ragged M/K): [%d,%d]x[%d,%d] max_err=%.6f "
+                    "rel_l2=%.5f\n",
+                    m, n, k, k, err, rel);
+        if (rel > 0.02f) {
             std::printf("  FAIL\n");
             ++failures;
         } else {

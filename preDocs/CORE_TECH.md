@@ -82,7 +82,8 @@ MoE 权重在 `DecoderWeights::load(..., quantize_experts_int4=true)` 时按需�
 | 文件 | 内核 | 说明 |
 |---|---|---|
 | `rswa_attention.cu` | `rswa_decode_kernel` | 每 head 一个 block，在线 softmax 遍历 `kv_len`，`__ldg` 读 cache，无 score 矩阵 |
-| `moe_gemm_int4.cu` | `moe_gemm_int4_kernel` | AWQ 反量化 + FP32 累加（tensor-core mma 留作后续） |
+| `moe_gemm_int4.cu` | `moe_gemm_int4_kernel` | AWQ 反量化 + FP32 累加（标量正确性基线） |
+| `moe_gemm_int4.cu` | `moe_gemm_int4_tc_kernel` | **W4A16**：寄存器内 INT4→BF16 反量化 + `mma.m16n8k16.bf16`（f32 累加） |
 | `rmsnorm.cu` | `rmsnorm_kernel` | 块内归约 |
 | `rope_fused.cu` | `rope_kernel`, `rmsnorm_head_kernel` | 融合逐头 RMSNorm + RoPE |
 | `backend.cu` | `matmul_t(_bf16)`, `device_info` | 稠密 GEMM、设备信息 |
