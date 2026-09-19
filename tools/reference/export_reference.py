@@ -64,6 +64,19 @@ def run_decoder(args, model):
     for li in range(first_dense, n_layers):
         handles.append(model.model.layers[li].mlp.gate.register_forward_hook(make_hook(li)))
 
+    # Attention projections per layer (q/k pre-RoPE, v, o output).
+    attn_out = {}
+
+    def make_attn_hook(li, kind):
+        def hook(module, inp, output):
+            attn_out[(li, kind)] = output.detach().to(torch.float32).cpu()
+        return hook
+
+    for li in range(n_layers):
+        sa = model.model.layers[li].self_attn
+        for kind, mod in (("q", sa.q_proj), ("k", sa.k_proj), ("v", sa.v_proj), ("o", sa.o_proj)):
+            handles.append(mod.register_forward_hook(make_attn_hook(li, kind)))
+
     def save_routers(prefix):
         for li in sorted(gate_out):
             idx, w = gate_out[li]
@@ -72,10 +85,16 @@ def run_decoder(args, model):
             manifest["tensors"][f"{prefix}_router_w_{li}"] = save_np(
                 args.out, f"{prefix}_router_w_{li}", w)
 
+    def save_attn(prefix):
+        for (li, kind), t in attn_out.items():
+            manifest["tensors"][f"{prefix}_attn_{kind}_{li}"] = save_np(
+                args.out, f"{prefix}_attn_{kind}_{li}", t[0])
+
     with torch.no_grad():
         out = model(input_ids=input_ids, images=None, use_cache=True,
                     output_hidden_states=True, return_dict=True)
     save_routers("prefill")
+    save_attn("prefill")
 
     manifest["window"] = args.window
     manifest["tokens"] = ids
@@ -105,6 +124,7 @@ def run_decoder(args, model):
         tok = int(torch.argmax(logits).item())
         cur = torch.tensor([[tok]], dtype=torch.long, device=model.device)
         gate_out.clear()
+        attn_out.clear()
         # Pass explicit (increasing) position_ids: the direct forward would
         # otherwise derive them from the ring cache length, which stops growing
         # once the ring is full (real `generate` uses the growing mask instead).
@@ -114,6 +134,7 @@ def run_decoder(args, model):
                         position_ids=pos_ids, output_hidden_states=True, return_dict=True)
         if step < 2:
             save_routers(f"decode{step}")
+            save_attn(f"decode{step}")
         cache = out.past_key_values
         k0 = get_layer_cache(cache, 0)[0]
         rec = {

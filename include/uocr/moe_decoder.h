@@ -62,6 +62,16 @@ public:
     void clear_router_trace() { router_trace_.clear(); }
     void set_trace_router(bool v) { trace_router_ = v; }
 
+    // Per-layer attention projections (q/k pre-RoPE, v, o output), [seq, hidden].
+    // One entry appended per layer_forward call (used by compare_reference).
+    struct AttnTrace {
+        int seq = 0;
+        std::vector<float> q, k, v, o;
+    };
+    const std::vector<AttnTrace>& attn_trace() const { return attn_trace_; }
+    void clear_attn_trace() { attn_trace_.clear(); }
+    void set_trace_attn(bool v) { trace_attn_ = v; }
+
     // Round the MLP/MoE block input (post_attention_layernorm output) to bf16,
     // emulating the reference gate's `hidden_states.type(torch.float32)` on a
     // bf16 autocast activation.  Off by default; experiments show it does not
@@ -81,8 +91,10 @@ private:
     // scratch buffers (reused between calls to avoid allocations)
     mutable std::vector<float> scratch_;
     bool trace_router_ = false;
+    bool trace_attn_ = false;
     bool bf16_rounding_ = false;
     std::vector<std::vector<RouterTrace>> router_trace_;
+    std::vector<AttnTrace> attn_trace_;
 };
 
 // Standalone fused ops reused by tests.  These implement the reference

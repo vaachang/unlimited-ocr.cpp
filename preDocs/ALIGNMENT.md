@@ -229,3 +229,32 @@ OMP_NUM_THREADS=8 ./build/tools/compare_ocr --model models --ref /tmp/opencode/r
 `set_mismatch` 仍为 13/176（per-layer 分布不变）。根因是 router 输入已经因
 attention/expert 的 f32 累积而偏离参考 bf16 激活超过 1 ulp，仅舍入最后一步无效。
 保留为可选开关，默认关闭。
+
+## 7. 逐层 attention q/k/v/O 对比（P1，2026-09-19）
+
+`export_reference.py` 增加对每层 `self_attn.{q,k,v,o}_proj` 的 hook，导出
+`{prefill,decode0,decode1}_attn_{q,k,v,o}_{li}`；`MoEDecoder::set_trace_attn(true)` 在
+C++ 侧记录同样的张量；`compare_reference` 输出逐层 rel_l2：
+
+| 段 | q | k | v | o |
+|---|---|---|---|---|
+| prefill worst | 0.0245 | 0.0233 | 0.0437 | 0.0567 |
+| decode0 worst | 0.0222 | 0.0250 | 0.0473 | 0.0414 |
+| decode1 worst | 0.0123 | 0.0126 | 0.0216 | 0.0291 |
+
+prefill 逐层 q rel_l2（layer0→11）：
+`0.0018 0.0047 0.0043 0.0066 0.0064 0.0121 0.0188 0.0199 0.0191 0.0245 0.0232 0.0195`。
+
+**结论**：误差随层数单调累积（第 0 层 ~0.2% → 第 9 层 ~2.5%），v/O 投影比 q/k 稍大
+（v 无 RoPE、误差不会因旋转而部分抵消）。这是 **bf16 激活累积漂移**，不是实现错误：
+C++ 侧 `MoEDecoder` 全程 f32 累积，参考端为 bf16 autocast。它与第 3 节的 13/176 路由
+翻转同源，也解释了第 11 层 hidden 的 1.40（该层 RMS 小，少数 token 偏差占主导）。
+在最后 logits 上仍收敛到 <1%，greedy 完全一致。
+
+## 8. 复现
+
+```bash
+./.venv/bin/python tools/reference/export_reference.py --model models \
+    --out /tmp/opencode/ref_attn --mode decoder --seq 16 --decode-steps 4
+./build/tools/compare_reference --model models --ref /tmp/opencode/ref_attn
+```

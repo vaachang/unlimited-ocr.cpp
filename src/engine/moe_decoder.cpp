@@ -133,6 +133,14 @@ void MoEDecoder::layer_forward(int layer_idx, const Tensor& x, const std::vector
     L.k_proj.forward(normed.data(), k.data(), seq);
     L.v_proj.forward(normed.data(), v.data(), seq);
 
+    AttnTrace atrace;
+    if (trace_attn_) {
+        atrace.seq = seq;
+        atrace.q = q;
+        atrace.k = k;
+        atrace.v = v;
+    }
+
     ops::rope(q.data(), k.data(), positions.data(), seq, heads, kv_heads, hd, cfg_.rope_theta);
 
     if (prefill) {
@@ -146,6 +154,11 @@ void MoEDecoder::layer_forward(int layer_idx, const Tensor& x, const std::vector
 
     Tensor attn_out({seq, hidden});
     L.o_proj.forward(ctx.data(), attn_out.data(), seq);
+
+    if (trace_attn_) {
+        atrace.o.assign(attn_out.data(), attn_out.data() + attn_out.numel());
+        attn_trace_.push_back(std::move(atrace));
+    }
 
     Tensor h1({seq, hidden});
     for (i64 i = 0; i < h1.numel(); ++i) h1[i] = x[i] + attn_out[i];

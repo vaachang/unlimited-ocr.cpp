@@ -103,6 +103,30 @@ RouterDiff compare_routers(const std::vector<std::vector<MoEDecoder::RouterTrace
     return rd;
 }
 
+void compare_attn(const std::vector<MoEDecoder::AttnTrace>& tr, const std::string& dir,
+                  const json& tensors, const std::string& prefix, int n_layers,
+                  std::vector<double>& per_layer_q) {
+    static const char* names[4] = {"q", "k", "v", "o"};
+    double worst[4] = {0, 0, 0, 0};
+    for (int li = 0; li < n_layers && li < static_cast<int>(tr.size()); ++li) {
+        const MoEDecoder::AttnTrace& t = tr[li];
+        const std::vector<float>* got[4] = {&t.q, &t.k, &t.v, &t.o};
+        double layer_q = 0;
+        for (int ki = 0; ki < 4; ++ki) {
+            const std::string key = prefix + "_attn_" + names[ki] + "_" + std::to_string(li);
+            if (!tensors.contains(key)) continue;
+            std::vector<float> ref = load_bin(dir, tensors.at(key));
+            if (ref.size() != got[ki]->size()) continue;
+            Diff d = diff(got[ki]->data(), ref.data(), static_cast<i64>(ref.size()));
+            worst[ki] = std::max(worst[ki], d.rel_l2);
+            if (ki == 0) layer_q = d.rel_l2;
+        }
+        per_layer_q.push_back(layer_q);
+    }
+    std::printf("== %s attention projections: worst rel_l2 q=%.5f k=%.5f v=%.5f o=%.5f\n",
+                prefix.c_str(), worst[0], worst[1], worst[2], worst[3]);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -146,9 +170,20 @@ int main(int argc, char** argv) {
     cache.reset(seq);
 
     dec.set_trace_router(true);
+    dec.set_trace_attn(true);
     std::vector<float> logits;
     std::vector<Tensor> trace;
     dec.forward(inputs, positions, cache, /*prefill=*/true, 0, /*final_norm=*/true, logits, &trace);
+
+    if (tensors.contains("prefill_attn_q_0")) {
+        std::vector<double> per_layer_q;
+        compare_attn(dec.attn_trace(), ref_dir, tensors, "prefill", cfg.num_hidden_layers,
+                     per_layer_q);
+        std::printf("   per-layer q rel_l2 (layer0..):");
+        for (double v : per_layer_q) std::printf(" %.4f", v);
+        std::printf("\n");
+    }
+    dec.clear_attn_trace();
 
     std::printf("\n== prefill: per-layer hidden states (torch hidden_%d) ==\n", 0);
     double worst = 0;
@@ -236,7 +271,13 @@ int main(int argc, char** argv) {
             std::printf("           router: tokens=%d set_mismatch=%d weight_max_abs=%.4f\n",
                         rd.total, rd.set_mismatch, rd.weight_max_abs);
         }
+        if (s < 2 && tensors.contains("decode" + std::to_string(s) + "_attn_q_0")) {
+            std::vector<double> pq;
+            compare_attn(dec.attn_trace(), ref_dir, tensors, "decode" + std::to_string(s),
+                         cfg.num_hidden_layers, pq);
+        }
         dec.clear_router_trace();
+        dec.clear_attn_trace();
     }
     std::printf("== decode worst: hidden rel_l2=%.5f (step %zu), logits rel_l2=%.5f\n",
                 worst_dec_hidden, worst_dec_step, worst_dec_logits);

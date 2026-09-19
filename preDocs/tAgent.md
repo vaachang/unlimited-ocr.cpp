@@ -72,7 +72,10 @@
       `MoEDecoder::set_bf16_rounding`，默认关闭；实测 set_mismatch 仍为 13，
       **未能降低翻转**。翻转来自 attention/expert 的 f32-vs-bf16 累积漂移，
       需要整链路 bf16 才可能对齐，暂缓。）
-- [ ] 逐层对比 attention 的 q/k/v、O 投影输出，定位除路由外的残差。
+- [x] 逐层对比 attention 的 q/k/v、O 投影输出（2026-09-19）：`export_reference.py`
+      增加 q/k/v/o hook，`MoEDecoder::set_trace_attn` + `compare_reference` 输出逐层
+      rel_l2，q/k/v/o 分别 ≤0.024/0.023/0.044/0.057。误差随层数累积，确认除路由外
+      的残差是 **bf16 激活累积漂移**（非 bug），详见 `ALIGNMENT.md` §7。
 - [x] 增加 `--decode-steps 140`，覆盖 ring 真正发生覆写的阶段，验证 R-SWA
       环形覆写路径与参考一致。（已验证：ring 完成后 final K/V rel_l2
       ≤ 0.03，decode logits rel_l2 ≤ 0.084。见 `ALIGNMENT.md` §6。）
