@@ -54,6 +54,11 @@ public:
     void set_graph_scope(GraphScope s) { graph_scope_ = s; }
     GraphScope graph_scope() const { return graph_scope_; }
 
+    // Timing of the last decode step (CUDA events): decoder forward and the
+    // final lm_head projection + logits D2H.
+    double last_forward_ms() const { return last_forward_ms_; }
+    double last_logits_ms() const { return last_logits_ms_; }
+
     const ModelConfig& config() const { return cfg_; }
 
 private:
@@ -110,7 +115,7 @@ private:
     void ensure_scratch(int seq);
     void ensure_router_scratch(int seq);
     void final_logits(const float* hidden_dev, int seq, std::vector<float>& logits);
-    void final_logits_from_normed(std::vector<float>& logits);
+    void final_logits_from_normed(std::vector<float>& logits, cudaStream_t stream = 0);
 
     // CUDA-Graph decode path.
     void invalidate_graph();
@@ -124,6 +129,7 @@ private:
     GpuRSWACache cache_;
     std::vector<DevLayer> layers_;
     float* final_norm_ = nullptr;
+    DevLinear lm_head_;  // device bf16 copy for the final projection
 
     // scratch (device)
     void* scratch_ = nullptr;
@@ -137,6 +143,7 @@ private:
     float* d_pong_ = nullptr;
     float* d_normed_ = nullptr;
     float* d_hidden_ = nullptr;
+    float* d_logits_ = nullptr;  // [vocab_size]
 
     // device router scratch
     int* d_router_ids_ = nullptr;
@@ -144,6 +151,7 @@ private:
     int* d_assign_token_ = nullptr;
     float* d_assign_w_ = nullptr;
     int* d_count_ = nullptr;
+    float* d_act_ = nullptr;  // [n_experts, cap, moe_intermediate_size]
     int router_seq_ = 0;
     int router_cap_ = 0;
 
@@ -159,6 +167,8 @@ private:
     std::vector<cudaGraphExec_t> attn_graph_execs_;
     float* h_embed_pinned_ = nullptr;
     int* h_pos_pinned_ = nullptr;
+    cudaEvent_t ev_a_ = nullptr, ev_b_ = nullptr, ev_c_ = nullptr;
+    float last_forward_ms_ = 0.0f, last_logits_ms_ = 0.0f;
 };
 
 }  // namespace cuda

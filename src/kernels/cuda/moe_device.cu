@@ -1,15 +1,18 @@
-// Device-side MoE routing + fused "all experts, masked skip" MLP.
+// Device-side MoE routing + masked expert MLP kernels.
 //
-// Both kernels have a launch configuration that depends only on compile-time
-// model shape (never on the routing result), which is what makes the decode
-// step capturable by a CUDA Graph.  The router groups tokens per expert using
-// atomic counters; the expert kernel launches one block per expert and skips
-// the block immediately when the expert received no tokens.
+// All launch configurations depend only on static model shape (never on the
+// routing result), which is what makes the decode step capturable by a CUDA
+// Graph.  The router groups tokens per expert using atomic counters; the
+// expert kernels launch a fixed grid per expert and return immediately when
+// the expert received no tokens.
+//
+// The expert MLP is split into gate_up + down so the output-feature axis is
+// spread over many warps.  Each warp computes one output feature with
+// coalesced vectorized weight reads (one warp per row), mirroring the dense
+// matvec kernel.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
-
-#include <cstdio>
 
 #include "uocr/cuda_ops.h"
 
@@ -62,8 +65,7 @@ __global__ void moe_router_topk_kernel(const float* __restrict__ logits, int n_e
     }
     __syncthreads();
 
-    // Greedy top-k: one thread scans sequentially (n_experts is small).
-    if (threadIdx.x == 0) {
+    if (tid == 0) {
         for (int j = 0; j < top_k; ++j) {
             int best = -1;
             float bestv = -1e30f;
@@ -95,118 +97,171 @@ __global__ void moe_router_topk_kernel(const float* __restrict__ logits, int n_e
     }
 }
 
-__device__ __forceinline__ float bf16_to_f32(std::uint16_t h) {
-    return __bfloat162float(__ushort_as_bfloat16(h));
+// Warp-wide dot product of a bf16 row with `x`, coalesced and 2-wide
+// vectorized.  Result is valid on lane 0.
+__device__ __forceinline__ float warp_dot_bf16(const std::uint16_t* __restrict__ wrow,
+                                               const float* __restrict__ x, int k) {
+    const int lane = threadIdx.x & 31;
+    float acc = 0.0f;
+    int c = lane * 2;
+    for (; c + 1 < k; c += 64) {
+        const std::uint32_t two = *reinterpret_cast<const std::uint32_t*>(wrow + c);
+        const __nv_bfloat162 wb = *reinterpret_cast<const __nv_bfloat162*>(&two);
+        const float2 wf = __bfloat1622float2(wb);
+        acc += wf.x * x[c] + wf.y * x[c + 1];
+    }
+    if (c < k) acc += __bfloat162float(__ushort_as_bfloat16(wrow[c])) * x[c];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    return acc;
 }
 
-// Grid = n_experts.  Each block processes the tokens assigned to its expert.
-__global__ void moe_experts_masked_kernel(
-    const float* __restrict__ x, const std::uint16_t* const* __restrict__ gate_w,
-    const std::uint16_t* const* __restrict__ up_w,
-    const std::uint16_t* const* __restrict__ down_w, const int* __restrict__ assign_token,
-    const float* __restrict__ assign_w, const int* __restrict__ count, int cap, int hidden,
-    int inter, float* __restrict__ out) {
-    extern __shared__ float act[];
+// Same for a packed INT4 row with per-group (scale, zero).
+__device__ __forceinline__ float warp_dot_i4(const std::uint8_t* __restrict__ prow,
+                                             const float* __restrict__ sc,
+                                             const float* __restrict__ z,
+                                             const float* __restrict__ x, int k, int group) {
+    const int lane = threadIdx.x & 31;
+    float acc = 0.0f;
+    int c = lane * 2;
+    for (; c + 1 < k; c += 64) {
+        const std::uint8_t b = prow[c >> 1];
+        const float q0 = static_cast<float>(b & 0x0f);
+        const float q1 = static_cast<float>(b >> 4);
+        const int gg = c / group;
+        const float s = sc[gg], zz = z[gg];
+        acc += (q0 - zz) * s * x[c] + (q1 - zz) * s * x[c + 1];
+    }
+    if (c < k) {
+        const std::uint8_t b = prow[c >> 1];
+        const float q = static_cast<float>(b & 0x0f);
+        const int gg = c / group;
+        acc += (q - z[gg]) * sc[gg] * x[c];
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    return acc;
+}
+
+// act[e, s, i] = silu(gate_i(x_t)) * up_i(x_t); one warp per output i.
+__global__ void expert_gate_up_kernel(const float* __restrict__ x,
+                                      const std::uint16_t* const* __restrict__ gate_w,
+                                      const std::uint16_t* const* __restrict__ up_w,
+                                      const int* __restrict__ assign_token,
+                                      const int* __restrict__ count, int cap, int hidden, int inter,
+                                      float* __restrict__ act) {
     const int e = blockIdx.x;
     const int n = count[e];
     if (n <= 0) return;
-    const std::uint16_t* gw = gate_w[e];
-    const std::uint16_t* uw = up_w[e];
-    const std::uint16_t* dw = down_w[e];
-
+    const int warp = threadIdx.x >> 5;
+    const int i = blockIdx.y * (blockDim.x >> 5) + warp;
+    if (i >= inter) return;
+    const std::uint16_t* grow = gate_w[e] + static_cast<std::size_t>(i) * hidden;
+    const std::uint16_t* urow = up_w[e] + static_cast<std::size_t>(i) * hidden;
+    const int lane = threadIdx.x & 31;
     for (int s = 0; s < n; ++s) {
         const int t = assign_token[static_cast<std::size_t>(e) * cap + s];
-        const float w = assign_w[static_cast<std::size_t>(e) * cap + s];
         const float* xr = x + static_cast<std::size_t>(t) * hidden;
-
-        for (int i = threadIdx.x; i < inter; i += blockDim.x) {
-            const std::uint16_t* grow = gw + static_cast<std::size_t>(i) * hidden;
-            const std::uint16_t* urow = uw + static_cast<std::size_t>(i) * hidden;
-            float g = 0.0f, u = 0.0f;
-            for (int c = 0; c < hidden; ++c) {
-                const float xv = xr[c];
-                g += bf16_to_f32(grow[c]) * xv;
-                u += bf16_to_f32(urow[c]) * xv;
-            }
-            act[i] = (g / (1.0f + __expf(-g))) * u;
-        }
-        __syncthreads();
-
-        for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
-            const std::uint16_t* drow = dw + static_cast<std::size_t>(j) * inter;
-            float acc = 0.0f;
-            for (int c = 0; c < inter; ++c) acc += bf16_to_f32(drow[c]) * act[c];
-            atomicAdd(&out[static_cast<std::size_t>(t) * hidden + j], w * acc);
-        }
-        __syncthreads();
+        const float g = warp_dot_bf16(grow, xr, hidden);
+        const float u = warp_dot_bf16(urow, xr, hidden);
+        if (lane == 0)
+            act[(static_cast<std::size_t>(e) * cap + s) * inter + i] = (g / (1.0f + __expf(-g))) * u;
     }
 }
 
-// INT4 variant: activations stay f32, weights are AWQ INT4 group-quantized.
-__global__ void moe_experts_masked_int4_kernel(
-    const float* __restrict__ x, const std::uint8_t* __restrict__ gate_packed,
-    const float* __restrict__ gate_scales, const float* __restrict__ gate_zeros,
-    int gate_pstride, int gate_sstride, int gate_ng, const std::uint8_t* __restrict__ up_packed,
-    const float* __restrict__ up_scales, const float* __restrict__ up_zeros, int up_pstride,
-    int up_sstride, int up_ng, const std::uint8_t* __restrict__ down_packed,
-    const float* __restrict__ down_scales, const float* __restrict__ down_zeros, int down_pstride,
-    int down_sstride, int down_ng, const int* __restrict__ assign_token,
-    const float* __restrict__ assign_w, const int* __restrict__ count, int cap, int hidden,
-    int inter, int group, float* __restrict__ out) {
-    extern __shared__ float act[];
+// out[t] += w * down(act[e, s]); one warp per output j.
+__global__ void expert_down_kernel(const std::uint16_t* const* __restrict__ down_w,
+                                   const int* __restrict__ assign_token,
+                                   const float* __restrict__ assign_w, const int* __restrict__ count,
+                                   int cap, int hidden, int inter, const float* __restrict__ act,
+                                   float* __restrict__ out) {
     const int e = blockIdx.x;
     const int n = count[e];
     if (n <= 0) return;
-
-    const std::uint8_t* gp = gate_packed + static_cast<std::size_t>(e) * gate_pstride;
-    const float* gs = gate_scales + static_cast<std::size_t>(e) * gate_sstride;
-    const float* gz = gate_zeros + static_cast<std::size_t>(e) * gate_sstride;
-    const std::uint8_t* up_p = up_packed + static_cast<std::size_t>(e) * up_pstride;
-    const float* us = up_scales + static_cast<std::size_t>(e) * up_sstride;
-    const float* uz = up_zeros + static_cast<std::size_t>(e) * up_sstride;
-    const std::uint8_t* dp = down_packed + static_cast<std::size_t>(e) * down_pstride;
-    const float* ds = down_scales + static_cast<std::size_t>(e) * down_sstride;
-    const float* dz = down_zeros + static_cast<std::size_t>(e) * down_sstride;
-
-    const int gpr = (hidden + 1) / 2;  // gate/up packed row stride (bytes)
-    const int dpr = (inter + 1) / 2;   // down packed row stride (bytes)
-
+    const int warp = threadIdx.x >> 5;
+    const int j = blockIdx.y * (blockDim.x >> 5) + warp;
+    if (j >= hidden) return;
+    const std::uint16_t* drow = down_w[e] + static_cast<std::size_t>(j) * inter;
+    const int lane = threadIdx.x & 31;
     for (int s = 0; s < n; ++s) {
-        const int t = assign_token[static_cast<std::size_t>(e) * cap + s];
-        const float w = assign_w[static_cast<std::size_t>(e) * cap + s];
-        const float* xr = x + static_cast<std::size_t>(t) * hidden;
-
-        for (int i = threadIdx.x; i < inter; i += blockDim.x) {
-            const std::uint8_t* grow = gp + static_cast<std::size_t>(i) * gpr;
-            const std::uint8_t* urow = up_p + static_cast<std::size_t>(i) * gpr;
-            float gv = 0.0f, uv = 0.0f;
-            for (int c = 0; c < hidden; ++c) {
-                const int gg = c / group;
-                const std::uint8_t gb = grow[c >> 1];
-                const int gq = (c & 1) ? (gb >> 4) : (gb & 0x0f);
-                const std::uint8_t ub = urow[c >> 1];
-                const int uq = (c & 1) ? (ub >> 4) : (ub & 0x0f);
-                const float xv = xr[c];
-                gv += (static_cast<float>(gq) - gz[i * gate_ng + gg]) * gs[i * gate_ng + gg] * xv;
-                uv += (static_cast<float>(uq) - uz[i * up_ng + gg]) * us[i * up_ng + gg] * xv;
-            }
-            act[i] = (gv / (1.0f + __expf(-gv))) * uv;
-        }
-        __syncthreads();
-
-        for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
-            const std::uint8_t* drow = dp + static_cast<std::size_t>(j) * dpr;
-            float acc = 0.0f;
-            for (int c = 0; c < inter; ++c) {
-                const int gg = c / group;
-                const std::uint8_t db = drow[c >> 1];
-                const int dq = (c & 1) ? (db >> 4) : (db & 0x0f);
-                acc += (static_cast<float>(dq) - dz[j * down_ng + gg]) * ds[j * down_ng + gg] *
-                       act[c];
-            }
+        const float* a = act + (static_cast<std::size_t>(e) * cap + s) * inter;
+        const float acc = warp_dot_bf16(drow, a, inter);
+        if (lane == 0) {
+            const int t = assign_token[static_cast<std::size_t>(e) * cap + s];
+            const float w = assign_w[static_cast<std::size_t>(e) * cap + s];
             atomicAdd(&out[static_cast<std::size_t>(t) * hidden + j], w * acc);
         }
-        __syncthreads();
+    }
+}
+
+__global__ void expert_gate_up_int4_kernel(
+    const float* __restrict__ x, const std::uint8_t* __restrict__ gate_packed,
+    const float* __restrict__ gate_scales, const float* __restrict__ gate_zeros, int gate_pstride,
+    int gate_sstride, int gate_ng, const std::uint8_t* __restrict__ up_packed,
+    const float* __restrict__ up_scales, const float* __restrict__ up_zeros, int up_pstride,
+    int up_sstride, int up_ng, const int* __restrict__ assign_token,
+    const int* __restrict__ count, int cap, int hidden, int inter, int group,
+    float* __restrict__ act) {
+    const int e = blockIdx.x;
+    const int n = count[e];
+    if (n <= 0) return;
+    const int warp = threadIdx.x >> 5;
+    const int i = blockIdx.y * (blockDim.x >> 5) + warp;
+    if (i >= inter) return;
+    const int gpr = (hidden + 1) / 2;
+    const std::uint8_t* grow =
+        gate_packed + static_cast<std::size_t>(e) * gate_pstride + static_cast<std::size_t>(i) * gpr;
+    const std::uint8_t* urow =
+        up_packed + static_cast<std::size_t>(e) * up_pstride + static_cast<std::size_t>(i) * gpr;
+    const float* gsc =
+        gate_scales + static_cast<std::size_t>(e) * gate_sstride + static_cast<std::size_t>(i) * gate_ng;
+    const float* gzr =
+        gate_zeros + static_cast<std::size_t>(e) * gate_sstride + static_cast<std::size_t>(i) * gate_ng;
+    const float* usc =
+        up_scales + static_cast<std::size_t>(e) * up_sstride + static_cast<std::size_t>(i) * up_ng;
+    const float* uzr =
+        up_zeros + static_cast<std::size_t>(e) * up_sstride + static_cast<std::size_t>(i) * up_ng;
+    const int lane = threadIdx.x & 31;
+    for (int s = 0; s < n; ++s) {
+        const int t = assign_token[static_cast<std::size_t>(e) * cap + s];
+        const float* xr = x + static_cast<std::size_t>(t) * hidden;
+        const float g = warp_dot_i4(grow, gsc, gzr, xr, hidden, group);
+        const float u = warp_dot_i4(urow, usc, uzr, xr, hidden, group);
+        if (lane == 0)
+            act[(static_cast<std::size_t>(e) * cap + s) * inter + i] = (g / (1.0f + __expf(-g))) * u;
+    }
+}
+
+__global__ void expert_down_int4_kernel(
+    const std::uint8_t* __restrict__ down_packed, const float* __restrict__ down_scales,
+    const float* __restrict__ down_zeros, int down_pstride, int down_sstride, int down_ng,
+    const int* __restrict__ assign_token, const float* __restrict__ assign_w,
+    const int* __restrict__ count, int cap, int hidden, int inter, int group,
+    const float* __restrict__ act, float* __restrict__ out) {
+    const int e = blockIdx.x;
+    const int n = count[e];
+    if (n <= 0) return;
+    const int warp = threadIdx.x >> 5;
+    const int j = blockIdx.y * (blockDim.x >> 5) + warp;
+    if (j >= hidden) return;
+    const int dpr = (inter + 1) / 2;
+    const std::uint8_t* drow =
+        down_packed + static_cast<std::size_t>(e) * down_pstride + static_cast<std::size_t>(j) * dpr;
+    const float* dsc =
+        down_scales + static_cast<std::size_t>(e) * down_sstride + static_cast<std::size_t>(j) * down_ng;
+    const float* dzr =
+        down_zeros + static_cast<std::size_t>(e) * down_sstride + static_cast<std::size_t>(j) * down_ng;
+    const int lane = threadIdx.x & 31;
+    for (int s = 0; s < n; ++s) {
+        const float* a = act + (static_cast<std::size_t>(e) * cap + s) * inter;
+        const float acc = warp_dot_i4(drow, dsc, dzr, a, inter, group);
+        if (lane == 0) {
+            const int t = assign_token[static_cast<std::size_t>(e) * cap + s];
+            const float w = assign_w[static_cast<std::size_t>(e) * cap + s];
+            atomicAdd(&out[static_cast<std::size_t>(t) * hidden + j], w * acc);
+        }
     }
 }
 
@@ -227,13 +282,17 @@ void moe_router_topk(const float* router_logits, int seq, int n_experts, int top
 void moe_experts_masked(const float* x, int seq, const std::uint16_t* const* gate_w,
                         const std::uint16_t* const* up_w, const std::uint16_t* const* down_w,
                         const int* assign_token, const float* assign_w, const int* count,
-                        int n_experts, int cap, int hidden, int inter, float* out,
+                        int n_experts, int cap, int hidden, int inter, float* act, float* out,
                         cudaStream_t stream) {
     if (n_experts == 0) return;
-    const int threads = 256;
-    const std::size_t shmem = static_cast<std::size_t>(inter) * sizeof(float);
-    moe_experts_masked_kernel<<<n_experts, threads, shmem, stream>>>(
-        x, gate_w, up_w, down_w, assign_token, assign_w, count, cap, hidden, inter, out);
+    const int threads = 256;  // 8 warps
+    const int warps = threads / 32;
+    const dim3 gu_grid(n_experts, (inter + warps - 1) / warps);
+    expert_gate_up_kernel<<<gu_grid, threads, 0, stream>>>(x, gate_w, up_w, assign_token, count,
+                                                           cap, hidden, inter, act);
+    const dim3 d_grid(n_experts, (hidden + warps - 1) / warps);
+    expert_down_kernel<<<d_grid, threads, 0, stream>>>(down_w, assign_token, assign_w, count, cap,
+                                                       hidden, inter, act, out);
     (void)seq;
 }
 
@@ -244,15 +303,20 @@ void moe_experts_masked_int4(
     int up_sstride, int up_ng, const std::uint8_t* down_packed, const float* down_scales,
     const float* down_zeros, int down_pstride, int down_sstride, int down_ng,
     const int* assign_token, const float* assign_w, const int* count, int n_experts, int cap,
-    int hidden, int inter, int group, float* out, cudaStream_t stream) {
+    int hidden, int inter, int group, float* act, float* out, cudaStream_t stream) {
     if (n_experts == 0) return;
     const int threads = 256;
-    const std::size_t shmem = static_cast<std::size_t>(inter) * sizeof(float);
-    moe_experts_masked_int4_kernel<<<n_experts, threads, shmem, stream>>>(
+    const int warps = threads / 32;
+    const dim3 gu_grid(n_experts, (inter + warps - 1) / warps);
+    expert_gate_up_int4_kernel<<<gu_grid, threads, 0, stream>>>(
         x, gate_packed, gate_scales, gate_zeros, gate_pstride, gate_sstride, gate_ng, up_packed,
-        up_scales, up_zeros, up_pstride, up_sstride, up_ng, down_packed, down_scales, down_zeros,
-        down_pstride, down_sstride, down_ng, assign_token, assign_w, count, cap, hidden, inter,
-        group, out);
+        up_scales, up_zeros, up_pstride, up_sstride, up_ng, assign_token, count, cap, hidden, inter,
+        group, act);
+    const dim3 d_grid(n_experts, (hidden + warps - 1) / warps);
+    expert_down_int4_kernel<<<d_grid, threads, 0, stream>>>(down_packed, down_scales, down_zeros,
+                                                           down_pstride, down_sstride, down_ng,
+                                                           assign_token, assign_w, count, cap,
+                                                           hidden, inter, group, act, out);
     (void)seq;
 }
 

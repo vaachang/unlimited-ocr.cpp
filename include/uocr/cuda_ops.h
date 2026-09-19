@@ -18,6 +18,11 @@ void matmul_t(const float* x, const float* w, const float* bias, float* y, int m
 void matmul_t_bf16(const float* x, const std::uint16_t* w, const float* bias, float* y, int m,
                    int n, int k, cudaStream_t stream = 0);
 
+// y[n] = W[n,k] * x[k] + bias (single activation vector).  Unlike the tiled
+// GEMM this reads each weight exactly once, which matters for m == 1 decode.
+void matvec_bf16(const float* x, const std::uint16_t* w, const float* bias, float* y, int n,
+                 int k, cudaStream_t stream = 0);
+
 // out[r,c] = x[r,c] / rms(x[r,:]) * weight[c]
 void rmsnorm(const float* x, const float* weight, float* out, int rows, int cols, float eps,
              cudaStream_t stream = 0);
@@ -74,10 +79,12 @@ void moe_router_topk(const float* router_logits, int seq, int n_experts, int top
 // over the tokens assigned to its expert (at most `cap`) and scatter-adds the
 // weighted expert output into `out` [seq, hidden].  Gate/up/down weight tables
 // are device pointer arrays of length n_experts.
+// `act` is a caller-owned workspace of [n_experts, cap, inter] floats used to
+// stage the gate/up activation between the two expert kernels.
 void moe_experts_masked(const float* x, int seq, const std::uint16_t* const* gate_w,
                         const std::uint16_t* const* up_w, const std::uint16_t* const* down_w,
                         const int* assign_token, const float* assign_w, const int* count,
-                        int n_experts, int cap, int hidden, int inter, float* out,
+                        int n_experts, int cap, int hidden, int inter, float* act, float* out,
                         cudaStream_t stream = 0);
 
 // INT4 (AWQ) variant of `moe_experts_masked`.  Weight tables are concatenated
@@ -90,7 +97,7 @@ void moe_experts_masked_int4(
     int up_sstride, int up_ng, const std::uint8_t* down_packed, const float* down_scales,
     const float* down_zeros, int down_pstride, int down_sstride, int down_ng,
     const int* assign_token, const float* assign_w, const int* count, int n_experts, int cap,
-    int hidden, int inter, int group, float* out, cudaStream_t stream = 0);
+    int hidden, int inter, int group, float* act, float* out, cudaStream_t stream = 0);
 
 // MoE INT4 GEMM: y[m,n] = x[m,k] * dequant(W_int4[n,k]); W is packed 2-per-byte
 // with per-group affine scale/zero.  Scalar reference (correctness baseline).
