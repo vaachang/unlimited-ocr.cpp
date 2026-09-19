@@ -29,9 +29,12 @@
    [x] 同批完成 **prefill 走 device masked MoE**：prefill 复用解码的
    device router + 融合专家内核，prefill/请求 88 → 53 ms(INT4)/35 ms(BF16)。
    详见 `BENCHMARKS.md` §2.6、`CORE_TECH.md` §“批处理”。
-2. **Chunked/continuous prefill**：`generate_batch` 目前逐请求串行 prefill，长
-   prompt 时 prefill 主导墙钟。需要支持 ragged prefill（变长 + causal mask）或
-   chunked prefill，并纳入 CUDA Graph。
+2. [x] **Ragged prefill**（2026-09-19 完成）：`GpuDecoder::batch_prefill_embeds`
+   + `forward_ragged` + `rswa_write_prefill_ragged` / `rswa_attention_ragged`，
+   一步内新请求打包成一次变长前向（K/V 按 slot 散写，逐行 causal）。每专家
+   token>2 时走 TC GEMM，否则走 masked matvec。batch=16 整波 prefill
+   16×88ms→279ms(INT4)/370ms(BF16)；`Engine batch` 与逐请求 logits rel_l2=0。
+   [ ] 尚未纳入 CUDA Graph（见下条）。
 3. **Batched CUDA Graph**：现在 Graph 只覆盖单请求 seq=1 稳态。可为固定 batch
    shape 捕获 batched decode（按 batch size 缓存多个 Graph），去掉 batched
    decode 的 host 逐 kernel 发射。

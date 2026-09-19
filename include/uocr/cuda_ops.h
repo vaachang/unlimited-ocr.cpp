@@ -88,6 +88,22 @@ void rswa_attention_batch(const float* q, const float* kcache_base, const float*
                           int heads, int kv_heads, int head_dim, float* out,
                           cudaStream_t stream = 0);
 
+// Ragged multi-request prefill: `total` query tokens from several requests are
+// packed back-to-back.  Row `t` belongs to cache slot `d_slots[t]` at local
+// position `d_pos[t]`.
+// - `rswa_write_prefill_ragged` scatters row `t`'s K/V into
+//   `kcache_base[v_slots[t] * batch_cap + d_pos[t]]`.
+// - `rswa_attention_ragged` (grid=(total, heads)) lets row `t` causally attend
+//   its own slot's rows [0, d_pos[t]].
+void rswa_write_prefill_ragged(const float* k, const float* v, float* kcache_base,
+                               float* vcache_base, const int* d_slots, const int* d_pos,
+                               int total, int batch_cap, int kv_heads, int head_dim,
+                               cudaStream_t stream = 0);
+void rswa_attention_ragged(const float* q, const float* kcache_base, const float* vcache_base,
+                           const int* d_slots, const int* d_pos, int total, int batch_cap,
+                           int heads, int kv_heads, int head_dim, float* out,
+                           cudaStream_t stream = 0);
+
 // MoE router on device: softmax/sigmoid -> greedy top-k -> per-expert grouping.
 // `d_ids` / `d_weights` are [seq, top_k]; `d_assign_token` / `d_assign_w` are
 // [n_experts, cap] and `d_count` is [n_experts] (must be zeroed by the caller).

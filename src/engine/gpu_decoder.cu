@@ -278,6 +278,8 @@ GpuDecoder::~GpuDecoder() {
     f(d_batch_ring_);
     f(d_batch_prefill_);
     f(d_batch_slots_);
+    f(d_batch_row_slot_);
+    f(d_batch_last_idx_);
     f(d_logits_batch_);
     invalidate_graph();
     if (ev_a_) cudaEventDestroy(ev_a_);
@@ -782,7 +784,10 @@ void GpuDecoder::batch_configure(int slots, int capacity) {
     if (d_batch_ring_) { cudaFree(d_batch_ring_); d_batch_ring_ = nullptr; }
     if (d_batch_prefill_) { cudaFree(d_batch_prefill_); d_batch_prefill_ = nullptr; }
     if (d_batch_slots_) { cudaFree(d_batch_slots_); d_batch_slots_ = nullptr; }
+    if (d_batch_row_slot_) { cudaFree(d_batch_row_slot_); d_batch_row_slot_ = nullptr; }
+    if (d_batch_last_idx_) { cudaFree(d_batch_last_idx_); d_batch_last_idx_ = nullptr; }
     batch_slots_cap_ = 0;
+    ragged_slots_cap_ = 0;
     batch_slots_ = slots;
     batch_cap_ = capacity;
     batch_stride_ = cfg_.num_key_value_heads * cfg_.head_dim();
@@ -801,6 +806,7 @@ void GpuDecoder::batch_configure(int slots, int capacity) {
              "batch ring");
     cu_check(cudaMalloc(&d_batch_prefill_, slots * sizeof(int)), "batch prefill");
     cu_check(cudaMalloc(&d_batch_slots_, slots * sizeof(int)), "batch slots");
+    cu_check(cudaMalloc(&d_batch_last_idx_, slots * sizeof(int)), "batch last idx");
     batch_slots_cap_ = slots;
     cu_check(cudaMemset(d_batch_len_, 0, cfg_.num_hidden_layers * slots * sizeof(int)),
              "batch len zero");
@@ -884,6 +890,148 @@ void GpuDecoder::forward_batch(const float* x, int batch, const int* positions, 
     }
     cu_check(cudaMemcpyAsync(out, cur, static_cast<std::size_t>(batch) * h * sizeof(float),
                              cudaMemcpyDeviceToDevice, stream), "batch out copy");
+}
+
+void GpuDecoder::attention_block_ragged(int li, int total, const float* x, const int* positions,
+                                        const int* slots, float* h1, float* normed2,
+                                        cudaStream_t stream) {
+    const int h = cfg_.hidden_size;
+    const int heads = cfg_.num_attention_heads;
+    const int kv_heads = cfg_.num_key_value_heads;
+    const int hd = cfg_.head_dim();
+    DevLayer& L = layers_[li];
+    const int mi = std::max(cfg_.intermediate_size,
+                            cfg_.moe_intermediate_size * std::max(cfg_.n_shared_experts, 1));
+    LayerScratch s = layer_scratch(scratch_, total, h, mi);
+
+    cuda::rmsnorm(x, L.in_ln, s.normed, total, h, cfg_.rms_norm_eps, stream);
+    linear_forward(s.normed, L.q.w, L.q.bias, s.q, total, h, h, stream);
+    linear_forward(s.normed, L.k.w, L.k.bias, s.k, total, h, h, stream);
+    linear_forward(s.normed, L.v.w, L.v.bias, s.v, total, h, h, stream);
+    cuda::rope(s.q, s.k, positions, total, heads, kv_heads, hd, cfg_.rope_theta, stream);
+    cuda::rswa_write_prefill_ragged(s.k, s.v, batch_k_[li], batch_v_[li], slots, positions, total,
+                                    batch_cap_, kv_heads, hd, stream);
+    cuda::rswa_attention_ragged(s.q, batch_k_[li], batch_v_[li], slots, positions, total,
+                                batch_cap_, heads, kv_heads, hd, s.ctx, stream);
+    linear_forward(s.ctx, L.o.w, L.o.bias, s.attn, total, h, h, stream);
+
+    cu_check(cudaMemcpyAsync(h1, x, static_cast<std::size_t>(total) * h * sizeof(float),
+                             cudaMemcpyDeviceToDevice, stream), "ragged h1 copy");
+    cuda::add_scaled(h1, s.attn, 1.0f, total * h, stream);
+    cuda::rmsnorm(h1, L.post_ln, normed2, total, h, cfg_.rms_norm_eps, stream);
+}
+
+void GpuDecoder::forward_ragged(const float* x, int total, const int* positions, const int* slots,
+                                float* out, cudaStream_t stream) {
+    ensure_scratch(total);
+    ensure_router_scratch(total);
+    const int h = cfg_.hidden_size;
+    const int mi = std::max(cfg_.intermediate_size,
+                            cfg_.moe_intermediate_size * std::max(cfg_.n_shared_experts, 1));
+    // With few rows per expert the masked matvec wins (weights are read once
+    // per token but the kernel is well occupied); once several tokens share an
+    // expert, the per-expert tensor-core GEMM amortises the weight read and
+    // becomes much faster.  Crossover is around 2 tokens/expert.
+    const bool dev_moe = total <= 2 * cfg_.n_routed_experts;
+    const float* cur = x;
+    float* next = d_ping_;
+    for (int li = 0; li < cfg_.num_hidden_layers; ++li) {
+        LayerScratch s = layer_scratch(scratch_, total, h, mi);
+        attention_block_ragged(li, total, cur, positions, slots, s.h1, s.normed2, stream);
+        mlp_block(li, s.h1, s.normed2, total, dev_moe, next, stream);
+        cur = next;
+        next = (next == d_ping_) ? d_pong_ : d_ping_;
+    }
+    cu_check(cudaMemcpyAsync(out, cur, static_cast<std::size_t>(total) * h * sizeof(float),
+                             cudaMemcpyDeviceToDevice, stream), "ragged out copy");
+}
+
+void GpuDecoder::batch_prefill_embeds(const float* host_embeds, const std::vector<int>& starts,
+                                      const std::vector<int>& lengths,
+                                      const std::vector<int>& slots,
+                                      std::vector<std::vector<float>>& logits) {
+    const int requests = static_cast<int>(lengths.size());
+    UOCR_CHECK(requests > 0, "batch_prefill_embeds: no requests");
+    UOCR_CHECK(static_cast<int>(starts.size()) == requests &&
+                   static_cast<int>(slots.size()) == requests,
+               "batch_prefill_embeds: array size mismatch");
+    const int h = cfg_.hidden_size;
+    const int V = cfg_.vocab_size;
+    int total = 0;
+    for (int r = 0; r < requests; ++r) {
+        UOCR_CHECK(lengths[r] > 0, "batch_prefill_embeds: empty prompt");
+        UOCR_CHECK(starts[r] == total, "batch_prefill_embeds: non-contiguous starts");
+        UOCR_CHECK(slots[r] >= 0 && slots[r] < batch_slots_, "batch_prefill_embeds: slot out of range");
+        total += lengths[r];
+    }
+
+    ensure_scratch(total);
+    ensure_router_scratch(total);
+
+    std::vector<int> pos(static_cast<std::size_t>(total));
+    std::vector<int> row_slot(static_cast<std::size_t>(total));
+    for (int r = 0; r < requests; ++r)
+        for (int p = 0; p < lengths[r]; ++p) {
+            pos[static_cast<std::size_t>(starts[r] + p)] = p;
+            row_slot[static_cast<std::size_t>(starts[r] + p)] = slots[r];
+        }
+    if (total > ragged_slots_cap_) {
+        if (d_batch_row_slot_) cudaFree(d_batch_row_slot_);
+        cu_check(cudaMalloc(&d_batch_row_slot_, static_cast<std::size_t>(total) * sizeof(int)),
+                 "ragged row slot");
+        ragged_slots_cap_ = total;
+    }
+    cu_check(cudaMemcpy(d_xin_, host_embeds, static_cast<std::size_t>(total) * h * sizeof(float),
+                        cudaMemcpyHostToDevice), "ragged embeds H2D");
+    cu_check(cudaMemcpy(d_pos_, pos.data(), pos.size() * sizeof(int), cudaMemcpyHostToDevice),
+             "ragged pos H2D");
+    cu_check(cudaMemcpy(d_batch_row_slot_, row_slot.data(), row_slot.size() * sizeof(int),
+                        cudaMemcpyHostToDevice), "ragged slots H2D");
+
+    forward_ragged(d_xin_, total, d_pos_, d_batch_row_slot_, d_hidden_, 0);
+
+    // Publish the per-slot prefill state so subsequent batch_decode can run.
+    std::vector<int> starts_dev(static_cast<std::size_t>(requests));
+    for (int r = 0; r < requests; ++r) starts_dev[r] = starts[r] + lengths[r] - 1;
+    cu_check(cudaMemcpy(d_batch_last_idx_, starts_dev.data(), starts_dev.size() * sizeof(int),
+                        cudaMemcpyHostToDevice), "ragged last idx");
+    for (int r = 0; r < requests; ++r) {
+        const int slot = slots[r];
+        const int prefill_len = lengths[r];
+        const int zero = 0;
+        for (int l = 0; l < cfg_.num_hidden_layers; ++l) {
+            const int idx = l * batch_slots_ + slot;
+            cu_check(cudaMemcpy(d_batch_len_ + idx, &prefill_len, sizeof(int),
+                                cudaMemcpyHostToDevice), "ragged len");
+            cu_check(cudaMemcpy(d_batch_ring_ + idx, &zero, sizeof(int), cudaMemcpyHostToDevice),
+                     "ragged ring");
+        }
+        cu_check(cudaMemcpy(d_batch_prefill_ + slot, &prefill_len, sizeof(int),
+                            cudaMemcpyHostToDevice), "ragged prefill len");
+        slot_prefill_len_[slot] = prefill_len;
+    }
+
+    // Last-token logits for each request.
+    cu_check(cudaMemcpy(d_row_idx_, starts_dev.data(), starts_dev.size() * sizeof(int),
+                        cudaMemcpyHostToDevice), "ragged last idx copy");
+    cuda::gather_rows(d_ping_, d_hidden_, d_row_idx_, requests, h, 0);
+    cuda::rmsnorm(d_ping_, final_norm_, d_normed_, requests, h, cfg_.rms_norm_eps, 0);
+    if (requests > batch_logits_cap_) {
+        if (d_logits_batch_) cudaFree(d_logits_batch_);
+        cu_check(cudaMalloc(&d_logits_batch_,
+                            static_cast<std::size_t>(requests) * V * sizeof(float)),
+                 "ragged logits");
+        batch_logits_cap_ = requests;
+    }
+    cuda::matmul_t_bf16(d_normed_, lm_head_.w, nullptr, d_logits_batch_, requests, V, h, 0);
+    cu_check(cudaStreamSynchronize(0), "ragged sync");
+    std::vector<float> buf(static_cast<std::size_t>(requests) * V);
+    cu_check(cudaMemcpy(buf.data(), d_logits_batch_, buf.size() * sizeof(float),
+                        cudaMemcpyDeviceToHost), "ragged logits D2H");
+    logits.resize(requests);
+    for (int r = 0; r < requests; ++r)
+        logits[r].assign(buf.begin() + static_cast<std::size_t>(r) * V,
+                         buf.begin() + static_cast<std::size_t>(r + 1) * V);
 }
 
 void GpuDecoder::batch_decode(const std::vector<int>& tokens, const std::vector<int>& positions,

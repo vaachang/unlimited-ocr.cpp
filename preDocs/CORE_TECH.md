@@ -151,11 +151,17 @@ prefill 的 `matmul_t_bf16` 改为 64×64 分块 + shared memory staging（panel
 - **batch decode 流程**：`forward_batch` 逐层 `attention_block_batch` +
   `mlp_block(dev_moe=true)`（device router + masked 专家），最后一次性
   `matmul_t_bf16` lm_head 得到 `[B, V]` logits 并 D2H。
-- **prefill 也走 device MoE**：`EngineConfig::use_device_moe_prefill`（默认 true）。
-  单请求 prefill 中每个专家平均只有几个 token，逐专家发射 `moe_gemm_int4_tc`
-  产生 64×3 个小 GEMM/层，kernel 发射与低占用开销大；改为按 token 归组的
-  `moe_experts_masked[_int4]` 后 prefill 从 88ms 降到 53ms(INT4)/35ms(BF16)。
-  数学等价（同为 AWQ 反量化 + bf16/INT4 权重），`uocr_cuda_tests` 校验。
+- **ragged 多请求 prefill**：`GpuDecoder::batch_prefill_embeds(embeds, starts, lengths,
+  slots, logits)` 把一步内新请求的全部 token 打包成一个 `[total, h]` 前向。
+  - `rswa_write_prefill_ragged` 把第 t 行 K/V 直接散写到
+    `batch_k[l][slots[t]*cap + pos[t]]`；`rswa_attention_ragged`（grid=`(total, heads)`）
+    让第 t 行只 causal attend 自己 slot 的 `[0, pos[t]]`。
+  - 前向结束后按请求取最后一行做 final norm + lm_head，得到每个请求的首 token logits。
+  - MoE 选择：每专家 token 数 ≤2 时用 masked matvec（`dev_moe=true`），否则用逐专家
+    tensor-core GEMM（`moe_gemm_int4_tc`，M 即该专家 token 数）——大批量时权重只读
+    一次，prefill 从串行 16×88ms 降到整波 279ms(INT4)。
+  - `EngineConfig::use_device_moe_prefill`（默认 true）控制单请求 prefill
+    （`prefill_embeds`，OCR 路径）走 masked device MoE。
 
 ## 6. 与 `prj.md` 三大创新点的对应
 

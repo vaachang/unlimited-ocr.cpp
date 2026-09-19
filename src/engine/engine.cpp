@@ -316,35 +316,55 @@ std::vector<GenerationResult> Engine::generate_batch(const std::vector<std::vect
         const double t0 = now_ms();
         while (scheduler_->has_work()) {
             Batch b = scheduler_->build_batch();
-            // Admit / prefill new requests (one at a time into the scratch cache).
-            for (int id : b.prefill) {
-                Request* r = scheduler_->get(id);
-                if (!r) continue;
-                UOCR_CHECK(!free_slots.empty(), "generate_batch: no free slot");
-                const int slot = free_slots.back();
-                free_slots.pop_back();
-                id_slot[id] = slot;
-                const int P = static_cast<int>(r->prompt_tokens.size());
-                std::vector<float> embeds(static_cast<std::size_t>(P) * mcfg_.hidden_size);
-                for (int t = 0; t < P; ++t)
-                    weights_.embed_tokens.row(r->prompt_tokens[t],
-                                              embeds.data() + static_cast<std::size_t>(t) *
-                                                                  mcfg_.hidden_size);
-                std::vector<float> lg;
-                const double p0 = now_ms();
-                gpu_decoder_->prefill_embeds(embeds.data(), P, lg);
-                gpu_decoder_->batch_import_prefill(slot, P);
-                results[id].ttft_ms = now_ms() - p0;
-                history[id] = r->prompt_tokens;
-                scheduler_->mark_prefilled(id);
-                const int tok = sample(lg, history[id]);
-                if (tok == mcfg_.eos_token_id) {
-                    scheduler_->finish(id);
-                    release(id);
-                    continue;
+            // Admit / prefill new requests.  All requests admitted in this
+            // step are prefilled together as one ragged forward pass: the MoE
+            // expert GEMMs then see O(sum P_i) rows instead of one prompt at a
+            // time, and the per-request serial prefill wall-clock disappears.
+            if (!b.prefill.empty()) {
+                std::vector<int> pf_ids, starts, lengths, pf_slots;
+                std::vector<float> embeds;
+                const int h = mcfg_.hidden_size;
+                for (int id : b.prefill) {
+                    Request* r = scheduler_->get(id);
+                    if (!r) continue;
+                    UOCR_CHECK(!free_slots.empty(), "generate_batch: no free slot");
+                    const int slot = free_slots.back();
+                    free_slots.pop_back();
+                    id_slot[id] = slot;
+                    const int P = static_cast<int>(r->prompt_tokens.size());
+                    starts.push_back(static_cast<int>(embeds.size()) / h);
+                    lengths.push_back(P);
+                    pf_slots.push_back(slot);
+                    pf_ids.push_back(id);
+                    embeds.resize(embeds.size() + static_cast<std::size_t>(P) * h);
+                    float* dst = embeds.data() + static_cast<std::size_t>(starts.back()) * h;
+                    for (int t = 0; t < P; ++t)
+                        weights_.embed_tokens.row(r->prompt_tokens[t],
+                                                  dst + static_cast<std::size_t>(t) * h);
                 }
-                history[id].push_back(tok);
-                if (scheduler_->add_token(id, tok)) release(id);
+                if (!pf_ids.empty()) {
+                    std::vector<std::vector<float>> lgs;
+                    const double p0 = now_ms();
+                    gpu_decoder_->batch_prefill_embeds(embeds.data(), starts, lengths, pf_slots,
+                                                       lgs);
+                    const double pf_ms = now_ms() - p0;
+                    for (std::size_t r = 0; r < pf_ids.size(); ++r) {
+                        const int id = pf_ids[r];
+                        Request* req = scheduler_->get(id);
+                        if (!req || r >= lgs.size()) continue;
+                        results[id].ttft_ms = pf_ms;
+                        history[id] = req->prompt_tokens;
+                        scheduler_->mark_prefilled(id);
+                        const int tok = sample(lgs[r], history[id]);
+                        if (tok == mcfg_.eos_token_id) {
+                            scheduler_->finish(id);
+                            release(id);
+                            continue;
+                        }
+                        history[id].push_back(tok);
+                        if (scheduler_->add_token(id, tok)) release(id);
+                    }
+                }
             }
             // Decode every running request together.
             if (!b.decode.empty()) {

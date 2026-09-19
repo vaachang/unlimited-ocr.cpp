@@ -569,6 +569,66 @@ int main() {
                     worst <= 0.05 ? "OK" : "FAIL");
     }
 
+    // ---- ragged multi-request prefill vs per-request prefill ----
+    {
+        ModelConfig cfg;
+        cfg.vocab_size = 256;
+        cfg.hidden_size = 64;
+        cfg.intermediate_size = 128;
+        cfg.moe_intermediate_size = 32;
+        cfg.num_hidden_layers = 2;
+        cfg.num_attention_heads = 4;
+        cfg.num_key_value_heads = 4;
+        cfg.first_k_dense_replace = 1;
+        cfg.n_routed_experts = 8;
+        cfg.n_shared_experts = 1;
+        cfg.num_experts_per_tok = 2;
+        cfg.norm_topk_prob = true;
+        cfg.sliding_window = 8;
+        cfg.max_position_embeddings = 256;
+        cfg.projector_input_dim = 2048;
+        cfg.projector_n_embed = 64;
+
+        DecoderWeights w = DecoderWeights::random(cfg, 808);
+        cuda::GpuDecoder gpu(cfg, w);
+        std::vector<std::vector<int>> prompts = {{1, 2, 3, 4}, {5, 6}, {7, 8, 9, 10, 11}};
+        std::vector<int> slots = {2, 0, 1};
+        gpu.batch_configure(3, 16);  // capacity >= max prefill + window
+
+        const int h = cfg.hidden_size;
+        std::vector<float> embeds;
+        std::vector<int> starts, lengths;
+        for (std::size_t r = 0; r < prompts.size(); ++r) {
+            starts.push_back(static_cast<int>(embeds.size()) / h);
+            lengths.push_back(static_cast<int>(prompts[r].size()));
+            embeds.resize(embeds.size() + prompts[r].size() * h);
+            float* dst = embeds.data() + static_cast<std::size_t>(starts.back()) * h;
+            for (std::size_t t = 0; t < prompts[r].size(); ++t)
+                w.embed_tokens.row(prompts[r][t], dst + t * h);
+        }
+        std::vector<std::vector<float>> ragged;
+        gpu.batch_prefill_embeds(embeds.data(), starts, lengths, slots, ragged);
+
+        auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+            double num = 0, den = 0;
+            for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+                const double e = static_cast<double>(a[i]) - b[i];
+                num += e * e;
+                den += static_cast<double>(b[i]) * b[i];
+            }
+            return std::sqrt(num / (den + 1e-30));
+        };
+        float worst = 0.0f;
+        for (std::size_t r = 0; r < prompts.size(); ++r) {
+            std::vector<float> ref;
+            gpu.prefill_tokens(prompts[r], ref);
+            worst = std::max(worst, static_cast<float>(rel(ragged[r], ref)));
+        }
+        std::printf("Ragged prefill (%zu requests): worst rel_l2 vs per-request=%.5f %s\n",
+                    prompts.size(), worst, worst <= 0.05f ? "OK" : "FAIL");
+        if (worst > 0.05f) ++failures;
+    }
+
     // ---- Engine CUDA branch vs CPU branch (same tiny model) ----
     {
         ModelConfig cfg;

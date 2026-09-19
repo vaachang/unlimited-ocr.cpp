@@ -213,6 +213,97 @@ __global__ void rswa_attn_kernel(const float* __restrict__ q, const float* __res
     }
 }
 
+// Ragged prefill attention: one block per (query token, head).  Query row `t`
+// attends slot `d_slots[t]` at rows [0, d_pos[t]] (causal within its request).
+template <int MAX_HD>
+__global__ void rswa_attn_ragged_kernel(const float* __restrict__ q,
+                                        const float* __restrict__ kcache_base,
+                                        const float* __restrict__ vcache_base,
+                                        const int* __restrict__ d_slots,
+                                        const int* __restrict__ d_pos, int heads, int kv_heads,
+                                        int head_dim, int batch_cap, float scale,
+                                        float* __restrict__ out) {
+    const int t = blockIdx.x;
+    const int head = blockIdx.y;
+    const int slot = d_slots[t];
+    const int limit = d_pos[t] + 1;
+    const int tid = threadIdx.x;
+    const int group = heads / kv_heads;
+    const int kvh = head / group;
+    const int stride = kv_heads * head_dim;
+    const float* kcache = kcache_base + static_cast<std::size_t>(slot) * batch_cap * stride;
+    const float* vcache = vcache_base + static_cast<std::size_t>(slot) * batch_cap * stride;
+    const std::size_t qoff = (static_cast<std::size_t>(t) * heads + head) * head_dim;
+
+    __shared__ float q_sh[MAX_HD];
+    __shared__ float acc[MAX_HD];
+    __shared__ float red[256];
+    __shared__ float m_sh, l_sh;
+
+    if (tid == 0) {
+        m_sh = -1e30f;
+        l_sh = 0.0f;
+    }
+    if (tid < head_dim) {
+        q_sh[tid] = q[qoff + tid];
+        acc[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int tt = 0; tt < limit; ++tt) {
+        const std::size_t base = (static_cast<std::size_t>(tt) * kv_heads + kvh) * head_dim;
+        float part = 0.0f;
+        if (tid < head_dim) part = q_sh[tid] * kcache[base + tid];
+        red[tid] = part;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const float dot = red[0] * scale;
+            const float m_new = fmaxf(m_sh, dot);
+            const float alpha = __expf(m_sh - m_new);
+            const float beta = __expf(dot - m_new);
+            red[0] = alpha;
+            red[1] = beta;
+            m_sh = m_new;
+            l_sh = l_sh * alpha + beta;
+        }
+        __syncthreads();
+        const float alpha = red[0];
+        const float beta = red[1];
+        if (tid < head_dim) acc[tid] = acc[tid] * alpha + beta * vcache[base + tid];
+        __syncthreads();
+    }
+
+    if (tid < head_dim) {
+        const float inv = l_sh > 0.0f ? 1.0f / l_sh : 0.0f;
+        out[qoff + tid] = acc[tid] * inv;
+    }
+}
+
+// Ragged prefill K/V scatter: one block per query token, writing to its slot.
+__global__ void rswa_write_prefill_ragged_kernel(const float* __restrict__ k,
+                                                 const float* __restrict__ v,
+                                                 float* __restrict__ kcache_base,
+                                                 float* __restrict__ vcache_base,
+                                                 const int* __restrict__ d_slots,
+                                                 const int* __restrict__ d_pos, int batch_cap,
+                                                 int stride) {
+    const int t = blockIdx.x;
+    const int slot = d_slots[t];
+    const int pos = d_pos[t];
+    float* kc = kcache_base + (static_cast<std::size_t>(slot) * batch_cap + pos) * stride;
+    float* vc = vcache_base + (static_cast<std::size_t>(slot) * batch_cap + pos) * stride;
+    const float* kt = k + static_cast<std::size_t>(t) * stride;
+    const float* vt = v + static_cast<std::size_t>(t) * stride;
+    for (int i = threadIdx.x; i < stride; i += blockDim.x) {
+        kc[i] = kt[i];
+        vc[i] = vt[i];
+    }
+}
+
 // Batched append: one block per batch slot.  Each slot owns an independent ring
 // cursor and (possibly different) prefill length, read from the batch arrays.
 __global__ void rswa_append_batch_kernel(const float* __restrict__ k,
@@ -327,6 +418,38 @@ void rswa_attention_batch(const float* q, const float* kcache_base, const float*
         rswa_decode_batch_kernel<256><<<grid, threads, 0, stream>>>(
             q, kcache_base, vcache_base, d_len, d_slots, heads, kv_heads, head_dim, batch_cap,
             scale, out);
+}
+
+void rswa_attention_ragged(const float* q, const float* kcache_base, const float* vcache_base,
+                           const int* d_slots, const int* d_pos, int total, int batch_cap,
+                           int heads, int kv_heads, int head_dim, float* out,
+                           cudaStream_t stream) {
+    if (total <= 0) return;
+    const float scale = rsqrtf(static_cast<float>(head_dim));
+    const int threads = 256;
+    dim3 grid(total, heads);
+    if (head_dim <= 64)
+        rswa_attn_ragged_kernel<64><<<grid, threads, 0, stream>>>(
+            q, kcache_base, vcache_base, d_slots, d_pos, heads, kv_heads, head_dim, batch_cap,
+            scale, out);
+    else if (head_dim <= 128)
+        rswa_attn_ragged_kernel<128><<<grid, threads, 0, stream>>>(
+            q, kcache_base, vcache_base, d_slots, d_pos, heads, kv_heads, head_dim, batch_cap,
+            scale, out);
+    else
+        rswa_attn_ragged_kernel<256><<<grid, threads, 0, stream>>>(
+            q, kcache_base, vcache_base, d_slots, d_pos, heads, kv_heads, head_dim, batch_cap,
+            scale, out);
+}
+
+void rswa_write_prefill_ragged(const float* k, const float* v, float* kcache_base,
+                               float* vcache_base, const int* d_slots, const int* d_pos,
+                               int total, int batch_cap, int kv_heads, int head_dim,
+                               cudaStream_t stream) {
+    if (total <= 0) return;
+    const int stride = kv_heads * head_dim;
+    rswa_write_prefill_ragged_kernel<<<total, 256, 0, stream>>>(k, v, kcache_base, vcache_base,
+                                                                d_slots, d_pos, batch_cap, stride);
 }
 
 namespace {

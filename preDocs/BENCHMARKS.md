@@ -91,38 +91,43 @@ n=896, k=1280, group=128, iters=200（单次 GEMM 调用；`2*m*n*k` 计 FLOP）
 ## 2.6 连续批处理吞吐（`bench/bench_batch_*.txt`）
 
 `Engine::generate_batch`（scheduler + device batched decoder），prompt=64，steps=16；
-吞吐按总生成 token / 总墙钟计（**含每个请求的串行 prefill**，因此偏保守）。
-2026-09-19 两项优化后（batched attention kernel + prefill 走 device masked MoE）：
+吞吐按总生成 token / 总墙钟计。`prefill_ms` 列是**整波 ragged prefill 的墙钟**
+（每请求 ttft 都记同一值，表格取平均）。2026-09-19 三项优化后：
 
 | batch | BF16 tok/s | BF16 peak | INT4 tok/s | INT4 peak |
 |---|---|---|---|---|
-| 1 | 101.4 | 9288 MB | 92.3 | 2292 MB |
-| 2 | 88.5 | 9314 MB | 80.8 | 2318 MB |
-| 4 | 136.8 | 9366 MB | 118.3 | 2370 MB |
-| 8 | 191.3 | 9466 MB | 153.0 | 2470 MB |
-| 16 | **240.4** | 9660 MB | **179.9** | 2664 MB |
+| 1 | 99.4 | 9264 MB | 89.4 | 2268 MB |
+| 2 | 89.4 | 9318 MB | 82.3 | 2322 MB |
+| 4 | 115.1 | 9420 MB | 134.3 | 2424 MB |
+| 8 | 189.8 | 9636 MB | 216.5 | 2640 MB |
+| 16 | **298.0** | 10044 MB | **310.7** | 3048 MB |
 
-优化前对照（同命令，本次改动前）：
+优化前对照（同命令，本轮改动前；prefill 逐请求串行、masked MoE）：
 
 | batch | BF16 tok/s | INT4 tok/s | prefill/请求 |
 |---|---|---|---|
 | 8 | 74.3 | 105.7 | 88 ms |
 | 16 | 73.5 | 117.6 | 88 ms |
 
-- **Batched attention kernel**：`rswa_append_decode_batch` + `rswa_attention_batch`
-  （grid=(slots, heads)）把每步 attention 的 kernel 数从 `O(B·L)` 降到 `O(L)`。
-  合成小模型（launch-bound）收益最大：batch=16 吞吐 2828 → 6406 tok/s（2.3×）；
-  真实模型因 prefill/MoE 占主导，单纯此改动吞吐持平。
-- **prefill device MoE**：prefill 不再逐专家发射 `moe_gemm_int4_tc`（64×3 个小
-  GEMM/层），而是复用解码的 device router + 融合 masked 专家内核，按 token 归组。
-  prefill 从 88 ms 降到 53 ms（INT4）/ 35 ms（BF16）。这是真实模型吞吐提升的主因。
+三项优化：
 
-正确性：`uocr_cuda_tests` 的 `Engine batch` 用例用 4 个不同长度 prompt 对比
-batch 与 sequential device decode，token 完全一致（并对 CPU 一致）；
-`GpuDecoder prefill`、`Engine CUDA greedy` 同样通过。
+1. **Batched attention kernel**：`rswa_append_decode_batch` + `rswa_attention_batch`
+   （grid=`(B, heads)`，行→slot 由 `d_slots` 指定）把每步 attention 的 kernel 数从
+   `O(B·L)` 降到 `O(L)`。合成小模型（launch-bound）batch=16 吞吐 2828 → 8365 tok/s。
+2. **ragged 多请求 prefill**：一步内新请求打包成一次 `forward_ragged`，
+   K/V 用 `rswa_write_prefill_ragged` 直接散写到各自 slot，attention 用
+   `rswa_attention_ragged`（每行按自己的 slot/局部位置做 causal）。当每专家 token 数
+   >2 时走逐专家 tensor-core GEMM（`moe_gemm_int4_tc`，M≈96），否则走 masked matvec。
+   prefill 从“16×88ms 串行”降到整波 **279ms(INT4)/370ms(BF16)**。
+3. **prefill device MoE（小批量）**：每专家 token 少时（≤2）复用解码的 masked
+   专家内核，避免逐专家小 GEMM 的发射开销。
 
-剩余瓶颈：prefill 仍逐请求串行（未做 ragged/chunked prefill）；
-batched decode 未纳入 CUDA Graph（当前复用单请求 Graph 仅覆盖 batch=1）。
+正确性：新增单测把 ragged 多请求 prefill 的 logits 与逐请求 `prefill_tokens` 对比
+（rel_l2 = 0）；`Engine batch` / slot 复用 / 非恒等 slot 排列 / `GpuDecoder prefill` /
+`Engine CUDA greedy` 全部通过。
+
+剩余瓶颈：batched decode 未纳入 CUDA Graph（host 逐 kernel 发射）；
+`matmul_t_bf16`（dense/shared 投影）仍是 CUDA-core tiled GEMM（~2 TFLOPS，未用 TC）。
 
 ## 3. 数值对齐
 

@@ -38,6 +38,7 @@
 ✅ 连续批处理接入 device decoder（`Engine::generate_batch`，每 slot 独立 R-SWA KV）
 ✅ batched R-SWA attention/append 内核（每步 attention kernel 数 O(B·L)→O(L)）
 ✅ prefill 走 device masked MoE（prefill/请求 88→53ms INT4、35ms BF16）
+✅ ragged 多请求 prefill（整波一次前向，batch=16 prefill 串行 16×88ms→279ms）
 ```
 
 > 性能原始数据与汇总见 `BENCHMARKS.md` 和 `bench/` 目录。
@@ -169,7 +170,8 @@ cmake --build build-cuda -j8
 | R-SWA decode attention（kv_len=307, heads=10, hd=128） | max_err = 0.000000 |
 | `GpuRSWACache` 环形覆写（W=8, P=4, 24 步） | cache K/V err = 0；decode err = 1e-6 |
 | `GpuRSWACache` prefill causal attention | max_err = 0.000001 |
-| Batched R-SWA（B=3 变长 prefill, W=8, 24 步, 环形覆写）vs per-slot 内核 | attn err = 0；cache err = 0 |
+| Batched R-SWA（B=3 变长 prefill, W=8, 24 步, 环形覆写，非恒等 slot 排列） | attn err = 0；cache err = 0 |
+| ragged 多请求 prefill（3 请求，非恒等 slot）vs 逐请求 prefill logits | rel_l2 = 0 |
 | INT4 MoE GEMM 标量（8×64×256, group=128） | max_err = 0.000010 |
 | INT4 MoE GEMM 张量核 W4A16（8×64×256） | rel_l2 = 0.0024 |
 | INT4 MoE GEMM 张量核 ragged（M=5,K=48） | rel_l2 = 0.0026 |
@@ -212,19 +214,23 @@ P2（device router + 固定调度掩码 kernel + CUDA Graph、device INT4 权重
 指标表、可选 reference CTest）。最终回归：`compare_ocr` layout OK、
 visual rel_l2 0.04187、greedy **24/24**。
 
-2026-09-19 续做：**batched R-SWA attention/append 内核**（每步 attention 发射数
-O(B·L)→O(L)）与 **prefill 走 device masked MoE**（复用解码的融合专家内核）。
-真实模型 `bench_cuda_batch` batch=16：BF16 73.5→**240.4** tok/s、INT4 117.6→**179.9**
-tok/s，prefill/请求 88→35/53 ms。同时修复连续批处理的 **slot 映射错位**（`batch_decode`
-显式接收“行→slot”映射，见 `PITFALLS.md` §13）。回归：`uocr_cuda_tests` 全过（新增
-Batched R-SWA 非恒等排列用例，attn/cache err = 0）；20/20 CPU 单测通过。
+2026-09-19 续做三块：
+1. **batched R-SWA attention/append 内核**（每步 attention 发射数 O(B·L)→O(L)）；
+2. **ragged 多请求 prefill**（`forward_ragged` + ragged attention/scatter，一步内新请求
+   打包成一次前向；每专家 token>2 时走 TC GEMM）；
+3. **prefill device masked MoE**（小批量/单请求路径）。
+真实模型 `bench_cuda_batch` batch=16：BF16 73.5→**298.0** tok/s、INT4 117.6→**310.7**
+tok/s；batch=16 整波 prefill 16×88ms→279ms(INT4)/370ms(BF16)。同时修复连续批处理的
+**slot 映射错位**（`batch_decode` 显式接收“行→slot”映射，见 `PITFALLS.md` §13）。
+回归：`uocr_cuda_tests` 全过（新增 Batched R-SWA 非恒等排列、ragged prefill logits
+对齐、slot 复用用例）；20/20 CPU 单测通过。
 
 仍待完成（见 `tAgent.md`）：
 
-1. **Chunked/ragged prefill**：prefill 仍逐请求串行，长 prompt 时主导墙钟；
-   `moe_gemm_int4_tc` 的逐专家小 GEMM 已不再用于 prefill（改走 masked 路径）。
-2. **Batched CUDA Graph**：Graph 仅覆盖单请求 seq=1 稳态，batched decode 仍 host 逐
+1. **Batched CUDA Graph**：Graph 仅覆盖单请求 seq=1 稳态，batched decode 仍 host 逐
    kernel 发射。
+2. **dense/shared GEMM 上 tensor core**：`matmul_t_bf16` 仍是 CUDA-core tiled
+   （~2 TFLOPS），占 batch prefill 相当比例。
 3. **精度评测**：OmniDocBench v1.6（AWQ vs BF16）未接入。
 4. **Prefill KV 分区写入**：仍按参考语义保留全部 prefill KV（prj.md 的优化未做）。
 5. **TC 进一步调优**：swizzle / split-K / `cp.async` 双缓冲。

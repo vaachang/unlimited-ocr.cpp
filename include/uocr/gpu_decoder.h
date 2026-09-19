@@ -76,6 +76,13 @@ public:
     // of the configured slots, so requests are free to occupy any slot.
     void batch_decode(const std::vector<int>& tokens, const std::vector<int>& positions,
                       const std::vector<int>& slots, std::vector<std::vector<float>>& logits);
+    // Ragged multi-request prefill: `host_embeds` packs every request's prompt
+    // rows back-to-back; request r owns rows [starts[r], starts[r]+lengths[r])
+    // and writes into cache slot slots[r].  Returns the last-token logits per
+    // request (same order).
+    void batch_prefill_embeds(const float* host_embeds, const std::vector<int>& starts,
+                              const std::vector<int>& lengths, const std::vector<int>& slots,
+                              std::vector<std::vector<float>>& logits);
     int batch_slots() const { return batch_slots_; }
 
     const ModelConfig& config() const { return cfg_; }
@@ -151,6 +158,12 @@ private:
     void forward_batch(const float* x, int batch, const int* positions, const int* slots,
                        float* out, cudaStream_t stream);
 
+    // Ragged prefill layer pieces (device MoE; per-row slot/position).
+    void attention_block_ragged(int li, int total, const float* x, const int* positions,
+                                const int* slots, float* h1, float* normed2, cudaStream_t stream);
+    void forward_ragged(const float* x, int total, const int* positions, const int* slots,
+                        float* out, cudaStream_t stream);
+
     ModelConfig cfg_;
     const DecoderWeights* host_weights_ = nullptr;
     GpuRSWACache cache_;
@@ -206,6 +219,9 @@ private:
     int* d_batch_prefill_ = nullptr;         // [slots] per-slot prefill length
     int* d_batch_slots_ = nullptr;           // [batch] row -> slot mapping
     int batch_slots_cap_ = 0;                // allocated length of d_batch_slots_
+    int* d_batch_row_slot_ = nullptr;        // [ragged slots] row -> slot for prefill
+    int ragged_slots_cap_ = 0;               // allocated length of d_batch_row_slot_
+    int* d_batch_last_idx_ = nullptr;        // [slots] last-token row per request
     std::vector<int> slot_prefill_len_;      // [slots]
     float* d_logits_batch_ = nullptr;
     int batch_logits_cap_ = 0;
