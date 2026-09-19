@@ -552,10 +552,10 @@ void GpuDecoder::mlp_block(int li, const float* h1, const float* normed2, int se
                 DevLinear& g = L.experts[static_cast<std::size_t>(e) * 3 + 0];
                 DevLinear& u = L.experts[static_cast<std::size_t>(e) * 3 + 1];
                 DevLinear& d = L.experts[static_cast<std::size_t>(e) * 3 + 2];
-                cuda::matmul_t_bf16(s.xg, g.w, g.bias, s.gate, rows, inter, h, stream);
-                cuda::matmul_t_bf16(s.xg, u.w, u.bias, s.up, rows, inter, h, stream);
+                linear_forward(s.xg, g.w, g.bias, s.gate, rows, inter, h, stream);
+                linear_forward(s.xg, u.w, u.bias, s.up, rows, inter, h, stream);
                 cuda::silu_mul(s.gate, s.up, s.act, rows * inter, stream);
-                cuda::matmul_t_bf16(s.act, d.w, d.bias, s.yg, rows, h, inter, stream);
+                linear_forward(s.act, d.w, d.bias, s.yg, rows, h, inter, stream);
             }
             cuda::scatter_add_scaled(s.moe_out, s.yg, d_row_idx_, d_row_w_, rows, h, stream);
         }
