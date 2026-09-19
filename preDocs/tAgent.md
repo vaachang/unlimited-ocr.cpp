@@ -6,7 +6,7 @@
 
 ---
 
-## 下一阶段任务计划（2026-09-19 二次更新）
+## 下一阶段任务计划（2026-09-19 三次更新）
 
 进度与结果见 `PROGRESS.md`、`ALIGNMENT.md`、`PITFALLS.md`、`CORE_TECH.md`、
 `BENCHMARKS.md`（含 `bench/` 原始输出）。
@@ -16,36 +16,51 @@
 → P1 CUDA 设备端 decoder + Engine CUDA 分支 → P2 Tensor Core W4A16 GEMM
 → P2 CUDA Graph（device router + 固定调度掩码跳过）→ P2 device INT4 专家权重
 → P2 合并访存内核与分块 prefill GEMM → P1 attention 逐层残差定位
-→ P2 TC `ldmatrix`/shared-memory staging → **连续批处理接入 device decoder**。
-最终回归：`compare_ocr` greedy **24/24**；`uocr_cuda_tests` 全过。
+→ P2 TC `ldmatrix`/shared-memory staging → 连续批处理接入 device decoder
+→ **batched R-SWA attention/append 内核** → **ragged 多请求 prefill**
+→ **slot 映射 bug 修复**。
 
-**下一步优先级**（详见文末各节）：
+最终回归：`compare_ocr` greedy **24/24**（CPU 参考路径）；`uocr_cuda_tests` 全过
+（含 batched 排列 / ragged prefill / slot 复用）；CPU 单测 20/20。
 
-1. [x] **Batched attention kernel**（2026-09-19 完成）：新增
-   `rswa_append_decode_batch`（grid=B）与 `rswa_attention_batch`（grid=(B, heads)），
-   每步 attention kernel 数从 O(B·L) 降到 O(L)。合成模型 batch=16 吞吐
-   2828 → 6406 tok/s（2.3×）；真实模型因 prefill 主导，单项收益被掩盖，与下一项
-   合计后 BF16 batch=16 73.5 → 240.4 tok/s、INT4 117.6 → 179.9 tok/s。
-   [x] 同批完成 **prefill 走 device masked MoE**：prefill 复用解码的
-   device router + 融合专家内核，prefill/请求 88 → 53 ms(INT4)/35 ms(BF16)。
-   详见 `BENCHMARKS.md` §2.6、`CORE_TECH.md` §“批处理”。
-2. [x] **Ragged prefill**（2026-09-19 完成）：`GpuDecoder::batch_prefill_embeds`
-   + `forward_ragged` + `rswa_write_prefill_ragged` / `rswa_attention_ragged`，
-   一步内新请求打包成一次变长前向（K/V 按 slot 散写，逐行 causal）。每专家
-   token>2 时走 TC GEMM，否则走 masked matvec。batch=16 整波 prefill
-   16×88ms→279ms(INT4)/370ms(BF16)；`Engine batch` 与逐请求 logits rel_l2=0。
-   [ ] 尚未纳入 CUDA Graph（见下条）。
-3. **Batched CUDA Graph**：现在 Graph 只覆盖单请求 seq=1 稳态。可为固定 batch
-   shape 捕获 batched decode（按 batch size 缓存多个 Graph），去掉 batched
-   decode 的 host 逐 kernel 发射。
-4. **Prefill KV 分区写入优化**（prj.md 创新点三）：prefill 时按位置分区
-   （视觉区/环形区/gap 丢弃），节省 ~70% prefill KV 写入带宽。
-5. **TC 进一步调优**：`ldmatrix` 已完成；剩余 `swizzle` 减少 bank conflict、
+**连续批处理性能（真实模型，prompt=64，batch=16，RTX 5060 Ti）**：
+
+| 配置 | 本轮优化前 | 现在 |
+|---|---|---|
+| BF16 tok/s | 73.5 | **298.0** |
+| INT4 tok/s | 117.6 | **310.7** |
+| 整波 prefill（16 请求） | 16 × 88 ms 串行 | **279 ms** INT4 / 370 ms BF16 |
+
+> 三项改动：① batched attention（O(B·L)→O(L) 发射）；② ragged prefill（整波一次
+> 变长前向，K/V 按 slot 散写，逐行 causal）；③ 按每专家 token 数选择 masked matvec /
+> TC GEMM。详见 `BENCHMARKS.md` §2.6、`CORE_TECH.md` §5.5。
+
+**下一步优先级**（按收益/成本排序，详见文末各节）：
+
+1. **Batched CUDA Graph**（最大剩余项）：Graph 目前只覆盖单请求 seq=1 稳态。
+   batched decode 仍由 host 逐 kernel 发射（每步 ~275 个 kernel）。可为固定 batch
+   shape 捕获 batched decode（按 batch size / 活跃 slot 组合缓存多个 Graph），
+   用 pinned staging 更新 token/pos/slot。注意 slots 会随请求进出变化，
+   需要“活跃集合变化即重捕获”或把 slot 映射做成设备端结构。
+2. **dense/shared 投影上 tensor core**：`matmul_t_bf16` 仍是 CUDA-core 分块 GEMM
+   （实测 ~2 TFLOPS），在 batch prefill 中占显著比例。用与 `moe_gemm_int4_tc`
+   相同的 `ldmatrix`/MMA 路径实现 bf16×bf16 tensor-core GEMM。
+3. **Prefill KV 分区写入优化**（prj.md 创新点三）：prefill 时按位置分区
+   （视觉区/环形区/gap 丢弃），节省 ~70% prefill KV 写入带宽（当前按参考语义
+   保留全部 prefill KV）。
+4. **TC 进一步调优**：`ldmatrix` 已完成；剩余 `swizzle` 减少 bank conflict、
    split-K（小 m 场景）、`cp.async` 双缓冲。
-6. **精度评测**：OmniDocBench v1.6（AWQ vs BF16 综合分）、AWQ vs 朴素 INT4 消融。
-7. **性能记录补全**：GPU SM 利用率（需 ncu/nsys）、KV Cache 碎片率、
-   batch=8/16 的 TTFT（当前吞吐含串行 prefill，偏保守）。
-8. **权重加载优化**（prj.md 6.1）：`mmap` + `cudaHostRegister` pinned DMA 直通。
+5. **精度评测**：OmniDocBench v1.6（AWQ vs BF16 综合分）、AWQ vs 朴素 INT4 消融。
+6. **性能记录补全**：GPU SM 利用率（已装 ncu/nsys）、KV Cache 碎片率、
+   纯 decode 的 TTFT/TPOT 分解（当前吞吐含 prefill）。
+7. **权重加载优化**（prj.md 6.1）：`mmap` + `cudaHostRegister` pinned DMA 直通。
+
+**已知遗留/技术债**：
+- `GpuDecoder::mlp_block` 的 host 路由分支（`dev_moe=false`）在每层做一次
+  router D2H；ragged prefill 现在也走该分支（批量大时值得把 top-k 也放设备端）。
+- `mlp_block_batch` 为未定义的空声明，可删除。
+- 真实 INT4 模型下 CUDA 端 greedy 尚未与参考 OCR 做端到端回归（当前 OCR 对齐
+  走 CPU 参考路径）。
 
 ### P0 视觉编码器数值对齐（已完成 2026-09-15）
 - [x] 跑完 `tools/compare_vision.cpp`。`DeepEncoder::encode` 输出 273×1280 与
@@ -163,11 +178,19 @@
       所有活跃 slot 一起 decode → 完成即释放 slot。
 - [x] 修复 CUDA 下 host `MemoryPool` 按 `max_seq_len×max_batch` 预分配数十 GB 的
       问题（CUDA 后端改用小 arena）。
-- [x] `bench_cuda_batch`（2026-09-19 优化后）：INT4 batch=16 **179.9 tok/s / 2664MB**；
-      BF16 **240.4 tok/s**（batched attention + prefill device MoE，见 §2.6）。
+- [x] `bench_cuda_batch`（2026-09-19 三次更新后）：INT4 batch=16
+      **310.7 tok/s / 3048MB**；BF16 **298.0 tok/s / 10044MB**
+      （batched attention + ragged prefill + 按专家规模选 MoE 路径，见 §2.6）。
       测试 `Engine batch`（4 个不同长度 prompt）batch == sequential == CPU。
-- [x] batched attention kernel（见优先级 1）。
-- [ ] **待优化**：chunked/ragged prefill；batched decode 纳入 CUDA Graph。
+- [x] batched attention kernel（`rswa_append_decode_batch` / `rswa_attention_batch`）。
+- [x] **ragged 多请求 prefill**：`batch_prefill_embeds` + `forward_ragged`，
+      K/V 用 `rswa_write_prefill_ragged` 按 slot 散写，attention 用
+      `rswa_attention_ragged` 逐行 causal；一步内新请求一次前向完成。
+      单测与逐请求 prefill logits rel_l2 = 0。
+- [x] **slot 映射修复**：`batch_decode(tokens, positions, slots, logits)` 显式传入
+      “行→slot”映射（此前按行号当 slot，请求顺序与 slot 顺序不一致时会读错
+      KV）。见 `PITFALLS.md` §13。
+- [ ] **待优化**：batched decode 纳入 CUDA Graph；dense/shared 投影上 tensor core。
 
 ### P2 分词器与性能记录
 - [x] 分词器对齐已提前到 P0/E0 执行（43/43），此处只保留性能与回归项。
