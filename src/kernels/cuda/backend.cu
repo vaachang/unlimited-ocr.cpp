@@ -377,6 +377,165 @@ __global__ void matmul_t_bf16_tc_pipe_kernel(const float* __restrict__ x,
     }
 }
 
+// Split activation staging: `x` (f32) -> hi = bf16(x), lo = bf16(x - hi).
+// `hi + lo` recovers ~16 mantissa bits, which keeps the tensor-core path as
+// accurate as f32 activations despite bf16 operands (the weights are exactly
+// bf16, so only the activations need compensation).
+template <int BM, int BK, int PAD>
+__device__ __forceinline__ void stage_a_split_bf16(__nv_bfloat16* __restrict__ sahi,
+                                                   __nv_bfloat16* __restrict__ salo,
+                                                   const float* __restrict__ x, int m0, int m,
+                                                   int k0, int k, int tid) {
+    constexpr int kThreads = 128;
+    constexpr int RS = BK + PAD;
+    constexpr int F4R = BK / 4;
+    constexpr int NF4 = BM * F4R;
+#pragma unroll
+    for (int i = tid; i < NF4; i += kThreads) {
+        const int r = i / F4R;
+        const int c = (i % F4R) * 4;
+        const int gm = m0 + r;
+        const int gk = k0 + c;
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (gm < m) {
+            if (gk + 4 <= k) {
+                v = *reinterpret_cast<const float4*>(x + static_cast<std::size_t>(gm) * k + gk);
+            } else {
+                float* vp = reinterpret_cast<float*>(&v);
+#pragma unroll
+                for (int t = 0; t < 4; ++t)
+                    vp[t] = (gk + t < k) ? x[static_cast<std::size_t>(gm) * k + gk + t] : 0.0f;
+            }
+        }
+        const __nv_bfloat162 hp0 = __float22bfloat162_rn(make_float2(v.x, v.y));
+        const __nv_bfloat162 hp1 = __float22bfloat162_rn(make_float2(v.z, v.w));
+        const float2 hf0 = __bfloat1622float2(hp0);
+        const float2 hf1 = __bfloat1622float2(hp1);
+        const __nv_bfloat162 lp0 = __float22bfloat162_rn(make_float2(v.x - hf0.x, v.y - hf0.y));
+        const __nv_bfloat162 lp1 = __float22bfloat162_rn(make_float2(v.z - hf1.x, v.w - hf1.y));
+        const unsigned uh0 = *reinterpret_cast<const unsigned*>(&hp0);
+        const unsigned uh1 = *reinterpret_cast<const unsigned*>(&hp1);
+        const unsigned ul0 = *reinterpret_cast<const unsigned*>(&lp0);
+        const unsigned ul1 = *reinterpret_cast<const unsigned*>(&lp1);
+        *reinterpret_cast<uint2*>(sahi + r * RS + c) = make_uint2(uh0, uh1);
+        *reinterpret_cast<uint2*>(salo + r * RS + c) = make_uint2(ul0, ul1);
+    }
+}
+
+// Tensor-core GEMM with split-bf16 activations: y = (Ahi + Alo) * W^T.  Same
+// cp.async weight pipeline as `matmul_t_bf16_tc_pipe_kernel`, but each
+// activation panel is staged twice and fed to two mma per weight panel.  Used
+// by the vision encoder to get tensor-core throughput while matching the f32
+// reference to ~1e-5.
+template <int BN, int STAGES>
+__global__ void matmul_t_split_bf16_tc_kernel(const float* __restrict__ x,
+                                              const std::uint16_t* __restrict__ w,
+                                              const float* __restrict__ bias,
+                                              float* __restrict__ y, int m, int n, int k) {
+    constexpr int BM = 64;
+    constexpr int BK = 32;
+    constexpr int PAD = 8;
+    constexpr int RS = BK + PAD;
+    constexpr int NT = BN / 8;
+
+    alignas(16) __shared__ __nv_bfloat16 sW[STAGES][BN][RS];
+    alignas(16) __shared__ __nv_bfloat16 sAhi[2][BM][RS];
+    alignas(16) __shared__ __nv_bfloat16 sAlo[2][BM][RS];
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int m0 = blockIdx.y * BM;
+    const int n0 = blockIdx.x * BN;
+    const int nk = (k + BK - 1) / BK;
+    const bool warp_active = (m0 + warp * 16) < m;
+
+    stage_a_split_bf16<BM, BK, PAD>(&sAhi[0][0][0], &sAlo[0][0][0], x, m0, m, 0, k, tid);
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < nk) {
+            stage_w_bf16<BN, BK, PAD>(&sW[s][0][0], w, n0, n, s * BK, k, tid);
+            cp_async_commit();
+        }
+    }
+
+    float c[NT][4] = {};
+
+    for (int k0i = 0; k0i < nk; ++k0i) {
+        if (k0i + STAGES - 1 < nk)
+            cp_async_wait<STAGES - 2>();
+        else
+            cp_async_wait<0>();
+        __syncthreads();
+
+        if (k0i + STAGES - 1 < nk) {
+            stage_w_bf16<BN, BK, PAD>(&sW[(k0i + STAGES - 1) % STAGES][0][0], w, n0, n,
+                                      (k0i + STAGES - 1) * BK, k, tid);
+            cp_async_commit();
+        }
+        if (k0i + 1 < nk)
+            stage_a_split_bf16<BM, BK, PAD>(&sAhi[(k0i + 1) & 1][0][0],
+                                            &sAlo[(k0i + 1) & 1][0][0], x, m0, m, (k0i + 1) * BK, k,
+                                            tid);
+
+        if (warp_active) {
+            const __nv_bfloat16* bufHi = &sAhi[k0i & 1][0][0];
+            const __nv_bfloat16* bufLo = &sAlo[k0i & 1][0][0];
+            const __nv_bfloat16* bufW = &sW[k0i % STAGES][0][0];
+#pragma unroll
+            for (int kk = 0; kk < BK; kk += 16) {
+                const int arow = warp * 16 + (lane & 15);
+                const __nv_bfloat16* ah_ptr = bufHi + arow * RS + kk + (lane >> 4) * 8;
+                const __nv_bfloat16* al_ptr = bufLo + arow * RS + kk + (lane >> 4) * 8;
+                unsigned ah0, ah1, ah2, ah3, al0, al1, al2, al3;
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(ah0), "=r"(ah1), "=r"(ah2), "=r"(ah3)
+                             : "r"(smem_addr(ah_ptr)));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(al0), "=r"(al1), "=r"(al2), "=r"(al3)
+                             : "r"(smem_addr(al_ptr)));
+#pragma unroll
+                for (int t = 0; t < NT; ++t) {
+                    const __nv_bfloat16* b_ptr =
+                        bufW + (t * 8 + (lane & 7)) * RS + kk + ((lane >> 3) & 1) * 8;
+                    unsigned b0, b1;
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                                 : "=r"(b0), "=r"(b1)
+                                 : "r"(smem_addr(b_ptr)));
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+                        : "+f"(c[t][0]), "+f"(c[t][1]), "+f"(c[t][2]), "+f"(c[t][3])
+                        : "r"(ah0), "r"(ah1), "r"(ah2), "r"(ah3), "r"(b0), "r"(b1));
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+                        : "+f"(c[t][0]), "+f"(c[t][1]), "+f"(c[t][2]), "+f"(c[t][3])
+                        : "r"(al0), "r"(al1), "r"(al2), "r"(al3), "r"(b0), "r"(b1));
+                }
+            }
+        }
+    }
+
+    if (!warp_active) return;
+    const int r0 = m0 + warp * 16 + (lane >> 2);
+    const int r1 = r0 + 8;
+    const int tig = lane & 3;
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        const int c0 = n0 + t * 8 + tig * 2;
+        const int c1 = c0 + 1;
+        if (r0 < m) {
+            if (c0 < n) y[static_cast<std::size_t>(r0) * n + c0] = c[t][0] + (bias ? bias[c0] : 0.0f);
+            if (c1 < n) y[static_cast<std::size_t>(r0) * n + c1] = c[t][1] + (bias ? bias[c1] : 0.0f);
+        }
+        if (r1 < m) {
+            if (c0 < n) y[static_cast<std::size_t>(r1) * n + c0] = c[t][2] + (bias ? bias[c0] : 0.0f);
+            if (c1 < n) y[static_cast<std::size_t>(r1) * n + c1] = c[t][3] + (bias ? bias[c1] : 0.0f);
+        }
+    }
+}
+
 // One warp per output row.  Lanes read consecutive bf16 pairs so every load
 // transaction is fully coalesced (the naive one-thread-per-row layout strides
 // by `k` between lanes and wastes ~16x bandwidth).
@@ -464,6 +623,22 @@ void matmul_t_bf16(const float* x, const std::uint16_t* w, const float* bias, fl
     constexpr int kStages = 3;
     const dim3 grid((n + kBN - 1) / kBN, (m + 63) / 64);
     matmul_t_bf16_tc_pipe_kernel<kBN, kStages, false>
+        <<<grid, block, 0, stream>>>(x, w, bias, y, m, n, k);
+}
+
+void matmul_t_split_bf16(const float* x, const std::uint16_t* w, const float* bias, float* y,
+                         int m, int n, int k, cudaStream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0) return;
+    // Needs the same 16-byte-friendly shapes as the bf16 pipeline.
+    if ((k & 7) != 0) {
+        matmul_t_f32w(x, w, bias, y, m, n, k, stream);
+        return;
+    }
+    constexpr int kBN = 64;
+    constexpr int kStages = 3;
+    const dim3 block(128);
+    const dim3 grid((n + kBN - 1) / kBN, (m + 63) / 64);
+    matmul_t_split_bf16_tc_kernel<kBN, kStages>
         <<<grid, block, 0, stream>>>(x, w, bias, y, m, n, k);
 }
 

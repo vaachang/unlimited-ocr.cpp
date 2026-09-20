@@ -95,7 +95,7 @@ mmap，因此在 `weights.cpp` 的专家循环加 `#pragma omp parallel for sche
 | `moe_gemm_int4.cu` | `moe_grouped_(gate_up|down)_int4_kernel` | **grouped expert GEMM**：一层一次 launch，block 映射 (expert, n-tile)，按设备分组表循环 token（见 §5.9） |
 | `rmsnorm.cu` | `rmsnorm_kernel` | 块内归约 |
 | `rope_fused.cu` | `rope_kernel`, `rmsnorm_head_kernel` | 融合逐头 RMSNorm + RoPE |
-| `backend.cu` | `matmul_t(_bf16)`, `device_info` | 稠密 GEMM、设备信息 |
+| `backend.cu` | `matmul_t(_bf16)`, `matmul_t_split_bf16`, `device_info` | 稠密 GEMM（含视觉用 split-bf16 高精度 TC）、设备信息 |
 | `gpu_ops.cu` | `silu_mul`, `add_scaled`, `gather_rows`, `scatter_add_scaled`, `embed_gather` | 设备端逐元素 / 分组 MoE 辅助 + embedding 查表（§5.10） |
 | `gpu_cache.cu` / `gpu_cache.h` | `GpuRSWACache` | device-resident 固定+环形 KV cache |
 | `gpu_decoder.cu` / `gpu_decoder.h` | `GpuDecoder` | 完整设备端 MoE decoder（bf16 权重常驻；路由 top-k 在 host 调度） |
@@ -255,24 +255,35 @@ gate_up/down 内核修复了“相邻线程按行 stride 读权重”导致的 ~
 
 - **权重**：线性层（SAM qkv/proj/mlp、CLIP qkv/out/fc1/fc2、projector）以 bf16
   常驻设备；norm/bias/pos/rel 为 f32，conv 权重转 bf16 供 GEMM。
-- **f32 精度（关键）**：与 tensor-core 的 bf16 激活路径不同，视觉线性和卷积用
-  **f32 tiled GEMM**（`matmul_t_f32w`：bf16 权重升为 f32、f32 激活/f32 累加），
-  与 CPU 参考（`WeightMatrix::matmul` on `BF16_EXT` = bf16 权重 + f32 激活）逐元素
-  一致。原因：bf16 激活舍入经 12 层 SAM + 24 层 CLIP 累积放大到 ~11%，远超 6e-4。
+- **精度（关键）**：朴素 bf16 激活舍入经 12 层 SAM + 24 层 CLIP 累积放大到 ~11%，
+  远超 6e-4。改为 **split-bf16 tensor-core GEMM**（`matmul_t_split_bf16`，P3 收尾）：
+  激活拆成 `hi=bf16(x)`、`lo=bf16(x-hi)`，权重本就是精确 bf16，因此每个权重面板
+  做 2 次 mma（`hi·W + lo·W`），恢复 ~16-bit 有效尾数；累加仍是 f32。staging 复用
+  既有 `cp.async` 权重流水线，`k%8≠0` 时回退 `matmul_t_f32w`（f32 激活、f32 累加）。
+  实测 1024 输入 visual rel_l2 **8.2e-5**（验收 6e-4）。
 - **内核**：`layernorm_rows`、`gelu_inplace`/`quick_gelu_inplace`、`add_bias_rows`/
   `add_inplace`、`im2col_chw`/`im2col_hwc`（conv → im2col + GEMM）、
   `window_partition`/`window_unpartition`、`attention_flash`（online softmax、
   warp-per-query、K/V 分块入 shared；`RELPOS` 模板给 SAM 加 decomposed relative
   position bias，CLIP 不加）。
+- **attention 优化（P3 收尾）**：1024 输入时 SAM global attention 曾是最大头（~404ms）。
+  两处改动：① **relpos 因式分解**——`q·(Rh[ih]+Rw[iw])` 拆成 `q·Rh[ih] + q·Rw[iw]`，
+  每 query 在 block 起始处算好长度 `H+W` 的查找表存入 shared，内层循环由「每 key
+  4 次 global load + 两次 warp 归约」变成「2 次 shared 查表」，省 ~120ms；② 每 warp
+  处理 `kAttnQP=4` 个 query（K/V tile 复用 4×）、`float2` 读 shared、softmax 用
+  `__expf`。核心仍是 f32 CUDA-core（~1 TFLOPS），要再上一档需 tensor-core
+  attention（未做）。
 - **两个语义坑**（见 `PITFALLS.md` §18）：windowed SAM 必须**先 partition 再 QKV**
   （padding token 要拿到 QKV bias）；CLIP MLP 的残差要用 `fc2` 覆盖 LN 结果再
   `+= residual`。
 - **集成**：`Engine::set_vision_gpu()` 后 `image_embeddings` 在 CUDA 后端整条视觉
   路径走设备；`tools/compare_ocr --gpu-vision` 可端到端验证。
 - **验收**（`tools/compare_vision_gpu`，GPU vs CPU 参考）：
-  `visual_embeddings` rel_l2 **1.1e-5**、`clip_features` 1.3e-5、`sam_features`
-  2e-6（验收 ≤6e-4）；单图 1024 编码 **612 ms**（CPU ~2 min）、640 **153 ms**、
-  224 **34 ms**。`--selftest` 覆盖 layernorm / relpos attention / full attention。
+  `visual_embeddings` rel_l2 **8.2e-5**、`clip_features` 9.9e-5、`sam_features`
+  1.7e-5（验收 ≤6e-4）；单图 1024 编码 **366 ms**（CPU ~2 min）、640 **95 ms**、
+  224 **18 ms**。`--selftest` 覆盖 layernorm / relpos attention / full attention。
+  相对 f32 GEMM 版本（612/153/34 ms）提升 **1.67×**；剩余瓶颈是 f32 CUDA-core
+  SAM attention（BENCHMARKS §2.9），达到 150–250ms 目标需 tensor-core attention。
 
 ### 5.9 Grouped INT4 expert GEMM + device router（P3 收尾，2026-09-20）
 

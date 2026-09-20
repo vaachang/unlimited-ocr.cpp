@@ -1,0 +1,15 @@
+=== size 224 ===
+GPU encode time: 18.4 ms
+sam_features         max_abs=0.00000 rel_l2=0.000016
+clip_features        max_abs=0.00007 rel_l2=0.000051
+visual_embeddings    max_abs=0.00005 rel_l2=0.000039
+=== size 640 ===
+GPU encode time: 91.1 ms
+sam_features         max_abs=0.00001 rel_l2=0.000018
+clip_features        max_abs=0.00023 rel_l2=0.000077
+visual_embeddings    max_abs=0.00013 rel_l2=0.000063
+=== size 1024 ===
+GPU encode time: 365.4 ms
+sam_features         max_abs=0.00001 rel_l2=0.000017
+clip_features        max_abs=0.00065 rel_l2=0.000099
+visual_embeddings    max_abs=0.00038 rel_l2=0.000082

@@ -21,6 +21,13 @@ void matmul_t(const float* x, const float* w, const float* bias, float* y, int m
 // far from the f32 reference.
 void matmul_t_f32w(const float* x, const std::uint16_t* w, const float* bias, float* y, int m,
                    int n, int k, cudaStream_t stream = 0);
+
+// Tensor-core GEMM with split-bf16 activations: x is split into hi/lo bf16 and
+// multiplied with the (exactly bf16) weights by two mma per panel, recovering
+// ~16 mantissa bits.  Tensor-core speed with f32-level accuracy; used by the
+// vision encoder.
+void matmul_t_split_bf16(const float* x, const std::uint16_t* w, const float* bias, float* y,
+                         int m, int n, int k, cudaStream_t stream = 0);
 void matmul_t_bf16(const float* x, const std::uint16_t* w, const float* bias, float* y, int m,
                    int n, int k, cudaStream_t stream = 0);
 

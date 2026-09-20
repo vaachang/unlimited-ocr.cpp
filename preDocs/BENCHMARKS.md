@@ -242,15 +242,21 @@ CUDA Graph 确实把逐步发射压到常数级。
 `tools/compare_vision_gpu` 在真实视觉权重上对比 GPU 编码器与 CPU 参考编码器
 （CPU 编码器已对齐 PyTorch f32 参考，见 `ALIGNMENT.md` §4），随机归一化图像：
 
-| size | GPU 编码 | CPU 编码 | visual rel_l2 | clip rel_l2 | sam rel_l2 |
-|---|---|---|---|---|---|
-| 224 | **34 ms** | — | — | — | — |
-| 640 | **153 ms** | ~43 s | 9e-6 | 1.1e-5 | 2e-6 |
-| 1024 | **612 ms** | ~2 min | **1.1e-5** | 1.3e-5 | 2e-6 |
+| size | GPU 编码（P3 收尾后） | 原 f32 GEMM | CPU 编码 | visual rel_l2 | clip rel_l2 | sam rel_l2 |
+|---|---|---|---|---|---|---|
+| 224 | **18 ms** | 34 ms | — | 3.9e-5 | — | — |
+| 640 | **95 ms** | 153 ms | ~43 s | 6.3e-5 | — | — |
+| 1024 | **366 ms** | 612 ms | ~2 min | **8.2e-5** | 9.9e-5 | 1.7e-5 |
 
-验收线为 rel_l2 ≤ 6e-4（tAgent 2.3），实测约 **50×** 余量。GPU 端用 f32 GEMM
-（`matmul_t_f32w`）而非 bf16 tensor core：bf16 激活舍入在深层视觉栈里累积到 ~11%。
+验收线为 rel_l2 ≤ 6e-4（tAgent 2.10），实测约 **7×** 余量。提升来自：视觉线性/
+卷积改用 **split-bf16 tensor-core GEMM**（`matmul_t_split_bf16`，激活 hi/lo 两片，
+2 次 mma/面板；见 `CORE_TECH.md` §5.8）+ SAM attention 的 **relpos 因式分解**
+（每 query 预计算 `H+W` 长度查找表，内层循环去掉每 key 的 global load 与归约）。
 `--selftest` 的 layernorm / relpos attention / full attention rel_l2 ≤ 1e-6。
+
+1024 的 kernel 分解（`nsys`）：attention_flash(RELPOS) **239 ms**（4 个 SAM global
+块各 ~52 ms）、`matmul_t_split_bf16` **98 ms**、其余 <5 ms。**未达 150–250ms 目标**：
+f32 CUDA-core attention 只有 ~1 TFLOPS，进一步提速需要 tensor-core attention（未做）。
 
 ## 2.10 grouped INT4 专家 GEMM（2026-09-20，`bench/bench_batch_real_int4_grouped.txt`）
 

@@ -178,7 +178,12 @@ __global__ void window_unpartition_kernel(const float* __restrict__ win, float* 
 // ---------------------------------------------------------------------------
 constexpr int kAttnHD = 64;
 constexpr int kAttnKT = 64;   // keys per tile
-constexpr int kAttnWarps = 8; // queries per block
+constexpr int kAttnWarps = 8; // warps per block
+// Queries per warp.  A block loads each K/V tile once and reuses it for
+// `kAttnWarps * kAttnQP` queries; raising this from 1 cuts the (otherwise
+// O(S/8)x redundant) K/V global traffic, which dominates the SAM global
+// attention at 1024.
+constexpr int kAttnQP = 4;
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -197,24 +202,64 @@ __global__ void attention_flash_kernel(const float* __restrict__ qkv,
     const int h = bh % heads;
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int qi = blockIdx.y * kAttnWarps + warp;
+    const int qbase = (blockIdx.y * kAttnWarps + warp) * kAttnQP;
+    constexpr int NQ = kAttnWarps * kAttnQP;
 
-    __shared__ float sK[kAttnKT][kAttnHD];
-    __shared__ float sV[kAttnKT][kAttnHD];
+    extern __shared__ float smem[];
+    // RELPOS: a [NQ][H+W] per-query relative-position score table, then K/V.
+    // Splitting `q . (Rh[ih] + Rw[iw])` into `q.Rh[ih] + q.Rw[iw]` lets the
+    // expensive inner loop use two shared lookups instead of four global loads
+    // plus a warp reduction per key (which dominated the SAM global attention).
+    float* sRel = smem;
+    float* sK = smem + (RELPOS ? static_cast<std::size_t>(NQ) * (H + W) : 0);
+    float* sV = sK + kAttnKT * kAttnHD;
 
     const float scale = 1.0f / sqrtf(static_cast<float>(kAttnHD));
-    const int qh = W > 0 ? qi / W : 0;
-    const int qw = W > 0 ? qi % W : 0;
-    const float* qp = qkv + (static_cast<std::size_t>(b) * S + qi) * 3 * C + h * kAttnHD;
     // Each lane owns head dims {2*lane, 2*lane+1}.
     const int d0 = 2 * lane;
-    float q0 = 0.0f, q1 = 0.0f;
-    if (qi < S) {
-        q0 = qp[d0];
-        q1 = qp[d0 + 1];
+    float q0[kAttnQP], q1[kAttnQP];
+    bool qok[kAttnQP];
+    float acc0[kAttnQP], acc1[kAttnQP], m[kAttnQP], l[kAttnQP];
+#pragma unroll
+    for (int t = 0; t < kAttnQP; ++t) {
+        const int qi = qbase + t;
+        qok[t] = qi < S;
+        q0[t] = 0.0f;
+        q1[t] = 0.0f;
+        acc0[t] = acc1[t] = 0.0f;
+        m[t] = -INFINITY;
+        l[t] = 0.0f;
+        if (qok[t]) {
+            const float* qp = qkv + (static_cast<std::size_t>(b) * S + qi) * 3 * C + h * kAttnHD;
+            q0[t] = qp[d0];
+            q1[t] = qp[d0 + 1];
+        }
     }
-    float acc0 = 0.0f, acc1 = 0.0f;
-    float m = -INFINITY, l = 0.0f;
+
+    if (RELPOS) {
+        const int RH = H + W;
+#pragma unroll
+        for (int t = 0; t < kAttnQP; ++t) {
+            if (!qok[t]) continue;
+            const int qi = qbase + t;
+            const int qh = W > 0 ? qi / W : 0;
+            const int qw = W > 0 ? qi % W : 0;
+            float* row = sRel + (warp * kAttnQP + t) * RH;
+            for (int kh = 0; kh < H; ++kh) {
+                const float* rp = relh + static_cast<std::size_t>(qh - kh + H - 1) * kAttnHD;
+                float r = q0[t] * rp[d0] + q1[t] * rp[d0 + 1];
+                r = warp_sum(r);
+                if (lane == 0) row[kh] = r;
+            }
+            for (int kw = 0; kw < W; ++kw) {
+                const float* rp = relw + static_cast<std::size_t>(qw - kw + W - 1) * kAttnHD;
+                float r = q0[t] * rp[d0] + q1[t] * rp[d0 + 1];
+                r = warp_sum(r);
+                if (lane == 0) row[H + kw] = r;
+            }
+        }
+        __syncthreads();
+    }
 
     const int nkt = (S + kAttnKT - 1) / kAttnKT;
     for (int kt = 0; kt < nkt; ++kt) {
@@ -230,45 +275,55 @@ __global__ void attention_flash_kernel(const float* __restrict__ qkv,
                 kv = base[C + d];
                 vv = base[2 * C + d];
             }
-            sK[j][d] = kv;
-            sV[j][d] = vv;
+            sK[j * kAttnHD + d] = kv;
+            sV[j * kAttnHD + d] = vv;
         }
         __syncthreads();
 
-        if (qi < S) {
-            const int jmax = min(kAttnKT, S - kt * kAttnKT);
+        const int jmax = min(kAttnKT, S - kt * kAttnKT);
+        // Fully unroll so the per-query arrays stay in registers (a dynamic
+        // index would spill them to local memory).
+#pragma unroll
+        for (int t = 0; t < kAttnQP; ++t) {
+            if (!qok[t]) continue;
+            const float* row = sRel + (warp * kAttnQP + t) * (H + W);
+            const float* kt_row = row + H;
+            float mt = m[t], lt = l[t], a0 = acc0[t], a1 = acc1[t];
             for (int j = 0; j < jmax; ++j) {
                 const int key = kt * kAttnKT + j;
-                float dot = q0 * sK[j][d0] + q1 * sK[j][d0 + 1];
+                const float2 kk = *reinterpret_cast<const float2*>(sK + j * kAttnHD + d0);
+                float dot = q0[t] * kk.x + q1[t] * kk.y;
                 dot = warp_sum(dot);
                 float s = dot * scale;
-                if (RELPOS) {
-                    const int kh = key / W, kw = key % W;
-                    const int ih = qh - kh + (H - 1);
-                    const int iw = qw - kw + (W - 1);
-                    const float* rh = relh + static_cast<std::size_t>(ih) * kAttnHD;
-                    const float* rw = relw + static_cast<std::size_t>(iw) * kAttnHD;
-                    float r = q0 * (rh[d0] + rw[d0]) + q1 * (rh[d0 + 1] + rw[d0 + 1]);
-                    r = warp_sum(r);
-                    s += r;
-                }
-                const float mnew = fmaxf(m, s);
-                const float alpha = expf(m - mnew);
-                const float beta = expf(s - mnew);
-                l = l * alpha + beta;
-                acc0 = acc0 * alpha + beta * sV[j][d0];
-                acc1 = acc1 * alpha + beta * sV[j][d0 + 1];
-                m = mnew;
+                if (RELPOS) s += row[key / W] + kt_row[key % W];
+                const float mnew = fmaxf(mt, s);
+                // __expf (MUFU) instead of the ~2x-ULP-accurate libm expf: the
+                // softmax probability error is ~1e-6, far below the 6e-4 budget,
+                // and it removes a large instruction-count cost in the inner loop.
+                const float alpha = __expf(mt - mnew);
+                const float beta = __expf(s - mnew);
+                const float2 vv = *reinterpret_cast<const float2*>(sV + j * kAttnHD + d0);
+                lt = lt * alpha + beta;
+                a0 = a0 * alpha + beta * vv.x;
+                a1 = a1 * alpha + beta * vv.y;
+                mt = mnew;
             }
+            m[t] = mt;
+            l[t] = lt;
+            acc0[t] = a0;
+            acc1[t] = a1;
         }
         __syncthreads();
     }
 
-    if (qi < S) {
-        const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+#pragma unroll
+    for (int t = 0; t < kAttnQP; ++t) {
+        if (!qok[t]) continue;
+        const int qi = qbase + t;
+        const float inv = l[t] > 0.0f ? 1.0f / l[t] : 0.0f;
         float* op = out + (static_cast<std::size_t>(b) * S + qi) * C + h * kAttnHD;
-        op[d0] = acc0 * inv;
-        op[d0 + 1] = acc1 * inv;
+        op[d0] = acc0[t] * inv;
+        op[d0 + 1] = acc1[t] * inv;
     }
 }
 
@@ -353,13 +408,23 @@ void attention_flash(const float* qkv, const float* relh, const float* relw, flo
                      int S, int H, int W, int heads, bool relpos, cudaStream_t stream) {
     if (B <= 0 || S <= 0 || heads <= 0) return;
     const dim3 block(32 * kAttnWarps);
-    const dim3 grid(B * heads, (S + kAttnWarps - 1) / kAttnWarps);
+    const dim3 grid(B * heads, (S + kAttnWarps * kAttnQP - 1) / (kAttnWarps * kAttnQP));
+    const std::size_t kv = static_cast<std::size_t>(2) * kAttnKT * kAttnHD;
+    const std::size_t rel = relpos
+                                ? static_cast<std::size_t>(kAttnWarps * kAttnQP) *
+                                      static_cast<std::size_t>(H + W)
+                                : 0;
+    const std::size_t shmem = (kv + rel) * sizeof(float);
     if (relpos) {
-        attention_flash_kernel<true><<<grid, block, 0, stream>>>(qkv, relh, relw, out, S, H, W,
-                                                                 heads);
+        // Large images push the relpos table past the 48KB default.
+        cudaFuncSetAttribute(attention_flash_kernel<true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(shmem));
+        attention_flash_kernel<true>
+            <<<grid, block, shmem, stream>>>(qkv, relh, relw, out, S, H, W, heads);
     } else {
-        attention_flash_kernel<false><<<grid, block, 0, stream>>>(qkv, relh, relw, out, S, H, W,
-                                                                  heads);
+        attention_flash_kernel<false>
+            <<<grid, block, shmem, stream>>>(qkv, relh, relw, out, S, H, W, heads);
     }
 }
 

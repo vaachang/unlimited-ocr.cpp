@@ -283,7 +283,7 @@ void GpuEncoder::encode(const float* image_chw, int height, int width, Tensor& o
         const int k = 3 * patch * patch;
         float* col = f32buf(static_cast<std::size_t>(N) * k);
         cuda::im2col_chw(img, col, 3, height, width, patch, patch, patch, 0, grid, grid);
-        cuda::matmul_t_f32w(col, I.patch_w, I.patch_b, x, N, dim, k);
+        cuda::matmul_t_split_bf16(col, I.patch_w, I.patch_b, x, N, dim, k);
         cuda::add_inplace(x, I.sam_pos, N * dim);
     }
     record("gpu_sam_pos", x, static_cast<std::size_t>(N) * dim);
@@ -302,7 +302,7 @@ void GpuEncoder::encode(const float* image_chw, int height, int width, Tensor& o
         cuda::layernorm_rows(x, d.n1w, d.n1b, normed, N, dim, 1e-6f);
         if (is_global) {
             // Global attention runs over the whole grid: QKV then attention.
-            cuda::matmul_t_f32w(normed, d.qkvw, d.qkvb, qkv, N, 3 * dim, dim);
+            cuda::matmul_t_split_bf16(normed, d.qkvw, d.qkvb, qkv, N, 3 * dim, dim);
             cuda::attention_flash(qkv, d.rh, d.rw, attn, 1, N, grid, grid, sam_heads, true);
         } else {
             // Windowed attention mirrors the reference: partition the normed
@@ -318,17 +318,17 @@ void GpuEncoder::encode(const float* image_chw, int height, int width, Tensor& o
             float* qkv_win = f32buf(static_cast<std::size_t>(rows) * 3 * dim);
             float* attn_win = f32buf(static_cast<std::size_t>(rows) * dim);
             cuda::window_partition(normed, normed_win, grid, grid, dim, ws, nh, nw);
-            cuda::matmul_t_f32w(normed_win, d.qkvw, d.qkvb, qkv_win, rows, 3 * dim, dim);
+            cuda::matmul_t_split_bf16(normed_win, d.qkvw, d.qkvb, qkv_win, rows, 3 * dim, dim);
             cuda::attention_flash(qkv_win, d.rh, d.rw, attn_win, nwin, sw, ws, ws, sam_heads, true);
             cuda::window_unpartition(attn_win, attn, grid, grid, dim, ws, nh, nw);
         }
-        cuda::matmul_t_f32w(attn, d.projw, d.projb, proj, N, dim, dim);
+        cuda::matmul_t_split_bf16(attn, d.projw, d.projb, proj, N, dim, dim);
         cuda::add_inplace(x, proj, N * dim);
 
         cuda::layernorm_rows(x, d.n2w, d.n2b, normed, N, dim, 1e-6f);
-        cuda::matmul_t_f32w(normed, d.m1w, d.m1b, mlp1, N, 4 * dim, dim);
+        cuda::matmul_t_split_bf16(normed, d.m1w, d.m1b, mlp1, N, 4 * dim, dim);
         cuda::gelu_inplace(mlp1, N * 4 * dim);
-        cuda::matmul_t_f32w(mlp1, d.m2w, d.m2b, mlp2, N, dim, 4 * dim);
+        cuda::matmul_t_split_bf16(mlp1, d.m2w, d.m2b, mlp2, N, dim, 4 * dim);
         cuda::add_inplace(x, mlp2, N * dim);
         if (bi == 0 && stages) record("gpu_sam_block0", x, static_cast<std::size_t>(N) * dim);
         if (bi == 1) record("gpu_sam_block1", x, static_cast<std::size_t>(N) * dim);
@@ -341,13 +341,13 @@ void GpuEncoder::encode(const float* image_chw, int height, int width, Tensor& o
     // ---- neck ----
     constexpr int kNC = 256;
     float* hwc = f32buf(static_cast<std::size_t>(N) * kNC);
-    cuda::matmul_t_f32w(x, I.neck0, nullptr, hwc, N, kNC, dim);
+    cuda::matmul_t_split_bf16(x, I.neck0, nullptr, hwc, N, kNC, dim);
     cuda::layernorm_rows(hwc, I.neck1w, I.neck1b, hwc, N, kNC, 1e-6f);
     {
         const int k = kNC * 9;
         float* col = f32buf(static_cast<std::size_t>(N) * k);
         cuda::im2col_hwc(hwc, col, kNC, grid, grid, 3, 3, 1, 1, grid, grid);
-        cuda::matmul_t_f32w(col, I.neck2, nullptr, hwc, N, kNC, k);
+        cuda::matmul_t_split_bf16(col, I.neck2, nullptr, hwc, N, kNC, k);
         cuda::layernorm_rows(hwc, I.neck3w, I.neck3b, hwc, N, kNC, 1e-6f);
     }
     record("gpu_sam_neck", hwc, static_cast<std::size_t>(N) * kNC);
@@ -358,7 +358,7 @@ void GpuEncoder::encode(const float* image_chw, int height, int width, Tensor& o
         const int k = kNC * 9;
         float* col = f32buf(static_cast<std::size_t>(N2) * k);
         cuda::im2col_hwc(hwc, col, kNC, grid, grid, 3, 3, 2, 1, h2, h2);
-        cuda::matmul_t_f32w(col, I.net2w, nullptr, x2, N2, 512, k);
+        cuda::matmul_t_split_bf16(col, I.net2w, nullptr, x2, N2, 512, k);
     }
     record("gpu_sam_net2", x2, static_cast<std::size_t>(N2) * 512);
     const int h3 = (h2 + 2 * 1 - 3) / 2 + 1;
@@ -368,7 +368,7 @@ void GpuEncoder::encode(const float* image_chw, int height, int width, Tensor& o
         const int k = 512 * 9;
         float* col = f32buf(static_cast<std::size_t>(N3) * k);
         cuda::im2col_hwc(x2, col, 512, h2, h2, 3, 3, 2, 1, h3, h3);
-        cuda::matmul_t_f32w(col, I.net3w, nullptr, sam_tokens, N3, 1024, k);
+        cuda::matmul_t_split_bf16(col, I.net3w, nullptr, sam_tokens, N3, 1024, k);
     }
     record("gpu_sam_net3", sam_tokens, static_cast<std::size_t>(N3) * 1024);
 
@@ -418,19 +418,19 @@ void GpuEncoder::encode(const float* image_chw, int height, int width, Tensor& o
                          cudaMemcpyDeviceToDevice),
               "residual");
         cuda::layernorm_rows(clip, d.ln1w, d.ln1b, clip, Nc, chd, 1e-5f);
-        cuda::matmul_t_f32w(clip, d.qkvw, d.qkvb, cqkv, Nc, 3 * chd, chd);
+        cuda::matmul_t_split_bf16(clip, d.qkvw, d.qkvb, cqkv, Nc, 3 * chd, chd);
         cuda::attention_flash(cqkv, nullptr, nullptr, cout, 1, Nc, 1, 1, clip_heads, false);
-        cuda::matmul_t_f32w(cout, d.outw, d.outb, clip, Nc, chd, chd);
+        cuda::matmul_t_split_bf16(cout, d.outw, d.outb, clip, Nc, chd, chd);
         cuda::add_inplace(clip, residual, Nc * chd);
 
         check(cudaMemcpy(residual, clip, bytes_f32(static_cast<std::size_t>(Nc) * chd),
                          cudaMemcpyDeviceToDevice),
               "residual2");
         cuda::layernorm_rows(clip, d.ln2w, d.ln2b, clip, Nc, chd, 1e-5f);
-        cuda::matmul_t_f32w(clip, d.fc1w, d.fc1b, fc1, Nc, cfg.clip_ffn_size, chd);
+        cuda::matmul_t_split_bf16(clip, d.fc1w, d.fc1b, fc1, Nc, cfg.clip_ffn_size, chd);
         cuda::quick_gelu_inplace(fc1, Nc * cfg.clip_ffn_size);
         // clip = fc2 + residual (overwrite the layer-normed value, like the CPU).
-        cuda::matmul_t_f32w(fc1, d.fc2w, d.fc2b, clip, Nc, chd, cfg.clip_ffn_size);
+        cuda::matmul_t_split_bf16(fc1, d.fc2w, d.fc2b, clip, Nc, chd, cfg.clip_ffn_size);
         cuda::add_inplace(clip, residual, Nc * chd);
     }
 
@@ -445,7 +445,7 @@ void GpuEncoder::encode(const float* image_chw, int height, int width, Tensor& o
           "concat sam");
     const int hidden = cfg.projector_n_embed;
     float* projected = f32buf(static_cast<std::size_t>(N3) * hidden);
-    cuda::matmul_t_f32w(cat, I.proj_w, I.proj_b, projected, N3, hidden, proj_in);
+    cuda::matmul_t_split_bf16(cat, I.proj_w, I.proj_b, projected, N3, hidden, proj_in);
 
     check(cudaDeviceSynchronize(), "encode sync");
     if (sam_debug) {

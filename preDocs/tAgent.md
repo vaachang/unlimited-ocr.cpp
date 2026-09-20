@@ -34,7 +34,7 @@
   | 整波 prefill（16 请求） | **~165 ms** BF16 / **120 ms** INT4 |
   | batch=1 吞吐 | 155.8 BF16 / 138.2 INT4 tok/s |
   | lm_head m=16（n=129280） | **1174 µs**（原 2652，2.3×） |
-  | 单图视觉编码（1024, GPU） | **612 ms**（CPU 参考 ~2 min；rel_l2 1.1e-5） |
+  | 单图视觉编码（1024, GPU） | **366 ms**（CPU 参考 ~2 min；rel_l2 8.2e-5；P3 收尾，原 612ms） |
 
 - 性能数据明细见 `BENCHMARKS.md` §2.5–2.10；历史进度见 `PROGRESS.md` §4。
 
@@ -54,9 +54,10 @@ ctest --test-dir build-cuda --output-on-failure
 按收益/成本排序。每项给出目标、方案、验收与涉及文件；完成后在本文档勾掉并更新 §1。
 
 > **2026-09-20 优先级**：2.4 device router + 2.2 grouped expert GEMM、2.5 device
-> embedding、2.9 权重加载均已完成（见下）→ 2.10 视觉编码器性能收尾 / 2.11 CUDA 端
-> OCR 端到端回归（2.11 需先导出参考张量）；2.6/2.7 需先确认；2.8 受 ncu 权限限制。
-> ✅ 表示已完成（保留一段背景说明）。
+> embedding、2.9 权重加载均已完成（见下）；2.10 视觉编码器**部分完成**（split-bf16
+> GEMM + relpos 因式分解，1024 612→366ms；离 150–250ms 目标仍差 tensor-core
+> attention）→ 下一步做 2.10 收尾（TC attention）或 2.11 CUDA 端 OCR 回归（需先导出
+> 参考张量）；2.6/2.7 需先确认；2.8 受 ncu 权限限制。✅ 已完成；🔶 部分完成。
 
 ### ✅ 2.1 高性能 TC GEMM 重写（2026-09-20 完成）
 
@@ -142,15 +143,23 @@ ctest --test-dir build-cuda --output-on-failure
 - **方案**：接入 OmniDocBench v1.6（AWQ vs BF16 综合分）、AWQ vs 朴素 INT4 消融。
 - **注意**：需下载外部工具链/数据，**先询问确认**。
 
-### 2.10 视觉编码器性能收尾（P3 遗留）
+### 🔶 2.10 视觉编码器性能收尾（部分完成，2026-09-20）
 
-- **现状**：`GpuEncoder` 1024 输入 612 ms，其中 f32 tiled GEMM 约 1.8 TFLOPS，
-  是主要成本；权重 bf16、激活/累加 f32。
-- **方案**：① bf16 tensor-core + 误差补偿（A 拆成 hi/lo 两片 bf16 做 2~3 次 mma，
-  保持 ~16-bit 有效尾数）；② CUDA Graph 捕获整个视觉栈；③ 支持任意非方形尺寸。
-- **验收**：1024 编码降到 ~150–250 ms；rel_l2 仍 ≤6e-4；`compare_vision_gpu` 通过。
-- **涉及**：`src/engine/gpu_encoder.cu`、`src/kernels/cuda/vision_ops.cu`、
-  `src/kernels/cuda/backend.cu`。
+- **已完成① split-bf16 tensor-core**：`matmul_t_split_bf16`（激活拆 hi/lo 两片 bf16、
+  每个权重面板做 2 次 mma、f32 累加），视觉线性/卷积全部改用它；`k%8≠0` 回退 f32。
+  1024 的 GEMM 由 178 → 98 ms，rel_l2 仍 8.2e-5。
+- **已完成① attention**：SAM global attention 的 relpos 因式分解（预计算每 query
+  的 `H+W` 查找表，内层循环去掉每 key 的 global load 与 warp 归约），attention
+  404 → 239 ms；另用每 warp 4 query / `float2` shared 读 / `__expf`。
+- **结果**：1024 编码 **612 → 366 ms**（640 153→95、224 34→18），rel_l2 8.2e-5
+  （验收 6e-4）。`compare_vision_gpu` selftest 与 GPU-vs-CPU 对比均过。
+- **未达验收（目标 150–250 ms）**：剩余瓶颈是 **f32 CUDA-core SAM attention**
+  （1024 时 239 ms，~1 TFLOPS）。要达标需要 **tensor-core flash attention**
+  （Q/K/P/V 都做 hi/lo 拆分以保精度），是一项较大的内核重写，**尚未做**。
+- **未做②③**：整栈 CUDA Graph 捕获（kernel 时间占比高、launch 开销小，收益有限）；
+  非方形尺寸支持（`encode` 仍要求正方形）。
+- **涉及**：`src/kernels/cuda/backend.cu`、`src/kernels/cuda/vision_ops.cu`、
+  `src/engine/gpu_encoder.cu`。详见 `CORE_TECH.md` §5.8、`BENCHMARKS.md` §2.9。
 
 ### 2.11 CUDA 端真实 INT4 OCR 端到端回归（技术债）
 
@@ -215,11 +224,15 @@ ctest --test-dir build-cuda --output-on-failure
 | P3 grouped MoE | device router + grouped INT4 gate_up/down（一层 2 次 launch、无 D2H）；tile `bn=32/bm=128` | INT4 整波 prefill 213→**120 ms**、B=16 **~518** tok/s；ragged rel_l2 1.7e-3 vs host |
 | P3 device embedding | bf16/f32 表设备常驻 + `embed_gather`；单请求 Graph 内 gather、batch 只传 token id | 每步无隐含 H2D；greedy 不变；显存 +331MB |
 | P3 权重加载 | INT4 专家量化改为 OpenMP 并行（`weights.cpp` 专家循环） | 真实模型加载墙钟 **20.5 → 7.4s**；显存不变 |
+| P3 视觉编码器 | split-bf16 TC GEMM（激活 hi/lo）+ SAM attention relpos 因式分解 | 1024 编码 **612→366ms**、640 153→95ms；rel_l2 8.2e-5（未达 150–250 目标） |
 
 ---
 
 ## 5. 已知遗留 / 技术债
 
+- **视觉编码器离 150–250ms 目标仍有差距**：f32 CUDA-core SAM attention（1024 时
+  ~239ms）需要 tensor-core flash attention 才能再上一档（任务 2.10 剩余）。非方形
+  尺寸支持与整栈 CUDA Graph 未做。
 - 单请求 `GpuDecoder::prefill_tokens` 仍在 host 查 embedding（每请求一次，非每步）；
   position 仍是 4B pinned H2D（本就是 int，未做成表）。
 - BF16 专家的 ragged 大批量 prefill 仍是 host top-k + 逐专家 GEMM（grouped 只做了
