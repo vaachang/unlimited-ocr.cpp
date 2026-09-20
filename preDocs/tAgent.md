@@ -54,8 +54,9 @@ ctest --test-dir build-cuda --output-on-failure
 按收益/成本排序。每项给出目标、方案、验收与涉及文件；完成后在本文档勾掉并更新 §1。
 
 > **2026-09-20 优先级**：2.4 device router + 2.2 grouped expert GEMM、2.5 device
-> embedding 均已完成（见下）→ 2.9 权重加载；2.10/2.11 为已完成项收尾；2.6/2.7 需先
-> 确认；2.8 受 ncu 权限限制。✅ 表示已完成（保留一段背景说明）。
+> embedding、2.9 权重加载均已完成（见下）→ 2.10 视觉编码器性能收尾 / 2.11 CUDA 端
+> OCR 端到端回归（2.11 需先导出参考张量）；2.6/2.7 需先确认；2.8 受 ncu 权限限制。
+> ✅ 表示已完成（保留一段背景说明）。
 
 ### ✅ 2.1 高性能 TC GEMM 重写（2026-09-20 完成）
 
@@ -111,13 +112,18 @@ ctest --test-dir build-cuda --output-on-failure
 - **剩余**：单请求 `prefill_tokens` 仍在 host 查表（每请求一次，不是每步）；
   position 仍是 4B pinned H2D（本就是 int，未做成表）。
 
-### 2.9 权重加载优化（prj.md 6.1）
+### ✅ 2.9 权重加载优化（2026-09-20 完成）
 
-- **问题**：nsys 显示权重上传（2.08GB H2D）占 host API 76%，首次加载慢。
-- **方案**：`mmap` + `cudaHostRegister` pinned 直通，或 `cudaMemcpyAsync` 分块流水
-  上传；INT4 量化与上传重叠。
-- **验收**：模型加载墙钟明显下降；显存不变。
-- **涉及**：`src/runtime/weights.cpp`、`src/engine/gpu_decoder.cu`、`GpuEncoder` 构造。
+- **已做**：负载实测的主要成本不是 H2D（~2.1GB / 2s），而是 **INT4 AWQ 量化**
+  （2112 个专家张量、单线程 ~18s）。量化按专家完全独立且 `quantize_int4_awq` 是
+  纯函数、`read_f32` 只读 mmap，故在 `weights.cpp` 的专家循环加
+  `#pragma omp parallel for schedule(dynamic)`（仅 INT4 时）。
+- **结果**：真实模型 `--real --int4` 进程墙钟 **20.5 → 7.4s**（8 核；H2D ~2s 不变），
+  量化结果确定，显存不变。
+- **未做（受环境限制）**：`mmap + cudaHostRegister` pinned 直通——本机 `ulimit -l`
+  只有 **8MB**，无法 pin 6.67GB 权重；分块 pinned 流水意义有限（H2D 仅 ~2s）。
+  nsys 的 “H2D 占 host API 76%” 是 host-track 占比，不代表墙钟。
+- **涉及**：`src/runtime/weights.cpp`。
 
 ### 2.8 性能记录补全
 
@@ -208,6 +214,7 @@ ctest --test-dir build-cuda --output-on-failure
 | P3 DeepEncoder CUDA | SAM+CLIP+projector 设备内核 + f32 GEMM；`GpuEncoder` + Engine 分派 | 单图 1024 **612 ms**（CPU ~2 min）；visual rel_l2 **1.1e-5** |
 | P3 grouped MoE | device router + grouped INT4 gate_up/down（一层 2 次 launch、无 D2H）；tile `bn=32/bm=128` | INT4 整波 prefill 213→**120 ms**、B=16 **~518** tok/s；ragged rel_l2 1.7e-3 vs host |
 | P3 device embedding | bf16/f32 表设备常驻 + `embed_gather`；单请求 Graph 内 gather、batch 只传 token id | 每步无隐含 H2D；greedy 不变；显存 +331MB |
+| P3 权重加载 | INT4 专家量化改为 OpenMP 并行（`weights.cpp` 专家循环） | 真实模型加载墙钟 **20.5 → 7.4s**；显存不变 |
 
 ---
 

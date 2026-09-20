@@ -83,6 +83,7 @@ unlimited-ocr.cpp/
 ✅ DeepEncoder CUDA 移植（SAM+CLIP+projector 设备内核 + f32 GEMM；P3）
 ✅ ragged prefill device router + grouped INT4 专家 GEMM（一层 2 次 launch、无 D2H；P3）
 ✅ device embedding 查表（表设备常驻 + `embed_gather`，每步无 embedding H2D；P3）
+✅ 权重加载：INT4 量化 OpenMP 并行（真实模型加载 20.5→7.4s；P3）
 ```
 
 ## 4. 开发历程
@@ -102,6 +103,7 @@ unlimited-ocr.cpp/
 | 2026-09-20 P3 | DeepEncoder CUDA 移植（`GpuEncoder` + vision 内核 + f32 tiled GEMM），Engine `set_vision_gpu` 分派 | `CORE_TECH.md` §5.8、`BENCHMARKS.md` §2.9、`PITFALLS.md` §18、`tools/compare_vision_gpu` |
 | 2026-09-20 P3 | ragged prefill 的 device router + grouped INT4 专家 GEMM（一层 2 次 launch、无 D2H；`bn=32/bm=128`） | `CORE_TECH.md` §5.9、`BENCHMARKS.md` §2.10、`PITFALLS.md` §19；INT4 整波 prefill 213→120 ms |
 | 2026-09-20 P3 | device embedding 查表（表设备常驻 bf16/f32 + `embed_gather`；单请求 Graph 内 gather、batch 只传 token id） | `CORE_TECH.md` §5.10、`BENCHMARKS.md` §2.11；每步无 embedding H2D，greedy 不变 |
+| 2026-09-20 P3 | 权重加载：INT4 专家量化 OpenMP 并行化（量化是加载墙钟主要成本，非 H2D） | `CORE_TECH.md` §5.11、`BENCHMARKS.md` §2.12；加载 20.5→7.4s |
 
 > 每一步的实现/坑/数据分别沉淀在 `CORE_TECH.md` / `PITFALLS.md` / `BENCHMARKS.md`；
 > 当前性能与回归见 `tAgent.md` §1。

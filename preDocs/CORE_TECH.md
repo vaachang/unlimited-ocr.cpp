@@ -69,6 +69,12 @@ w'    = (q - zero) * scale
 MoE 权重在 `DecoderWeights::load(..., quantize_experts_int4=true)` 时按需量化；
 默认保持 BF16 零拷贝视图以避免不必要的 CPU 开销与内存。
 
+**加载耗时**：真实模型 INT4 加载墙钟主要由 2112 个专家张量的量化决定（单线程 ~18s），
+H2D 上传只有 ~2s。量化按专家独立、`quantize_int4_awq` 为纯函数、`read_f32` 只读
+mmap，因此在 `weights.cpp` 的专家循环加 `#pragma omp parallel for schedule(dynamic)`
+（仅在量化时并行；`_OPENMP` 未定义时自动退化为串行），实测进程墙钟 20.5→7.4s。
+`cudaHostRegister` 直通方案受本机 `ulimit -l = 8MB` 限制无法实施（见 `tAgent.md` §2.9）。
+
 ## 4. Block Manager 与显存池（`include/uocr/block_manager.h`, `src/scheduler/`）
 
 - `MemoryPool`：偏移式 arena + 空闲链表 + 相邻合并，可统计 `used/peak/fragmentation`。

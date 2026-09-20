@@ -1,0 +1,12 @@
+[15:06:13][INFO] decoder weights loaded from models/model-00001-of-000001.safetensors  (/home/admin/MyDocs/unlimited-ocr.cpp/src/runtime/weights.cpp:221)
+[15:06:16][INFO] engine created (CUDA backend)  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:60)
+[15:06:16][INFO] batch done: 1 requests, 1 decode tokens, 45.2 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:423)
+[15:06:16][INFO] batch done: 1 requests, 1 decode tokens, 43.5 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:423)
+device: NVIDIA GeForce RTX 5060 Ti (sm_120, 36 SMs, 15.6 GB)
+prompt=64 steps=1 max_batch=1 experts=INT4 graph=on grouped_bn=32 bm=128
+ batch   prefill_ms    decode_ms          tok/s       peakMB
+     1         43.3         43.6           22.9       2584.0
+
+real	0m7.215s
+user	0m34.332s
+sys	0m1.796s

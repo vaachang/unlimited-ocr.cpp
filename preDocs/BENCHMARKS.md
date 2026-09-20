@@ -308,6 +308,23 @@ embedding 表常驻设备后（`CORE_TECH.md` §5.10）：
 每步不再有 `hidden` / `batch*hidden` 的 embedding H2D；`uocr_cuda_tests` greedy
 不变（`compare_ocr` 走 CPU 参考路径，不受影响）。
 
+## 2.12 权重加载墙钟（`--real --int4`，2026-09-20）
+
+| 阶段 | 串行量化 | OpenMP 量化（8 核） |
+|---|---|---|
+| 进程墙钟（加载+1 step） | **20.5 s** | **7.4 s** |
+| 其中 GpuDecoder H2D 上传 | ~2 s | ~2 s（不变） |
+
+主要成本是 2112 个专家张量的 INT4 AWQ 量化（CPU），不是 H2D；并行化后用户态 CPU
+时间从 18.9s 升到 34.7s（多核），墙钟降至 7.4s。测量命令：
+
+```bash
+time ./build-cuda/benchmarks/bench_cuda_batch --real --int4 --prompt 64 --steps 1 \
+     --max-batch 1 --only-batch 1
+```
+
+`mmap + cudaHostRegister` pinned 直通受本机 `ulimit -l = 8MB` 限制不可行（`tAgent.md` §2.9）。
+
 ## 3. 回归快照
 
 数值对齐的方法、逐项结果与根因分析统一记录在 **`ALIGNMENT.md`**（端到端 OCR

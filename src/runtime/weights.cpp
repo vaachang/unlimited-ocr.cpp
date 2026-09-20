@@ -195,6 +195,13 @@ DecoderWeights DecoderWeights::load(const std::string& path, const ModelConfig& 
         } else {
             L.router = view_bf16(st, p + "mlp.gate.weight");
             L.experts.resize(cfg.n_routed_experts);
+            // INT4 quantization is the dominant load cost and each expert is
+            // independent, so fan the (otherwise serial) loop out over cores.
+            // `read_f32` reads the mmap directly and `quantize_int4_awq` is a
+            // pure function, so this is data-race free.
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(dynamic) if (quantize_experts_int4)
+#endif
             for (int e = 0; e < cfg.n_routed_experts; ++e) {
                 const std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
                 L.experts[e].gate =
