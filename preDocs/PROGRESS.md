@@ -79,6 +79,7 @@ unlimited-ocr.cpp/
 ✅ 合并访存内核 + 分块/TC prefill GEMM
 ✅ 连续批处理（batched attention + ragged 多请求 prefill + slot 映射修复）
 ✅ bf16 tensor-core GEMM（dense/shared + lm_head + 小 m 变体）
+✅ cp.async 流水线 TC GEMM（bf16 + INT4 专家，bank-conflict-free padding；P3）
 ```
 
 ## 4. 开发历程
@@ -94,6 +95,7 @@ unlimited-ocr.cpp/
 | 2026-09-19 P2-② | 合并访存内核 + INT4 TC `ldmatrix` + 分块 prefill GEMM | `CORE_TECH.md` §5.4/§5.3、`BENCHMARKS.md` §2.5 |
 | 2026-09-19 P2-③ | 连续批处理接入 device decoder、batched attention、ragged prefill、slot 修复 | `CORE_TECH.md` §5.6、`BENCHMARKS.md` §2.6 |
 | 2026-09-19 P2-④ | batched decode CUDA Graph、bf16 TC GEMM（+小 m 变体）、INT4 专家 GEMM 调优、nsys 分解 | `CORE_TECH.md` §5.5/§5.7、`BENCHMARKS.md` §2.5/§2.6–2.8 |
+| 2026-09-20 P3 | cp.async 流水线 bf16 TC GEMM（padding 去 bank 冲突）、INT4 专家 GEMM 向量化 staging + `bn=8/bk=64`、cp.async 备选变体 | `CORE_TECH.md` §5.5/§5.5b、`BENCHMARKS.md` §2.5/§2.7、`PITFALLS.md` §16/§17 |
 
 > 每一步的实现/坑/数据分别沉淀在 `CORE_TECH.md` / `PITFALLS.md` / `BENCHMARKS.md`；
 > 当前性能与回归见 `tAgent.md` §1。

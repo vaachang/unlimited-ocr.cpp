@@ -258,3 +258,29 @@ position_ids = arange(past_key_values_length, seq_length + past_key_values_lengt
 - **lm_head 是已知性能短板**：n=129280、小 m 时即使 4 个 warp 全用上也只有 ~2 TFLOPS
   （受权重读取/每 k-step 同步限制），非正确性问题。实现见 `CORE_TECH.md` §5.5，
   数据见 `BENCHMARKS.md` §2.7。
+
+## 16. cp.async GEMM 重写的坑（2026-09-20，P3）
+
+- **共享内存行跨度决定 `ldmatrix` 的 bank 冲突**：BK=16 时 sA/sW 行跨度 16×2=32B，
+  8 个 `ldmatrix` 行只落在 2 个 bank 组（4 路冲突）；BK=32 时 64B 跨度同样退化。
+  行尾 **padding 8 个 bf16**（跨度 40×2=80B）后 8 行的 `(20·r mod 32)` 互不相同，
+  无冲突。padding 后行跨度仍须是 16B 的整数倍，否则 `cp.async`（要求 16B 对齐）无法写。
+- **`cp.async.wait_group N` 的尾部语义**：稳态下用 `wait_group(STAGES-2)` 只保留
+  `STAGES-2` 个组在途；但接近 k 末尾时后续组根本没发出去，仍用 N=STAGES-2 会让
+  “当前要用的那一组”尚未完成。必须 `if (k0+STAGES-1 < nk) wait<STAGES-2>(); else
+  wait<0>();` 在尾部排空。
+- **微基准不能完全预测端到端**：单形状重复计时下，m=64–273 的同步 bf16 内核比
+  cp.async 版更快（小 smem、高占用），但真实整波 prefill 用 cp.async 版快约 20%
+  （`prefill 212→164ms`）——连续内核之间的访存重叠不同。**改完 GEMM 必须跑
+  `bench_cuda_batch --real` 复核**，不要只看 `bench_bf16_gemm`。
+- **INT4 用“寄存器里逐 lane 拼 A fragment”不如 vectorized 共享 staging**：直接按
+  fragment 布局每 lane 发 16 个标量 float 载入，指令数比 `float4` staging + `ldmatrix`
+  多，只在 m≤32 时占优。最终 INT4 走 `float4` staging + `BK=64`（`bn=8/bk=64`），
+  cp.async 变体作为备选保留（`moe_gemm_int4_tc_pipe`）。
+- **`moe_gemm_int4_kernel` 标量路径只用于正确性基线**，不要用于性能对比之外的场合。
+
+## 17. ncu 不可用（2026-09-20）
+
+本机 `ncu` 报 `ERR_NVGPUCTRPERM`（无 GPU 性能计数器权限），无法采 SM/DRAM 利用率。
+`nsys` 可用（kernel 时间线），性能归因靠几何分析 + 消融实验。任务 2.8 的 ncu 项
+受此限制。

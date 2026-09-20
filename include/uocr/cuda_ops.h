@@ -163,6 +163,21 @@ void moe_gemm_int4_tc_n(const float* x, const std::uint8_t* packed, const float*
                         const float* zeros, int m, int n, int k, int group_size, float* y,
                         int bn, cudaStream_t stream = 0);
 
+// Tile-width + k-depth parameterised variant for tuning: `bn` in {8,16,32,64},
+// `bk` in {16,32,64}.  Larger `bk` halves/quarters the number of k-steps and
+// their syncs; the default `moe_gemm_int4_tc` uses bn=8, bk=16.
+void moe_gemm_int4_tc_nk(const float* x, const std::uint8_t* packed, const float* scales,
+                         const float* zeros, int m, int n, int k, int group_size, float* y,
+                         int bn, int bk, cudaStream_t stream = 0);
+
+// cp.async-pipelined variant: packed weights are prefetched into a 3-stage
+// shared ring and activations are register-resident, so only one
+// `__syncthreads` per k-step is needed.  `bn` in {8,16,32,64}; the default
+// `moe_gemm_int4_tc` uses this kernel.
+void moe_gemm_int4_tc_pipe(const float* x, const std::uint8_t* packed, const float* scales,
+                           const float* zeros, int m, int n, int k, int group_size, float* y,
+                           int bn, cudaStream_t stream = 0);
+
 // out[i] = silu(gate[i]) * up[i]
 void silu_mul(const float* gate, const float* up, float* out, int n, cudaStream_t stream = 0);
 

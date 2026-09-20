@@ -81,20 +81,32 @@ int main(int argc, char** argv) {
 
     std::printf("INT4 GEMM n=%d k=%d group=%d iters=%d\n", n, k, group, iters);
     const int bns[3] = {8, 16, 32};
-    std::printf("%6s %14s", "m", "scalar(us)");
-    for (int b : bns) std::printf(" %10s", (std::string("tc bn=") + std::to_string(b)).c_str());
+    const int bks[3] = {16, 32, 64};
+    const int pipe_bns[4] = {8, 16, 32, 64};
+    std::printf("%6s %12s", "m", "scalar(us)");
+    for (int b : bks)
+        for (int bn_ : bns) std::printf(" %10s", (std::string("bn") + std::to_string(bn_) + "/bk" + std::to_string(b)).c_str());
+    for (int bn_ : pipe_bns) std::printf(" %10s", (std::string("pipe") + std::to_string(bn_)).c_str());
     std::printf("\n");
     for (int m : {1, 8, 32, 64, 96, 128, 273}) {
         if (m > 273) continue;
         const double t_scalar = time_us([&] {
             uocr::cuda::moe_gemm_int4(d_x, d_p, d_s, d_z, m, n, k, group, d_y);
         }, iters);
-        std::printf("%6d %14.1f", m, t_scalar);
-        for (int b : bns) {
-            const double t_tc = time_us([&] {
-                uocr::cuda::moe_gemm_int4_tc_n(d_x, d_p, d_s, d_z, m, n, k, group, d_y, b);
+        std::printf("%6d %12.1f", m, t_scalar);
+        for (int b : bks) {
+            for (int bn_ : bns) {
+                const double t_tc = time_us([&] {
+                    uocr::cuda::moe_gemm_int4_tc_nk(d_x, d_p, d_s, d_z, m, n, k, group, d_y, bn_, b);
+                }, iters);
+                std::printf(" %10.1f", t_tc);
+            }
+        }
+        for (int bn_ : pipe_bns) {
+            const double t = time_us([&] {
+                uocr::cuda::moe_gemm_int4_tc_pipe(d_x, d_p, d_s, d_z, m, n, k, group, d_y, bn_);
             }, iters);
-            std::printf(" %10.1f", t_tc);
+            std::printf(" %10.1f", t);
         }
         std::printf("\n");
     }

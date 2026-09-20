@@ -14,12 +14,12 @@
 
 ---
 
-## 1. 当前状态（2026-09-19 快照）
+## 1. 当前状态（2026-09-20 快照）
 
 - **后端**：CPU 参考（OpenMP）+ CUDA 生产（sm_120），`-DENGINE_BACKEND=CPU|CUDA` 双构建。
 - **完成度**：M1–M6、P0（端到端 OCR 对齐 E0–E5）、P1（R-SWA 环形覆写 / CUDA 设备端
   decoder）、P2（TC INT4 GEMM、CUDA Graph、device INT4 权重、连续批处理、batched graph、
-  bf16 TC GEMM、INT4 专家 GEMM 调优）均已完成。**约 85–90%**（对照 `prj.md`）。
+  bf16 TC GEMM）、P3（cp.async 流水线 TC GEMM 重写）均已完成。**约 88–92%**（对照 `prj.md`）。
 - **回归**：`compare_ocr` greedy **24/24**（CPU 参考路径）；`uocr_tests` **20/20**；
   `uocr_cuda_tests` **全过**（batched 排列 / ragged prefill / slot 复用 / batched graph /
   TC vs ref）。
@@ -27,10 +27,11 @@
 
   | 指标 | 值 |
   |---|---|
-  | BF16 batch=16 吞吐 | **415.9 tok/s** |
-  | INT4 batch=16 吞吐 | **386.8 tok/s**（显存 2.2GB） |
-  | 整波 prefill（16 请求） | **212 ms** BF16 / **204 ms** INT4 |
-  | batch=1 吞吐 | 149.4 BF16 / 130.9 INT4 tok/s |
+  | BF16 batch=16 吞吐 | **521.6 tok/s** |
+  | INT4 batch=16 吞吐 | **429.3 tok/s**（显存 2.2GB） |
+  | 整波 prefill（16 请求） | **161 ms** BF16 / **213 ms** INT4 |
+  | batch=1 吞吐 | 155.8 BF16 / 132.9 INT4 tok/s |
+  | lm_head m=16（n=129280） | **1174 µs**（原 2652，2.3×） |
 
 - 性能数据明细见 `BENCHMARKS.md` §2.5–2.8；历史进度见 `PROGRESS.md` §4。
 
@@ -49,20 +50,18 @@ ctest --test-dir build-cuda --output-on-failure
 
 按收益/成本排序。每项给出目标、方案、验收与涉及文件；完成后在本文档勾掉并更新 §1。
 
-### 2.1 高性能 TC GEMM 重写（最大剩余项）
+### ✅ 2.1 高性能 TC GEMM 重写（2026-09-20 完成）
 
-- **问题**：现有 TC 内核每个 warp 每 k-step 只发 1 个 mma + 2 次 `__syncthreads`，
-  流水太短，实测仅 4–18 TFLOPS（硬件上限 ~80）。nsys 显示 prefill 逐专家
-  `moe_gemm_int4_tc` 占 **55%** kernel 时间。
-- **方案**：更大 tile（128×128 / 256×128）+ register tiling + `cp.async` 双缓冲 +
-  shared-memory swizzle；先做 bf16 版（`matmul_t_bf16`），再套到 INT4 专家 GEMM。
-- **收益面**：prefill 专家 GEMM、bf16 dense/shared、lm_head（大 n 仅 1.5–8 TFLOPS）。
-- **验收**：`bench_bf16_gemm` / `bench_int4_gemm` 峰值 TFLOPS 显著提升；真实模型
-  prefill 与 tok/s 改善；所有 TC 单测 rel_l2 不退化。
-- **涉及**：`src/kernels/cuda/backend.cu`、`src/kernels/cuda/moe_gemm_int4.cu`；
-  先看 `CORE_TECH.md` §5.3/§5.5、`BENCHMARKS.md` §2.5/§2.7。
+- **已做**：`matmul_t_bf16` 换成 cp.async 多级 ring + bank-conflict-free padding 的
+  `matmul_t_bf16_tc_pipe_kernel`（m≤16 的 n 拆分小 tile / m>16 的 64×64 tile）；
+  INT4 专家 GEMM 激活 staging 向量化并把默认 tile 改为 `bn=8/bk=64`，另加 cp.async
+  备选变体。详见 `CORE_TECH.md` §5.5 / §5.5b，数据见 `BENCHMARKS.md` §2.5/§2.7。
+- **结果**：lm_head m=8/16 2.3×；BF16 batch=16 416→~520 tok/s、整波 prefill
+  212→~164 ms；INT4 batch=16 387→~431 tok/s。
+- **剩余**（并入 2.2）：m>16 的 bf16 kernel 每 n-tile 重读 A；`moe_gemm_int4_tc`
+  仍是逐专家发射，grouped GEMM 未做。
 
-### 2.2 Grouped expert GEMM（与 2.1 合并做收益最大）
+### 2.2 Grouped expert GEMM（当前最大剩余项）
 
 - **问题**：`forward_ragged` 每层逐专家发 3×64 个 `moe_gemm_int4_tc`
   （整轮 12096 次、avg 55µs），发射与低占用开销大。
@@ -170,6 +169,7 @@ ctest --test-dir build-cuda --output-on-failure
 | P2 batched graph | 按行数 B 缓存图，活跃集合变化免重捕获 | graph vs plain rel_l2 = 0 |
 | P2 bf16 TC GEMM | dense/shared + lm_head + 小 m 变体 | BF16 batch16 → 415.9 tok/s |
 | P2 INT4 专家调优 | BN 模板 + staging 重写 | 整波 prefill −10% |
+| P3 TC GEMM 重写 | bf16 cp.async 流水线 + padding；INT4 向量化 staging + bn8/bk64；cp.async 备选变体 | BF16 batch16 416→**522** tok/s、prefill 212→**161** ms；lm_head m≤16 **2.3×**；INT4 batch16→**429** |
 
 ---
 

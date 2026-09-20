@@ -1,20 +1,8 @@
-[16:27:42][INFO] decoder weights loaded from models/model-00001-of-000001.safetensors  (/home/admin/MyDocs/unlimited-ocr.cpp/src/runtime/weights.cpp:214)
-[16:27:44][INFO] engine created (CUDA backend)  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:57)
-[16:27:44][INFO] batch done: 1 requests, 16 decode tokens, 126.8 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
-[16:27:44][INFO] batch done: 1 requests, 16 decode tokens, 126.7 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
-[16:27:45][INFO] batch done: 2 requests, 32 decode tokens, 298.4 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
-[16:27:45][INFO] batch done: 2 requests, 32 decode tokens, 296.0 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
-[16:27:45][INFO] batch done: 4 requests, 64 decode tokens, 366.1 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
-[16:27:46][INFO] batch done: 4 requests, 64 decode tokens, 372.5 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
-[16:27:46][INFO] batch done: 8 requests, 128 decode tokens, 478.2 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
-[16:27:47][INFO] batch done: 8 requests, 128 decode tokens, 476.7 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
-[16:27:47][INFO] batch done: 16 requests, 256 decode tokens, 685.2 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
-[16:27:48][INFO] batch done: 16 requests, 256 decode tokens, 703.2 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:420)
 device: NVIDIA GeForce RTX 5060 Ti (sm_120, 36 SMs, 15.6 GB)
 prompt=64 steps=16 max_batch=16 experts=INT4 graph=off
  batch   prefill_ms    decode_ms          tok/s       peakMB
-     1         49.7        126.8          126.2       2268.0
-     2         91.0        296.2          108.0       2322.0
-     4        124.1        372.6          171.8       2424.0
-     8        160.5        476.8          268.5       2640.0
-    16        227.2        703.5          363.9       3048.0
+     1         48.0        121.1          132.1       2268.0
+     2         87.9        213.7          149.7       2322.0
+     4        118.4        279.1          229.3       2424.0
+     8        145.3        387.6          330.3       2640.0
+    16        207.8        591.5          432.8       3048.0

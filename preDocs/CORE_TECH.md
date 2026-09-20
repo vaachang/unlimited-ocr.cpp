@@ -134,10 +134,11 @@ scale/zero），显存从 9.2GB 降到 2.2GB。`moe_experts_masked_int4` 在 ker
 按 group 反量化，权重读取同样是 warp-per-output 合并访存。
 
 prefill 的大批量专家计算走 `moe_gemm_int4_tc`（W4A16 TC GEMM，详见
-`BENCHMARKS.md` §2.5）：模板参数 `BN` 控制每 block 的 n 列宽，专家 GEMM 的
-N=896/1280 下经验最优是 **BN=8**（更宽的 tile 会让 block 数掉到 36 个 SM 以下）。
-权重 panel 的反量化 staging 由 128 线程按元素循环完成；`moe_gemm_int4_tc_n` 可扫
-bn∈{8,16,32,64}。
+`BENCHMARKS.md` §2.5 与 `CORE_TECH.md` §5.5b）：模板参数 `BN`/`BK` 控制每 block 的
+n 列宽与 k 步长，专家 GEMM 的 N=896/1280 下经验最优是 **BN=8 / BK=64**（更宽的 BN
+会让 block 数掉到 36 个 SM 以下；更大的 BK 摊薄同步开销）。权重 panel 的反量化
+staging 由 128 线程完成；`moe_gemm_int4_tc_nk` 可扫 bn∈{8,16,32,64}×bk∈{16,32,64}，
+另提供 cp.async 变体 `moe_gemm_int4_tc_pipe`。
 
 ### 5.4 合并访存内核（P2 性能）
 
@@ -146,32 +147,48 @@ gate_up/down 内核修复了“相邻线程按行 stride 读权重”导致的 ~
 `matmul_t_bf16` 的 CUDA-core 参考版保留为 64×64 分块 + shared memory staging
 （panel 补 1 列避免 bank conflict），见 §5.5 的 tensor-core 取代。
 
-### 5.5 bf16 tensor-core GEMM（P2，2026-09-19）
+### 5.5 bf16 tensor-core GEMM（P2，P3 重写 2026-09-20）
 
-`matmul_t_bf16`（dense/shared 投影与 lm_head 的主力）从 CUDA-core 分块 GEMM
-换成 `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`：
+`matmul_t_bf16`（dense/shared 投影与 lm_head 的主力）用
+`mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`，P3 起统一改用带
+`cp.async` 流水线的 `matmul_t_bf16_tc_pipe_kernel`：
 
-- block = 4 warps 计算 64(m)×64(n) tile，`kTCM=64/kTCN=64/kTCK=16`。激活值 staging
-  时 `__float2bfloat16`；权重已是 bf16 直接搬。A 用 `ldmatrix.x4`、B（`W[n][k]`
-  行主序 = mma 的 col-major）用 `ldmatrix.x2`，每个 warp 负责 16 行 m、遍历 8 个
-  n8 子块。grid = `(ceil(n/64), ceil(m/64))`，block=128 线程。
-- **小 m 不浪费**：m 不足 64 时，16 行切片完全越界的 warp 跳过 mma 循环（仍参与
-  `__syncthreads`），因此 decode 的 m=16 不会为 64 行 tile 付出 4× 计算。
-- **小 m 变体**（m ≤ 16）：另一个 BM=16/BN=64 的内核让 4 个 warp **沿 n 方向**
-  各算 16 列（各 2 个 n8 子块），避免上面 64 行内核在 m=16 时只有 1 个 warp 做
-  mma。`matmul_t_bf16` 在 m ≤ 16 时分派到它；n=k=1280、m=16 时
-  36.1→30.1µs（1.74 TFLOPS，+20%）。
+- **cp.async 多级 ring + bank-conflict-free padding**（`src/kernels/cuda/backend.cu`）：
+  权重面板以 `cp.async` 预取进共享内存 ring（m≤16 用 STAGES=4，m>16 用 STAGES=3），
+  在处理当前面板时下一面板已在传输；共享行尾 padding 8 个 bf16，使 BK=32 时
+  `ldmatrix`（x4 取 A、x2 取 B）无 bank 冲突。每 k-step 只需 **一次**
+  `__syncthreads`：环形下一内存槽由该同步保证已释放，尾部用 `wait_group(0)` 排空。
+- **两种 tile**：`SMALL=true`（m≤16，decode/batched lm_head）BM=16、4 warp 沿 n
+  拆分（BN=64，每 warp 16 列 = 2 个 n8）；`SMALL=false`（m>16，prefill）BM=64、
+  4 warp 各 16 行、遍历 8 个 n8。激活面板在计算前用 vectorized `float4` 载入并转
+  bf16（L2 命中），权重走 cp.async。
 - **回退/对照**：`matmul_t_bf16_ref`（原 CUDA-core 分块内核）保留，供单测 A/B；
   单测在 `m∈{3,16,40,64,273}`、`k∈{48,64,128,160,256}` 上 TC vs ref
   rel_l2 ≤ 0.0018。
-- `batch_decode`/ragged prefill 的 lm_head 在行数 ==1 时走 `matvec_bf16`
+- `batch_decode`/ragged prefill 的 lm_head 在行数 ==1 时仍走 `matvec_bf16`
   （避免用 GEMM 处理单行）。
+- **残留**：m>16 的 kernel 每个 n-tile 重读一次 A、权重按 tile 读一次；更大 tile
+  （BM=128）与 grouped expert GEMM（任务 2.2）是后续方向。
 - 微基准（`bench/bench_bf16_gemm_*.txt`，RTX 5060 Ti）：
-  - n=k=1280：m=16 时 84.7→30.1µs（2.8×），m=273 时 217.4→48.7µs（4.5×，18.4 TFLOPS）。
-  - lm_head n=129280、k=1280：m=16 时 3832→2652µs（1.44×，2.0 TFLOPS）——即使 4 个
-    warp 全用上仍受权重读取/同步限制，是后续调优点（split-K、更大 BN、`cp.async`）。
-- 真实模型连续批处理（`BENCHMARKS.md` §2.6）：BF16 batch=16 298→**416** tok/s、
-  整波 prefill 367→**212 ms**；INT4 batch=16 308→**387** tok/s、prefill 279→**204 ms**。
+  - n=k=1280：m=8 31.3→**16.7µs**（1.9×）、m=16 31.7→**17.2µs**（1.8×）、
+    m=273 52.2→**48.5µs**（18.5 TFLOPS）。
+  - lm_head n=129280、k=1280：m=8 2633→**1147µs**（2.3×）、m=16 2651→**1174µs**
+    （2.3×）——m≤16 的 lm_head 是本次最大收益点。
+- 真实模型连续批处理（`BENCHMARKS.md` §2.6）：BF16 batch=16 416→**~520** tok/s、
+  整波 prefill 212→**~164 ms**；INT4 batch=16 387→**~431** tok/s。
+
+### 5.5b INT4 专家 GEMM 的 P3 调优（2026-09-20）
+
+`moe_gemm_int4_tc`（prefill 逐专家 W4A16）在 P3 做了两处改动：
+- **激活 staging 向量化**：原按元素标量 `x[gm*k+gk]` 改为 `float4` 载入 + 转 bf16
+  写入带 padding 的 `sA`，每线程指令数从 8 降到 2。
+- **默认 tile 改为 `bn=8 / bk=64`**：`bk` 从 16 增到 64 把 k-step 从 80 降到 20，
+  同步/发射开销大幅下降；`bn=8` 保留高 block 数（延迟隐藏）。`moe_gemm_int4_tc_nk`
+  可扫 `bn∈{8,16,32,64}×bk∈{16,32,64}`。
+- **备选 cp.async 变体**：`moe_gemm_int4_tc_pipe`（packed 权重异步预取 + 激活驻留
+  寄存器）在 m≤32 时最优（m=1 30.2→26.1µs），但 m≈96（prefill 平均每专家 token 数）
+  时不如 `bk=64` 的向量化同步版，故仅保留供 `bench_int4_gemm` 调优对照。
+- 微基准：n=896/k=1280 时 m=96 51.1→**49.1µs**、m=273 111.7→**97.3µs**（`bn=8/bk=64`）。
 
 ### 5.6 连续批处理（P2 收尾，2026-09-19）
 
