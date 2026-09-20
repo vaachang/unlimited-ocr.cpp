@@ -15,6 +15,12 @@ namespace cuda {
 // y[m,n] = x[m,k] * W[n,k]^T + bias[n]; W may be f32 or bf16.
 void matmul_t(const float* x, const float* w, const float* bias, float* y, int m, int n, int k,
               cudaStream_t stream = 0);
+
+// Fully-f32 tiled GEMM (bf16 weights upcast to f32, f32 activations/accum).
+// Used by the vision encoder where bf16 activation rounding would drift too
+// far from the f32 reference.
+void matmul_t_f32w(const float* x, const std::uint16_t* w, const float* bias, float* y, int m,
+                   int n, int k, cudaStream_t stream = 0);
 void matmul_t_bf16(const float* x, const std::uint16_t* w, const float* bias, float* y, int m,
                    int n, int k, cudaStream_t stream = 0);
 
@@ -191,6 +197,45 @@ void scatter_add_scaled(float* out, const float* vals, const int* row_idx, const
 // dst[r, :] = src[row_idx[r], :]
 void gather_rows(float* dst, const float* src, const int* row_idx, int rows, int cols,
                  cudaStream_t stream = 0);
+
+// ---------------------------------------------------------------------------
+// DeepEncoder (vision) kernels.  See src/kernels/cuda/vision_ops.cu.
+// ---------------------------------------------------------------------------
+
+// out[r,c] = (x[r,c]-mean)/sqrt(var+eps) * w[c] + b[c] (w/b may be null).
+void layernorm_rows(const float* x, const float* w, const float* b, float* out, int rows,
+                    int cols, float eps, cudaStream_t stream = 0);
+
+// Exact erf-GELU / QuickGELU, in place.
+void gelu_inplace(float* x, int n, cudaStream_t stream = 0);
+void quick_gelu_inplace(float* x, int n, cudaStream_t stream = 0);
+
+// y[r,c] += bias[c].
+void add_bias_rows(float* y, const float* bias, int rows, int cols, cudaStream_t stream = 0);
+
+// y[i] += x[i].
+void add_inplace(float* y, const float* x, int n, cudaStream_t stream = 0);
+
+// im2col for a CHW image: out [(Ho*Wo), Cin*Kh*Kw], laid out (ci,kh,kw).
+void im2col_chw(const float* x, float* out, int Cin, int H, int W, int Kh, int Kw, int stride,
+                int pad, int Ho, int Wo, cudaStream_t stream = 0);
+
+// im2col for an HWC activation [H,W,C]; out [(Ho*Wo), C*Kh*Kw].
+void im2col_hwc(const float* x, float* out, int Cin, int H, int W, int Kh, int Kw, int stride,
+                int pad, int Ho, int Wo, cudaStream_t stream = 0);
+
+// Window partition/unpartition of an HWC activation [H,W,C] with padded grid
+// (Hp=nh*ws, Wp=nw*ws); out [(nh*nw), ws, ws, C].
+void window_partition(const float* x, float* out, int H, int W, int C, int ws, int nh, int nw,
+                      cudaStream_t stream = 0);
+void window_unpartition(const float* win, float* x, int H, int W, int C, int ws, int nh, int nw,
+                        cudaStream_t stream = 0);
+
+// Flash-style attention over a packed [B,S,3*C] qkv (C=heads*hd, hd=64).
+// When `relpos` is set, adds SAM's decomposed relative position bias from
+// `relh` [(2H-1)*hd] and `relw` [(2W-1)*hd].
+void attention_flash(const float* qkv, const float* relh, const float* relw, float* out, int B,
+                     int S, int H, int W, int heads, bool relpos, cudaStream_t stream = 0);
 
 // Device information.
 struct DeviceInfo {

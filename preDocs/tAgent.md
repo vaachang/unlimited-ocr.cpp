@@ -19,7 +19,8 @@
 - **后端**：CPU 参考（OpenMP）+ CUDA 生产（sm_120），`-DENGINE_BACKEND=CPU|CUDA` 双构建。
 - **完成度**：M1–M6、P0（端到端 OCR 对齐 E0–E5）、P1（R-SWA 环形覆写 / CUDA 设备端
   decoder）、P2（TC INT4 GEMM、CUDA Graph、device INT4 权重、连续批处理、batched graph、
-  bf16 TC GEMM）、P3（cp.async 流水线 TC GEMM 重写）均已完成。**约 88–92%**（对照 `prj.md`）。
+  bf16 TC GEMM）、P3（cp.async 流水线 TC GEMM、DeepEncoder CUDA 移植）均已完成。
+  **约 92–95%**（对照 `prj.md`）。
 - **回归**：`compare_ocr` greedy **24/24**（CPU 参考路径）；`uocr_tests` **20/20**；
   `uocr_cuda_tests` **全过**（batched 排列 / ragged prefill / slot 复用 / batched graph /
   TC vs ref）。
@@ -32,6 +33,7 @@
   | 整波 prefill（16 请求） | **161 ms** BF16 / **213 ms** INT4 |
   | batch=1 吞吐 | 155.8 BF16 / 132.9 INT4 tok/s |
   | lm_head m=16（n=129280） | **1174 µs**（原 2652，2.3×） |
+  | 单图视觉编码（1024, GPU） | **612 ms**（CPU 参考 ~2 min；rel_l2 1.1e-5） |
 
 - 性能数据明细见 `BENCHMARKS.md` §2.5–2.8；历史进度见 `PROGRESS.md` §4。
 
@@ -72,17 +74,19 @@ ctest --test-dir build-cuda --output-on-failure
 - **涉及**：`src/kernels/cuda/moe_gemm_int4.cu`、`src/engine/gpu_decoder.cu`
   （`mlp_block` / `forward_ragged`）。
 
-### 2.3 DeepEncoder CUDA 移植（GPU 卸载缺口，工作量最大）
+### ✅ 2.3 DeepEncoder CUDA 移植（2026-09-20 完成）
 
-- **问题**：视觉编码器（SAM-ViT + CLIP-ViT + projector，~1.5GB FP16）**纯 CPU/OpenMP**，
-  `src/engine/deep_encoder.cpp` 无任何 CUDA；`Engine::image_embeddings` 在 CUDA 后端也
-  调它，单图编码约 1–2 分钟。`prj.md` 架构图写的是「DeepEncoder (FP16, CUDA Graph)」。
-- **方案**：patch/pos embed、12 层 SAM block、neck、CLIP×24、projector 做成设备内核，
-  FP16 权重常驻；可复用现有 `rmsnorm`/`matmul_t`/attention 内核。
-- **验收**：`tools/compare_vision` 在 CUDA 后端输出与 CPU/f32 参考 rel_l2 ≤ 6e-4；
-  单图编码进入亚秒级。
-- **涉及**：新增 `src/engine/deep_encoder.cu` / `GpuEncoder`，改造 `DeepEncoder` 接口
-  以支持后端分派；参考 `CORE_TECH.md` §5.1、`PITFALLS.md` §4/§9、`ALIGNMENT.md` §4。
+- **已做**：新增 `src/engine/gpu_encoder.cu`（`cuda::GpuEncoder`）与
+  `src/kernels/cuda/vision_ops.cu`（layernorm / gelu / im2col / window partition /
+  flash attention）。patch+pos、12 层 SAM、neck、net2/net3、CLIP×24、projector
+  全部设备执行；线性权重 bf16 常驻，但用 **f32 tiled GEMM**（`matmul_t_f32w`）以
+  匹配 f32 参考（bf16 激活在深层栈里会漂到 ~11%）。`Engine::set_vision_gpu()` +
+  `image_embeddings` 分派，`tools/compare_ocr --gpu-vision` 可端到端验证。
+- **结果**：`tools/compare_vision_gpu` visual rel_l2 **1.1e-5**（验收 ≤6e-4）；
+  单图 1024 编码 **612 ms**（CPU ~2 min）、640 153 ms、224 34 ms。
+  详见 `CORE_TECH.md` §5.8、`BENCHMARKS.md` §2.9、`PITFALLS.md` §18。
+- **剩余**：512/768 等任意尺寸、FP16 权重与 tensor-core（需误差补偿）、CUDA Graph
+  捕获视觉栈。
 
 ### 2.4 大批量 prefill 的 device router
 
@@ -135,7 +139,7 @@ ctest --test-dir build-cuda --output-on-failure
 | MoE router / top-k（decode、小批量 prefill） | **GPU** | `moe_router_topk` |
 | MoE router / top-k（ragged 大批量 prefill） | **CPU** | 每层 router D2H + host top-k（任务 2.4） |
 | token embedding 查表 | **CPU** | host gather + 每步 H2D（任务 2.5） |
-| **DeepEncoder 视觉编码器（SAM+CLIP+projector, ~1.5GB）** | **CPU / OpenMP** | **无 CUDA 实现**（任务 2.3） |
+| **DeepEncoder 视觉编码器（SAM+CLIP+projector）** | **GPU** | `GpuEncoder`（f32 GEMM + vision 内核）；`set_vision_gpu()` 后启用 |
 | 采样 / no-repeat-ngram | CPU | 每步 D2H logits 后采样，属设计选择 |
 | tokenizer / 图像预处理 / 调度 | CPU | 设计如此 |
 
@@ -170,6 +174,7 @@ ctest --test-dir build-cuda --output-on-failure
 | P2 bf16 TC GEMM | dense/shared + lm_head + 小 m 变体 | BF16 batch16 → 415.9 tok/s |
 | P2 INT4 专家调优 | BN 模板 + staging 重写 | 整波 prefill −10% |
 | P3 TC GEMM 重写 | bf16 cp.async 流水线 + padding；INT4 向量化 staging + bn8/bk64；cp.async 备选变体 | BF16 batch16 416→**522** tok/s、prefill 212→**161** ms；lm_head m≤16 **2.3×**；INT4 batch16→**429** |
+| P3 DeepEncoder CUDA | SAM+CLIP+projector 设备内核 + f32 GEMM；`GpuEncoder` + Engine 分派 | 单图 1024 **612 ms**（CPU ~2 min）；visual rel_l2 **1.1e-5** |
 
 ---
 
@@ -177,8 +182,9 @@ ctest --test-dir build-cuda --output-on-failure
 
 - `GpuDecoder::mlp_block` 的 host 路由分支（ragged 大批量 prefill）每层 router D2H +
   host top-k；见任务 2.4。
-- **DeepEncoder 仅 CPU 实现**；CUDA 后端 `image_embeddings` 仍调 CPU 编码器；见任务 2.3。
 - **embedding 查表在 host**（lm_head 已在设备）；见任务 2.5。
+- 视觉编码器 f32 GEMM 目前是 CUDA-core tiled（~1.8 TFLOPS）；bf16 tensor-core 需
+  误差补偿才能在视觉栈里保持 6e-4，尚未做。
 - `GpuDecoder::mlp_block_batch` 为未定义的空声明，可删除。
 - `GpuDecoder::batch_import_prefill` 已无调用者，可删除。
 - 真实 INT4 模型下 CUDA 端 greedy 尚未与参考 OCR 做端到端回归（当前 OCR 对齐走

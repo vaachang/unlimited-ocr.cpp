@@ -234,6 +234,21 @@ CUDA Graph 确实把逐步发射压到常数级。
 - `rswa_attn_ragged` 7%：prefill attention 的 grid=(total,heads)，total 大时较可观。
 
 
+## 2.9 DeepEncoder (vision) CUDA 移植（`bench/` 无固定文件；用 `compare_vision_gpu`）
+
+`tools/compare_vision_gpu` 在真实视觉权重上对比 GPU 编码器与 CPU 参考编码器
+（CPU 编码器已对齐 PyTorch f32 参考，见 `ALIGNMENT.md` §4），随机归一化图像：
+
+| size | GPU 编码 | CPU 编码 | visual rel_l2 | clip rel_l2 | sam rel_l2 |
+|---|---|---|---|---|---|
+| 224 | **34 ms** | — | — | — | — |
+| 640 | **153 ms** | ~43 s | 9e-6 | 1.1e-5 | 2e-6 |
+| 1024 | **612 ms** | ~2 min | **1.1e-5** | 1.3e-5 | 2e-6 |
+
+验收线为 rel_l2 ≤ 6e-4（tAgent 2.3），实测约 **50×** 余量。GPU 端用 f32 GEMM
+（`matmul_t_f32w`）而非 bf16 tensor core：bf16 激活舍入在深层视觉栈里累积到 ~11%。
+`--selftest` 的 layernorm / relpos attention / full attention rel_l2 ≤ 1e-6。
+
 ## 3. 回归快照
 
 数值对齐的方法、逐项结果与根因分析统一记录在 **`ALIGNMENT.md`**（端到端 OCR

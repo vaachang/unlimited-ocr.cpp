@@ -11,6 +11,7 @@
 #include "uocr/log.h"
 #if defined(UOCR_CUDA_ENABLED)
 #include "uocr/gpu_decoder.h"
+#include "uocr/gpu_encoder.h"
 #endif
 
 namespace uocr {
@@ -432,7 +433,13 @@ std::vector<GenerationResult> Engine::generate_batch(const std::vector<std::vect
 
 std::vector<float> Engine::image_embeddings(const ImageRGB& image, bool crop_mode, int base_size,
                                             int image_size) {
-    UOCR_CHECK(vision_ != nullptr, "image_embeddings: vision encoder not set");
+#if defined(UOCR_CUDA_ENABLED)
+    const bool have_gpu_vision = static_cast<bool>(gpu_vision_);
+#else
+    const bool have_gpu_vision = false;
+#endif
+    UOCR_CHECK(vision_ != nullptr || have_gpu_vision,
+               "image_embeddings: vision encoder not set");
     if (base_size <= 0) base_size = mcfg_.base_size;
     if (image_size <= 0) image_size = mcfg_.candidate_image_size;
     const int hidden = mcfg_.hidden_size;
@@ -442,6 +449,12 @@ std::vector<float> Engine::image_embeddings(const ImageRGB& image, bool crop_mod
     auto encode_view = [&](const ImageRGB& view, int size) {
         std::vector<float> chw = to_tensor_normalized(view);
         Tensor out;
+#if defined(UOCR_CUDA_ENABLED)
+        if (gpu_vision_) {
+            gpu_vision_->encode(chw.data(), size, size, out);
+            return out;
+        }
+#endif
         vision_->encode(chw.data(), size, size, out);
         return out;
     };

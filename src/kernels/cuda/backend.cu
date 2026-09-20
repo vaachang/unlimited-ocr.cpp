@@ -106,6 +106,70 @@ __global__ void matmul_t_bf16_kernel(const float* __restrict__ x,
     }
 }
 
+// Fully-f32 tiled GEMM used by the vision encoder: bf16 weights are converted
+// to f32 (exact, since they came from bf16), activations stay f32, and the
+// accumulation is f32.  This matches the CPU reference (which also computes in
+// f32 from bf16 weights) to ~1e-6, unlike the bf16-activation tensor-core path.
+__global__ void matmul_t_f32w_kernel(const float* __restrict__ x,
+                                     const std::uint16_t* __restrict__ w,
+                                     const float* __restrict__ bias, float* __restrict__ y, int m,
+                                     int n, int k) {
+    __shared__ float As[kBM][kBK + 1];
+    __shared__ float Bs[kBN][kBK + 1];
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int tid = ty * 16 + tx;
+    const int m0 = blockIdx.y * kBM;
+    const int n0 = blockIdx.x * kBN;
+    float acc[4][4] = {};
+
+    for (int k0 = 0; k0 < k; k0 += kBK) {
+#pragma unroll
+        for (int l = 0; l < (kBM * kBK) / 256; ++l) {
+            const int idx = tid + l * 256;
+            const int r = idx / kBK, c = idx % kBK;
+            const int gm = m0 + r, gk = k0 + c;
+            As[r][c] = (gm < m && gk < k) ? x[static_cast<std::size_t>(gm) * k + gk] : 0.0f;
+        }
+#pragma unroll
+        for (int l = 0; l < (kBN * kBK) / 256; ++l) {
+            const int idx = tid + l * 256;
+            const int r = idx / kBK, c = idx % kBK;
+            const int gn = n0 + r, gk = k0 + c;
+            Bs[r][c] = (gn < n && gk < k)
+                           ? __bfloat162float(__ushort_as_bfloat16(
+                                 w[static_cast<std::size_t>(gn) * k + gk]))
+                           : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < kBK; ++kk) {
+            float a[4], b[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) a[i] = As[ty * 4 + i][kk];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) b[j] = Bs[tx * 4 + j][kk];
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] += a[i] * b[j];
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int row = m0 + ty * 4 + i;
+        if (row >= m) continue;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int col = n0 + tx * 4 + j;
+            if (col >= n) continue;
+            y[static_cast<std::size_t>(row) * n + col] = acc[i][j] + (bias ? bias[col] : 0.0f);
+        }
+    }
+}
+
 __device__ __forceinline__ unsigned smem_addr(const void* p) {
     return static_cast<unsigned>(__cvta_generic_to_shared(p));
 }
@@ -358,6 +422,14 @@ void matmul_t(const float* x, const float* w, const float* bias, float* y, int m
     dim3 block(16, 16);
     dim3 grid((n + 15) / 16, (m + 15) / 16);
     matmul_t_kernel<<<grid, block, 0, stream>>>(x, w, bias, y, m, n, k);
+}
+
+void matmul_t_f32w(const float* x, const std::uint16_t* w, const float* bias, float* y, int m,
+                   int n, int k, cudaStream_t stream) {
+    if (m <= 0 || n <= 0 || k <= 0) return;
+    dim3 block(16, 16);
+    dim3 grid((n + kBN - 1) / kBN, (m + kBM - 1) / kBM);
+    matmul_t_f32w_kernel<<<grid, block, 0, stream>>>(x, w, bias, y, m, n, k);
 }
 
 void matmul_t_bf16_ref(const float* x, const std::uint16_t* w, const float* bias, float* y, int m,

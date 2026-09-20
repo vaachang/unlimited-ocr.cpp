@@ -21,6 +21,9 @@
 #include <nlohmann/json.hpp>
 
 #include "uocr/config.h"
+#if defined(UOCR_CUDA_ENABLED)
+#include "uocr/gpu_encoder.h"
+#endif
 #include "uocr/deep_encoder.h"
 #include "uocr/engine.h"
 #include "uocr/image.h"
@@ -96,9 +99,11 @@ std::vector<std::string> split_on(const std::string& s, const std::string& sep) 
 int main(int argc, char** argv) {
     std::string model_dir = "models";
     std::string ref_dir = "/tmp/opencode/ref_ocr";
+    bool gpu_vision = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--model") && i + 1 < argc) model_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--ref") && i + 1 < argc) ref_dir = argv[++i];
+        else if (!std::strcmp(argv[i], "--gpu-vision")) gpu_vision = true;
     }
 
     std::ifstream mf(ref_dir + "/manifest.json");
@@ -161,7 +166,15 @@ int main(int argc, char** argv) {
     SafetensorsFile st(weights_path);
     VisionWeights vw = VisionWeights::load(st, cfg);
     DecoderWeights dw = DecoderWeights::load(weights_path, cfg, false, 128);
-    engine->set_vision(std::make_shared<DeepEncoder>(cfg, std::move(vw), std::move(dw)));
+#if defined(UOCR_CUDA_ENABLED)
+    if (gpu_vision) {
+        engine->set_vision_gpu(std::make_shared<cuda::GpuEncoder>(cfg, vw, dw));
+        std::printf("using GPU DeepEncoder\n");
+    } else
+#endif
+    {
+        engine->set_vision(std::make_shared<DeepEncoder>(cfg, std::move(vw), std::move(dw)));
+    }
 
     std::vector<float> visual = engine->image_embeddings(image, crop_mode);
     std::vector<float> ref_visual = load_f32(ref_dir, T.at("visual_scattered"));

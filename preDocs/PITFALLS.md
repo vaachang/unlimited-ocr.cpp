@@ -284,3 +284,22 @@ position_ids = arange(past_key_values_length, seq_length + past_key_values_lengt
 本机 `ncu` 报 `ERR_NVGPUCTRPERM`（无 GPU 性能计数器权限），无法采 SM/DRAM 利用率。
 `nsys` 可用（kernel 时间线），性能归因靠几何分析 + 消融实验。任务 2.8 的 ncu 项
 受此限制。
+
+## 18. DeepEncoder CUDA 移植的两个语义坑（2026-09-20）
+
+1. **windowed SAM 必须先 partition 再 QKV**：参考实现是
+   `windows = window_partition(normed)` → `sam_attention(windows)`（内部做 QKV）。
+   `window_partition` 给 padding 补 0，随后 QKV 线性层把 padding token 变成
+   **QKV bias**，这些 padding key/value 会参与同窗口真实 query 的 softmax。
+   若图省事先对整幅 `normed` 做 QKV 再把 qkv 分区补 0，padding token 就是 0（没有
+   bias），与参考产生 ~0.5%/层 的差异，12 层后累积到 ~11%。正确顺序：分区 → QKV →
+   注意力 → 反分区。
+2. **CLIP MLP 残差要覆盖而不是累加**：参考是 `x = residual + fc2 + fc2_b`。若写成
+   `ln = LN(x); ...; ln += residual; ln += fc2`，就把 LN 值也留在了残差里，24 层
+   后输出爆到 100×+（本移植一开始就是这个 bug，`clip_features` rel_l2=98）。
+   正确：`matmul(fc2 -> clip)` 覆盖 LN，再 `clip += residual`。
+3. **bf16 激活在视觉栈里不可用**：视觉线性的 bf16 激活舍入在 SAM 12 层 + CLIP 24 层
+   中放大到 ~11%（远超 6e-4 验收）。必须用 f32 GEMM（`matmul_t_f32w`：bf16 权重升
+   f32 + f32 累加），与 CPU 参考一致到 1e-6。相对 f32，bf16 TC 只在位置/补丁这种
+   浅层还能用。
+

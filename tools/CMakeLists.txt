@@ -12,3 +12,8 @@ add_executable(compare_image compare_image.cpp)
 target_link_libraries(compare_image PRIVATE ${UOCR_ENGINE_LIB})
 add_executable(compare_ocr compare_ocr.cpp)
 target_link_libraries(compare_ocr PRIVATE ${UOCR_ENGINE_LIB})
+
+if(ENGINE_BACKEND STREQUAL "CUDA")
+    add_executable(compare_vision_gpu compare_vision_gpu.cpp)
+    target_link_libraries(compare_vision_gpu PRIVATE ${UOCR_ENGINE_LIB})
+endif()

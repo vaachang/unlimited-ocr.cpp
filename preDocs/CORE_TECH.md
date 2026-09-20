@@ -241,6 +241,32 @@ gate_up/down 内核修复了“相邻线程按行 stride 读权重”导致的 ~
   脚本、非恒等 slot 排列、窗口 W=8 跑 14 步覆盖环形覆写，两者 logits
   rel_l2 = 0（逐位一致），且 graph 路径确认捕获到 1 张图、plain 路径 0 张。
 
+### 5.8 DeepEncoder CUDA 移植（P3，2026-09-20）
+
+视觉编码器（SAM-ViT-B + CLIP-L + projector）从纯 CPU/OpenMP 移植到设备
+（`src/engine/gpu_encoder.cu`、`src/kernels/cuda/vision_ops.cu`）：
+
+- **权重**：线性层（SAM qkv/proj/mlp、CLIP qkv/out/fc1/fc2、projector）以 bf16
+  常驻设备；norm/bias/pos/rel 为 f32，conv 权重转 bf16 供 GEMM。
+- **f32 精度（关键）**：与 tensor-core 的 bf16 激活路径不同，视觉线性和卷积用
+  **f32 tiled GEMM**（`matmul_t_f32w`：bf16 权重升为 f32、f32 激活/f32 累加），
+  与 CPU 参考（`WeightMatrix::matmul` on `BF16_EXT` = bf16 权重 + f32 激活）逐元素
+  一致。原因：bf16 激活舍入经 12 层 SAM + 24 层 CLIP 累积放大到 ~11%，远超 6e-4。
+- **内核**：`layernorm_rows`、`gelu_inplace`/`quick_gelu_inplace`、`add_bias_rows`/
+  `add_inplace`、`im2col_chw`/`im2col_hwc`（conv → im2col + GEMM）、
+  `window_partition`/`window_unpartition`、`attention_flash`（online softmax、
+  warp-per-query、K/V 分块入 shared；`RELPOS` 模板给 SAM 加 decomposed relative
+  position bias，CLIP 不加）。
+- **两个语义坑**（见 `PITFALLS.md` §18）：windowed SAM 必须**先 partition 再 QKV**
+  （padding token 要拿到 QKV bias）；CLIP MLP 的残差要用 `fc2` 覆盖 LN 结果再
+  `+= residual`。
+- **集成**：`Engine::set_vision_gpu()` 后 `image_embeddings` 在 CUDA 后端整条视觉
+  路径走设备；`tools/compare_ocr --gpu-vision` 可端到端验证。
+- **验收**（`tools/compare_vision_gpu`，GPU vs CPU 参考）：
+  `visual_embeddings` rel_l2 **1.1e-5**、`clip_features` 1.3e-5、`sam_features`
+  2e-6（验收 ≤6e-4）；单图 1024 编码 **612 ms**（CPU ~2 min）、640 **153 ms**、
+  224 **34 ms**。`--selftest` 覆盖 layernorm / relpos attention / full attention。
+
 ## 6. 与 `prj.md` 三大创新点的对应
 
 | prj.md 创新点 | 本项目实现 | 状态 |

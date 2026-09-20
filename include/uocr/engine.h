@@ -26,6 +26,9 @@ namespace uocr {
 
 namespace cuda {
 class GpuDecoder;
+#if defined(UOCR_CUDA_ENABLED)
+class GpuEncoder;
+#endif
 }
 
 enum class Backend { CPU, CUDA };
@@ -90,6 +93,15 @@ public:
     void set_vision(std::shared_ptr<DeepEncoder> enc) { vision_ = std::move(enc); }
     const DeepEncoder* vision() const { return vision_.get(); }
 
+#if defined(UOCR_CUDA_ENABLED)
+    // Optional GPU vision encoder.  When set on a CUDA engine,
+    // `image_embeddings` runs the DeepEncoder on the device instead of the CPU.
+    void set_vision_gpu(std::shared_ptr<cuda::GpuEncoder> enc) {
+        gpu_vision_ = std::move(enc);
+    }
+    const cuda::GpuEncoder* vision_gpu() const { return gpu_vision_.get(); }
+#endif
+
     // Insert visual embeddings into `tokens`/`inputs` at image-token positions.
     // Returns the indices that were replaced.
     static std::vector<int> find_image_token_positions(const std::vector<int>& tokens,
@@ -109,6 +121,7 @@ private:
     std::shared_ptr<DeepEncoder> vision_;
 #if defined(UOCR_CUDA_ENABLED)
     std::unique_ptr<cuda::GpuDecoder> gpu_decoder_;
+    std::shared_ptr<cuda::GpuEncoder> gpu_vision_;
 #endif
 };
 

@@ -130,7 +130,9 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
         src/kernels/cuda/gpu_cache.cu
         src/kernels/cuda/moe_device.cu
         src/kernels/cuda/backend.cu
-        src/engine/gpu_decoder.cu)
+        src/kernels/cuda/vision_ops.cu
+        src/engine/gpu_decoder.cu
+        src/engine/gpu_encoder.cu)
     target_link_libraries(uocr_core PUBLIC CUDA::cudart)
     target_compile_options(uocr_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
     set_target_properties(uocr_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
