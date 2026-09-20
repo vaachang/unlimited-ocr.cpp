@@ -86,6 +86,11 @@ public:
     int batch_slots() const { return batch_slots_; }
     // Number of captured batched-decode graphs (one per observed batch size).
     int batch_graph_count() const;
+    // Number of layers that used the grouped INT4 expert GEMM (test hook).
+    long grouped_moe_calls() const { return grouped_moe_calls_; }
+    // Tile size (columns / rows per block) for the grouped INT4 expert GEMM.
+    void set_grouped_moe_bn(int v) { grouped_bn_ = v; }
+    void set_grouped_moe_bm(int v) { grouped_bm_ = v; }
 
     const ModelConfig& config() const { return cfg_; }
 
@@ -138,8 +143,10 @@ private:
     // into the layer output.
     void attention_block(int li, const float* x, int seq, const int* positions, bool prefill,
                          int q_start, float* h1, float* normed2, cudaStream_t stream);
-    void mlp_block(int li, const float* h1, const float* normed2, int seq, bool dev_moe, float* out,
-                   cudaStream_t stream);
+    // `dev_moe` selects device routing; `grouped` additionally fuses all experts
+    // into one grouped GEMM (INT4 only, large-M prefill).
+    void mlp_block(int li, const float* h1, const float* normed2, int seq, bool dev_moe,
+                   bool grouped, float* out, cudaStream_t stream);
     void ensure_scratch(int seq);
     void ensure_router_scratch(int seq);
     void final_logits(const float* hidden_dev, int seq, std::vector<float>& logits);
@@ -208,6 +215,11 @@ private:
     // CUDA-Graph state
     bool use_graph_ = false;
     bool prefill_dev_moe_ = false;
+    // True when the resident expert weights are INT4 (enables the grouped GEMM).
+    bool int4_experts_ = false;
+    long grouped_moe_calls_ = 0;
+    int grouped_bn_ = 32;
+    int grouped_bm_ = 128;
     bool graph_ready_ = false;
     GraphScope graph_scope_ = GraphScope::kFull;
     int graph_prefill_len_ = -1;

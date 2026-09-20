@@ -147,6 +147,34 @@ void moe_experts_masked_int4(
     const int* assign_token, const float* assign_w, const int* count, int n_experts, int cap,
     int hidden, int inter, int group, float* act, float* out, cudaStream_t stream = 0);
 
+// Grouped INT4 expert GEMM driven by a device grouping table.
+//
+// One launch per projection for *all* experts.  `assign_token` / `assign_w`
+// are [n_experts, cap] and `count` is [n_experts]; both are produced on device
+// by `moe_router_topk`, so no host routing / D2H sync is needed.  `x` is the
+// shared [total, hidden] activation; a block handles one (expert, n-tile) pair
+// and loops over the expert's tokens on device.
+//
+// - `moe_grouped_gate_up_int4` computes gate and up for every expert and
+//   writes silu(gate) * up into `act` [n_experts, cap, inter].
+// - `moe_grouped_down_int4` computes down from `act` and scatter-adds the
+//   routing-weighted result into `out` [total, hidden] (caller zeroes it).
+// `bn` (columns per block, in {8,16,32,64}) trades block count for weight-panel
+// reuse; defaults to 8 (same as the per-expert GEMM).
+void moe_grouped_gate_up_int4(
+    const float* x, const std::uint8_t* gate_packed, const float* gate_scales,
+    const float* gate_zeros, int gate_pstride, int gate_sstride, int gate_ng,
+    const std::uint8_t* up_packed, const float* up_scales, const float* up_zeros,
+    int up_pstride, int up_sstride, int up_ng, const int* assign_token,
+    const int* count, int n_experts, int cap, int hidden, int inter, int group, float* act,
+    int bn = 16, int bm = 64, cudaStream_t stream = 0);
+
+void moe_grouped_down_int4(
+    const float* act, const std::uint8_t* packed, const float* scales, const float* zeros,
+    int pstride, int sstride, int ng, const int* assign_token, const float* assign_w,
+    const int* count, int n_experts, int cap, int hidden, int inter, int group, float* out,
+    int bn = 16, int bm = 64, cudaStream_t stream = 0);
+
 // MoE INT4 GEMM: y[m,n] = x[m,k] * dequant(W_int4[n,k]); W is packed 2-per-byte
 // with per-group affine scale/zero.  Scalar reference (correctness baseline).
 void moe_gemm_int4(const float* x, const std::uint8_t* packed, const float* scales,

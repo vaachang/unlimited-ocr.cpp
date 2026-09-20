@@ -81,6 +81,7 @@ unlimited-ocr.cpp/
 ✅ bf16 tensor-core GEMM（dense/shared + lm_head + 小 m 变体）
 ✅ cp.async 流水线 TC GEMM（bf16 + INT4 专家，bank-conflict-free padding；P3）
 ✅ DeepEncoder CUDA 移植（SAM+CLIP+projector 设备内核 + f32 GEMM；P3）
+✅ ragged prefill device router + grouped INT4 专家 GEMM（一层 2 次 launch、无 D2H；P3）
 ```
 
 ## 4. 开发历程
@@ -98,6 +99,7 @@ unlimited-ocr.cpp/
 | 2026-09-19 P2-④ | batched decode CUDA Graph、bf16 TC GEMM（+小 m 变体）、INT4 专家 GEMM 调优、nsys 分解 | `CORE_TECH.md` §5.5/§5.7、`BENCHMARKS.md` §2.5/§2.6–2.8 |
 | 2026-09-20 P3 | cp.async 流水线 bf16 TC GEMM（padding 去 bank 冲突）、INT4 专家 GEMM 向量化 staging + `bn=8/bk=64`、cp.async 备选变体 | `CORE_TECH.md` §5.5/§5.5b、`BENCHMARKS.md` §2.5/§2.7、`PITFALLS.md` §16/§17 |
 | 2026-09-20 P3 | DeepEncoder CUDA 移植（`GpuEncoder` + vision 内核 + f32 tiled GEMM），Engine `set_vision_gpu` 分派 | `CORE_TECH.md` §5.8、`BENCHMARKS.md` §2.9、`PITFALLS.md` §18、`tools/compare_vision_gpu` |
+| 2026-09-20 P3 | ragged prefill 的 device router + grouped INT4 专家 GEMM（一层 2 次 launch、无 D2H；`bn=32/bm=128`） | `CORE_TECH.md` §5.9、`BENCHMARKS.md` §2.10、`PITFALLS.md` §19；INT4 整波 prefill 213→120 ms |
 
 > 每一步的实现/坑/数据分别沉淀在 `CORE_TECH.md` / `PITFALLS.md` / `BENCHMARKS.md`；
 > 当前性能与回归见 `tAgent.md` §1。

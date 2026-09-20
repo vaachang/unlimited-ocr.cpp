@@ -51,6 +51,8 @@ Engine::Engine(ModelConfig mcfg, EngineConfig ecfg, DecoderWeights weights, Back
         gpu_decoder_ = std::make_unique<cuda::GpuDecoder>(mcfg_, weights_);
         gpu_decoder_->set_use_graph(ecfg_.use_cuda_graph);
         gpu_decoder_->set_prefill_device_moe(ecfg_.use_device_moe_prefill);
+        gpu_decoder_->set_grouped_moe_bn(ecfg_.grouped_moe_bn);
+        gpu_decoder_->set_grouped_moe_bm(ecfg_.grouped_moe_bm);
         if (ecfg_.graph_scope == "attn_dense")
             gpu_decoder_->set_graph_scope(cuda::GpuDecoder::GraphScope::kAttnDense);
     }

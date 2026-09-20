@@ -19,23 +19,23 @@
 - **后端**：CPU 参考（OpenMP）+ CUDA 生产（sm_120），`-DENGINE_BACKEND=CPU|CUDA` 双构建。
 - **完成度**：M1–M6、P0（端到端 OCR 对齐 E0–E5）、P1（R-SWA 环形覆写 / CUDA 设备端
   decoder）、P2（TC INT4 GEMM、CUDA Graph、device INT4 权重、连续批处理、batched graph、
-  bf16 TC GEMM）、P3（cp.async 流水线 TC GEMM、DeepEncoder CUDA 移植）均已完成。
-  **约 92–95%**（对照 `prj.md`）。
+  bf16 TC GEMM）、P3（cp.async 流水线 TC GEMM、DeepEncoder CUDA 移植、**grouped INT4
+  专家 GEMM + device router**）均已完成。**约 94–96%**（对照 `prj.md`）。
 - **回归**：`compare_ocr` greedy **24/24**（CPU 参考路径）；`uocr_tests` **20/20**；
-  `uocr_cuda_tests` **全过**（batched 排列 / ragged prefill / slot 复用 / batched graph /
-  TC vs ref）。
+  `uocr_cuda_tests` **全过**（batched 排列 / ragged prefill / **grouped INT4 ragged
+  prefill** / slot 复用 / batched graph / TC vs ref）。
 - **性能**（真实 `baidu/Unlimited-OCR`，prompt=64, steps=16, max_batch=16, warmup 稳态）：
 
   | 指标 | 值 |
   |---|---|
   | BF16 batch=16 吞吐 | **521.6 tok/s** |
-  | INT4 batch=16 吞吐 | **429.3 tok/s**（显存 2.2GB） |
-  | 整波 prefill（16 请求） | **161 ms** BF16 / **213 ms** INT4 |
-  | batch=1 吞吐 | 155.8 BF16 / 132.9 INT4 tok/s |
+  | INT4 batch=16 吞吐 | **488–516 tok/s**（显存峰值 3.0GB） |
+  | 整波 prefill（16 请求） | **161 ms** BF16 / **120 ms** INT4 |
+  | batch=1 吞吐 | 155.8 BF16 / 138.2 INT4 tok/s |
   | lm_head m=16（n=129280） | **1174 µs**（原 2652，2.3×） |
   | 单图视觉编码（1024, GPU） | **612 ms**（CPU 参考 ~2 min；rel_l2 1.1e-5） |
 
-- 性能数据明细见 `BENCHMARKS.md` §2.5–2.9；历史进度见 `PROGRESS.md` §4。
+- 性能数据明细见 `BENCHMARKS.md` §2.5–2.10；历史进度见 `PROGRESS.md` §4。
 
 **快速验证**：
 
@@ -52,9 +52,9 @@ ctest --test-dir build-cuda --output-on-failure
 
 按收益/成本排序。每项给出目标、方案、验收与涉及文件；完成后在本文档勾掉并更新 §1。
 
-> **2026-09-20 优先级**：2.4 device router → 2.2 grouped expert GEMM → 2.5 device
-> embedding → 2.9 权重加载；2.10/2.11 为已完成项收尾；2.6/2.7 需先确认；2.8 受
-> ncu 权限限制。✅ 表示已完成（保留一段背景说明）。
+> **2026-09-20 优先级**：2.4 device router + 2.2 grouped expert GEMM（均已完成，见下）
+> → 2.5 device embedding → 2.9 权重加载；2.10/2.11 为已完成项收尾；2.6/2.7 需先确认；
+> 2.8 受 ncu 权限限制。✅ 表示已完成（保留一段背景说明）。
 
 ### ✅ 2.1 高性能 TC GEMM 重写（2026-09-20 完成）
 
@@ -64,8 +64,8 @@ ctest --test-dir build-cuda --output-on-failure
   备选变体。详见 `CORE_TECH.md` §5.5 / §5.5b，数据见 `BENCHMARKS.md` §2.5/§2.7。
 - **结果**：lm_head m=8/16 2.3×；BF16 batch=16 416→**522** tok/s、整波 prefill
   212→**161** ms；INT4 batch=16 387→**429** tok/s。
-- **剩余**（并入 2.2）：m>16 的 bf16 kernel 每 n-tile 重读 A；`moe_gemm_int4_tc`
-  仍是逐专家发射，grouped GEMM 未做。
+- **剩余**：m>16 的 bf16 kernel 每 n-tile 重读 A（未处理）；`moe_gemm_int4_tc`
+  的逐专家发射已被 2.2 的 grouped GEMM 取代。
 
 ### ✅ 2.3 DeepEncoder CUDA 移植（2026-09-20 完成）
 
@@ -80,31 +80,21 @@ ctest --test-dir build-cuda --output-on-failure
   详见 `CORE_TECH.md` §5.8、`BENCHMARKS.md` §2.9、`PITFALLS.md` §18。
 - **剩余**：见 2.10。
 
-### 2.4 大批量 prefill 的 device router（建议先做，解锁 2.2）
+### ✅ 2.4 device router + 2.2 grouped expert GEMM（2026-09-20 完成）
 
-- **问题**：`GpuDecoder::mlp_block(dev_moe=false)` 分支（ragged 大批量 prefill 走此分支）
-  每层 router logits **D2H** + host top-k/分组 + 每专家索引 **H2D**，形成同步点，
-  阻塞 CUDA Graph 且拖慢整波 prefill。
-- **方案**：把 softmax/sigmoid + top-k 下放设备端（复用 `moe_router_topk`），直接产出
-  设备端 `(assign_token, assign_w, count)` 分组表；`forward_ragged` 的逐专家循环改为
-  读设备分组表（或直接接 2.2 的 grouped GEMM）。注意 `moe_router_topk` 当前假定
-  `count` 已清零、`cap` 固定，ragged 下需按 `total`/`top_k` 重新推导容量。
-- **验收**：ragged prefill 每层无 D2H/H2D 同步（nsys 上无 `cudaMemcpy` 同步点）；
-  logits 与 host 路由路径 rel_l2 ≤ 1e-4；`bench_cuda_batch` 整波 prefill 不退化。
-- **涉及**：`src/engine/gpu_decoder.cu`（`mlp_block` / `forward_ragged` / scratch）、
-  `src/kernels/cuda/moe_device.cu`。
-
-### 2.2 Grouped expert GEMM（依赖 2.4；prefill 最大剩余项）
-
-- **问题**：`forward_ragged` 每层逐专家发 3×64 个 `moe_gemm_int4_tc`
-  （整轮约 12096 次、avg ~50µs），nsys 上占 GPU kernel 时间 >50%。
-- **方案**：一层一次 launch：block 映射到 `(expert, m-tile, n-tile)`，设备端按专家
-  token 分组表取 A 行；gate/up/down 各一次（或合并 gate+up）。M 很小时回退到现有
-  masked matvec。
-- **验收**：整波 prefill 明显下降（目标 <150 ms INT4）；每层 `moe_gemm_int4_tc`
-  launch 数从 ~192 降到 3；all-close logits（rel_l2 ≤ 2e-3）。
-- **涉及**：`src/kernels/cuda/moe_gemm_int4.cu`、`src/engine/gpu_decoder.cu`
-  （`mlp_block` / `forward_ragged`）。
+- **已做**：ragged 大批量 prefill 不再走「router D2H + host top-k + 逐专家 GEMM」。
+  `forward_ragged` 里 INT4 专家一律改走 device router（`moe_router_topk` 产出
+  `(assign_token, assign_w, count)`，`cap=total`）与两个 grouped 内核：
+  `moe_grouped_gate_up_int4`（grid=(ceil(inter/BN), n_experts)，融合 gate+up+SiLU）
+  和 `moe_grouped_down_int4`（grid=(ceil(hidden/BN), n_experts)，含 scatter-add）。
+  每层从 ~192 次 launch 降到 2 次、无 D2H/H2D 同步。tile 可调
+  （`EngineConfig::grouped_moe_bn/bm`，默认 `bn=32/bm=128`；`BM=128` 是最大收益点）。
+  见 `CORE_TECH.md` §5.9、`PITFALLS.md` §19。
+- **结果**：INT4 batch=16 整波 prefill **213→120 ms**、tok/s **429→488–516**；
+  B=1/2/4/8 prefill 全线下降。`tests/test_rswa_cuda.cu` 新增 grouped vs 逐专家 host
+  回归（600 token，多 m-tile），rel_l2 **1.7e-3**（device vs host router 同量级）。
+- **剩余**：BF16 专家的 ragged 大批量 prefill 仍走 host 逐专家路径（未加 grouped
+  BF16 内核）；`rswa_attn_ragged` 成为新的第二大头（B=16 ~21 ms），未优化。
 
 ### 2.5 device embedding / position 查表
 
@@ -171,8 +161,9 @@ ctest --test-dir build-cuda --output-on-failure
 |---|---|---|
 | 文本解码器（12 层 MoE：RMSNorm/QKV/O/RoPE/R-SWA/dense/shared/专家） | **GPU** | `GpuDecoder`，权重常驻 |
 | lm_head | **GPU** | 设备副本 + `matvec`/`matmul_t_bf16` |
-| MoE router / top-k（decode、小批量 prefill） | **GPU** | `moe_router_topk` |
-| MoE router / top-k（ragged 大批量 prefill） | **CPU** | 每层 router D2H + host top-k（任务 2.4） |
+| MoE router / top-k（decode、prefill） | **GPU** | `moe_router_topk`（INT4 expert 的 ragged 路径也走设备端，无 D2H） |
+| MoE 专家 MLP（INT4，ragged prefill） | **GPU** | grouped gate+up+SiLU / down 各一次 launch（§5.9） |
+| MoE 专家 MLP（BF16，ragged 大批量 prefill） | **CPU 调度 + GPU GEMM** | 仍 host top-k + 逐专家 GEMM（未加 grouped BF16） |
 | token embedding 查表 | **CPU** | host gather + 每步 H2D（任务 2.5） |
 | **DeepEncoder 视觉编码器（SAM+CLIP+projector）** | **GPU** | `GpuEncoder`（f32 GEMM + vision 内核）；`set_vision_gpu()` 后启用 |
 | 采样 / no-repeat-ngram | CPU | 每步 D2H logits 后采样，属设计选择 |
@@ -210,14 +201,15 @@ ctest --test-dir build-cuda --output-on-failure
 | P2 INT4 专家调优 | BN 模板 + staging 重写 | 整波 prefill −10% |
 | P3 TC GEMM 重写 | bf16 cp.async 流水线 + padding；INT4 向量化 staging + bn8/bk64；cp.async 备选变体 | BF16 batch16 416→**522** tok/s、prefill 212→**161** ms；lm_head m≤16 **2.3×**；INT4 batch16→**429** |
 | P3 DeepEncoder CUDA | SAM+CLIP+projector 设备内核 + f32 GEMM；`GpuEncoder` + Engine 分派 | 单图 1024 **612 ms**（CPU ~2 min）；visual rel_l2 **1.1e-5** |
+| P3 grouped MoE | device router + grouped INT4 gate_up/down（一层 2 次 launch、无 D2H）；tile `bn=32/bm=128` | INT4 整波 prefill 213→**120 ms**、B=16 **488–516** tok/s；ragged rel_l2 1.7e-3 vs host |
 
 ---
 
 ## 5. 已知遗留 / 技术债
 
-- `GpuDecoder::mlp_block` 的 host 路由分支（ragged 大批量 prefill）每层 router D2H +
-  host top-k；见任务 2.4。
 - **embedding 查表在 host**（lm_head 已在设备）；见任务 2.5。
+- BF16 专家的 ragged 大批量 prefill 仍是 host top-k + 逐专家 GEMM（grouped 只做了
+  INT4）；`rswa_attn_ragged`（B=16 ~21 ms）是 grouped 之后的第二大头。
 - 视觉编码器 f32 GEMM 目前是 CUDA-core tiled（~1.8 TFLOPS）；bf16 tensor-core 需
   误差补偿才能在视觉栈里保持 6e-4，尚未做。
 - `GpuDecoder::mlp_block_batch` 为未定义的空声明，可删除。

@@ -63,7 +63,8 @@ ModelConfig synthetic_config() {
 int main(int argc, char** argv) {
     bool real = false, int4 = false, no_graph = false;
     std::string model_dir = "models";
-    int prompt_len = 64, steps = 32, max_batch = 16;
+    int prompt_len = 64, steps = 32, max_batch = 16, grouped_bn = 32, grouped_bm = 128;
+    int only_batch = 0;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--real")) real = true;
         else if (!std::strcmp(argv[i], "--int4")) int4 = true;
@@ -72,6 +73,9 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_len = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--steps") && i + 1 < argc) steps = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--max-batch") && i + 1 < argc) max_batch = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--grouped-bn") && i + 1 < argc) grouped_bn = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--grouped-bm") && i + 1 < argc) grouped_bm = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--only-batch") && i + 1 < argc) only_batch = std::atoi(argv[++i]);
     }
     if (!uocr::cuda::available()) {
         std::printf("no CUDA device\n");
@@ -99,12 +103,15 @@ int main(int argc, char** argv) {
     ecfg.no_repeat_ngram_size = 0;
     ecfg.max_new_tokens = steps;
     ecfg.use_cuda_graph = !no_graph;
+    ecfg.grouped_moe_bn = grouped_bn;
+    ecfg.grouped_moe_bm = grouped_bm;
 
     const std::size_t before = used_vram();
     Engine engine(cfg, ecfg, std::move(weights), Backend::CUDA);
 
-    std::printf("prompt=%d steps=%d max_batch=%d experts=%s graph=%s\n", prompt_len, steps,
-                max_batch, int4 ? "INT4" : "BF16", no_graph ? "off" : "on");
+    std::printf("prompt=%d steps=%d max_batch=%d experts=%s graph=%s grouped_bn=%d bm=%d\n",
+                prompt_len, steps, max_batch, int4 ? "INT4" : "BF16", no_graph ? "off" : "on",
+                grouped_bn, grouped_bm);
     std::printf("%6s %12s %12s %14s %12s\n", "batch", "prefill_ms", "decode_ms", "tok/s", "peakMB");
 
     std::vector<std::vector<int>> all_prompts(max_batch);
@@ -116,6 +123,7 @@ int main(int argc, char** argv) {
 
     for (int B : {1, 2, 4, 8, 16}) {
         if (B > max_batch) break;
+        if (only_batch > 0 && B != only_batch) continue;
         std::vector<std::vector<int>> prompts(all_prompts.begin(), all_prompts.begin() + B);
         // Warmup: captures the batched CUDA graph (first decode) so the timed
         // run measures steady state, not the one-off capture cost.

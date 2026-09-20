@@ -86,6 +86,7 @@ MoE 权重在 `DecoderWeights::load(..., quantize_experts_int4=true)` 时按需�
 | `rswa_attention.cu` | `rswa_decode_kernel` | 每 head 一个 block，在线 softmax 遍历 `kv_len`，`__ldg` 读 cache，无 score 矩阵 |
 | `moe_gemm_int4.cu` | `moe_gemm_int4_kernel` | AWQ 反量化 + FP32 累加（标量正确性基线） |
 | `moe_gemm_int4.cu` | `moe_gemm_int4_tc_kernel` | **W4A16**：寄存器内 INT4→BF16 反量化 + `mma.m16n8k16.bf16`（f32 累加） |
+| `moe_gemm_int4.cu` | `moe_grouped_(gate_up|down)_int4_kernel` | **grouped expert GEMM**：一层一次 launch，block 映射 (expert, n-tile)，按设备分组表循环 token（见 §5.9） |
 | `rmsnorm.cu` | `rmsnorm_kernel` | 块内归约 |
 | `rope_fused.cu` | `rope_kernel`, `rmsnorm_head_kernel` | 融合逐头 RMSNorm + RoPE |
 | `backend.cu` | `matmul_t(_bf16)`, `device_info` | 稠密 GEMM、设备信息 |
@@ -266,6 +267,41 @@ gate_up/down 内核修复了“相邻线程按行 stride 读权重”导致的 ~
   `visual_embeddings` rel_l2 **1.1e-5**、`clip_features` 1.3e-5、`sam_features`
   2e-6（验收 ≤6e-4）；单图 1024 编码 **612 ms**（CPU ~2 min）、640 **153 ms**、
   224 **34 ms**。`--selftest` 覆盖 layernorm / relpos attention / full attention。
+
+### 5.9 Grouped INT4 expert GEMM + device router（P3 收尾，2026-09-20）
+
+ragged 大批量 prefill 原来走 `mlp_block(dev_moe=false)`：每层 router logits
+**D2H → host top-k → 每专家索引 H2D**，再对 64 专家各发 gate/up/down 三个
+`moe_gemm_int4_tc`（外加 gather/silu/scatter），一层 ~192 次 launch 且带同步点。
+本项把它替换成 device router + 一次 grouped launch：
+
+- **device 分组表**：直接复用 `moe_router_topk`，产出 `d_assign_token/d_assign_w/
+  d_count`（布局 `[n_experts, cap]`，`cap = total`）。`mlp_block` 的 dev_moe 分支
+  不再把 router logits 拷回 host。
+- **`moe_grouped_gate_up_int4`**：grid=`(ceil(inter/BN), n_experts)`，每 block 负责
+  (expert, n-tile)，在设备端按 `count[e]` 循环该专家的 token（`assign_token[e, :]`），
+  一次算出 gate+up 并融合 SiLU 写进 `act[e, cap_slot, inter]`。
+- **`moe_grouped_down_int4`**：grid=`(ceil(hidden/BN), n_experts)`，从 `act` 读回，
+  一次算出 down 并按 `assign_w` scatter-add 进输出。down 的 k 维即 `inter`。
+- **固定网格**：grid 只依赖静态形状；token 列表、count、权重全部设备驻留，因此一层
+  只有 2 次 launch（原来是 ~192），且 ragged prefill 每层**无 D2H/H2D 同步**。
+- **`forward_ragged` 选择**：专家为 INT4 且 `hidden % 4 == 0`、`inter % 4 == 0`
+  时一律走 grouped（小批量也比 masked 快，因为权重只读一次）；否则保持原逻辑
+  （小批量 masked / 大批量 host）。grouped 不用于单请求 prefill 与 decode。
+- **tile 形状**（`EngineConfig::grouped_moe_bn/bm`，默认 `bn=32/bm=128`）：
+  `BM=128` 用 8 warp×16 行，把每专家的 m-tile 数从 2 降到 1（count≈96 时权重
+  只 stage 一次），这是最大收益点（gate_up 7.1→4.0 ms/layer）；`BN=32` 在占用率与
+  每 block 权重面板复用间取平衡（`BN` 越大 A 面板复用越多，但 block 数减少会掉占用）。
+  helper 的 staging 循环改成按 `blockDim.x` 步进以支持 128/256 线程两种 block。
+- **验收**（`tests/test_rswa_cuda.cu` 新增 “Grouped INT4 ragged prefill”）：3 个
+  请求共 600 token（每专家 > 128，覆盖 BM=128 多 m-tile），grouped vs 逐专家 host
+  路径 logits rel_l2 **1.7e-3**（与既有 device-router vs host-router 的 ragged 回归
+  同量级，阈值 1e-2）；`grouped_moe_calls()>0` 确认真的走了 grouped 内核。
+- **性能**（真实模型，见 `BENCHMARKS.md` §2.10）：INT4 batch=16 整波 prefill
+  **213 → 120 ms**、tok/s **429 → 488–516**；B=1/2/4/8 的 prefill 也全线下降
+  （原 per-expert host 路径的同步与发射开销被消除）。
+- **剩余**：`rswa_attn_ragged`（prefill attention，B=16 时 ~21 ms）成为新的第二大头，
+  未在本项处理；BF16 专家的大批量 prefill 仍走 host 路径（未加 grouped BF16 内核）。
 
 ## 6. 与 `prj.md` 三大创新点的对应
 

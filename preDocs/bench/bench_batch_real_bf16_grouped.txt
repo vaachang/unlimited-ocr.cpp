@@ -1,0 +1,20 @@
+[14:54:10][INFO] decoder weights loaded from models/model-00001-of-000001.safetensors  (/home/admin/MyDocs/unlimited-ocr.cpp/src/runtime/weights.cpp:214)
+[14:54:13][INFO] engine created (CUDA backend)  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:60)
+[14:54:14][INFO] batch done: 1 requests, 16 decode tokens, 106.9 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:423)
+[14:54:14][INFO] batch done: 1 requests, 16 decode tokens, 102.9 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:423)
+[14:54:14][INFO] batch done: 2 requests, 32 decode tokens, 183.2 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:423)
+[14:54:14][INFO] batch done: 2 requests, 32 decode tokens, 179.7 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:423)
+[14:54:14][INFO] batch done: 4 requests, 64 decode tokens, 257.3 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:423)
+[14:54:15][INFO] batch done: 4 requests, 64 decode tokens, 249.8 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:423)
+[14:54:15][INFO] batch done: 8 requests, 128 decode tokens, 344.7 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:423)
+[14:54:15][INFO] batch done: 8 requests, 128 decode tokens, 345.5 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:423)
+[14:54:16][INFO] batch done: 16 requests, 256 decode tokens, 493.9 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:423)
+[14:54:16][INFO] batch done: 16 requests, 256 decode tokens, 487.5 ms  (/home/admin/MyDocs/unlimited-ocr.cpp/src/engine/engine.cpp:423)
+device: NVIDIA GeForce RTX 5060 Ti (sm_120, 36 SMs, 15.6 GB)
+prompt=64 steps=16 max_batch=16 experts=BF16 graph=on grouped_bn=32 bm=128
+ batch   prefill_ms    decode_ms          tok/s       peakMB
+     1         30.3        103.0          155.3       9266.0
+     2         51.7        179.8          177.9       9320.0
+     4         89.4        250.1          255.9       9422.0
+     8        122.7        345.7          370.3       9638.0
+    16        163.6        487.6          525.0      10046.0

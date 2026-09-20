@@ -303,3 +303,23 @@ position_ids = arange(past_key_values_length, seq_length + past_key_values_lengt
    f32 + f32 累加），与 CPU 参考一致到 1e-6。相对 f32，bf16 TC 只在位置/补丁这种
    浅层还能用。
 
+## 19. grouped expert GEMM 的 tile 选择（2026-09-20）
+
+把逐专家 `moe_gemm_int4_tc` 合并成 grouped kernel（一层一次 launch）时，最先要
+注意的不是 launch 次数而是 **A 面板的重复读取**：
+
+- grouped kernel 的 grid 是 `(ceil(N/BN), n_experts)`，每个 `(expert, n-tile)`
+  block 都会把同一份 A 行重新 stage 一遍。`BN` 越小，A 重复读越多（`N/BN` 倍）。
+- 但 `BN` 不能无限加大：每个 block 的累加器是 `NT=BN/8` 组，`BN=64` 时每 warp 32 个
+  C 寄存器 + 更大的共享面板，占用率下降、block 数减少，实测反而更慢
+  （B=16 prefill：bn=32 121ms vs bn=64 199ms，BM=128）。
+- **真正的杠杆是 BM**：真实每专家 token 数 ≈96，`BM=64` 需要 2 个 m-tile，权重面板
+  stage 两遍；`BM=128`（8 warp×16 行）只需 1 遍，gate_up 实测 7.1→4.0 ms/layer。
+- staging helper 原本把线程数硬编码成 128；改成 `BM` 模板 + `for (idx = tid;
+  idx < N; idx += blockDim.x)` 就能同时支持 128/256 线程块（`BM=64/128`）。
+- `BM=128` 时若 `count[e] < 128`，多出来的行 stage 成 0、mma 结果也是 0，写回时用
+  `row < rows` 屏蔽即可，数值与逐专家路径逐位一致（差异只在 device/host router）。
+- device router（`moe_router_topk`）与 host `std::exp`/`__expf` 的 softmax 有微小
+  差异，端到端 logits 会差 ~1.8e-3（与既有 ragged 回归同量级），不是 grouped GEMM
+  的 bug；以 host router 作参考时不要期望 <1e-4。
+

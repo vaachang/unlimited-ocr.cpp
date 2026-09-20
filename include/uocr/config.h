@@ -106,6 +106,10 @@ struct EngineConfig {
     bool use_device_moe_prefill = true;
     bool use_int4_experts = true;
     int int4_group_size = 128;
+    // Tile size for the grouped INT4 expert GEMM (ragged prefill): `bn` columns
+    // in {8,16,32,64} and `bm` rows in {64,128}.
+    int grouped_moe_bn = 32;
+    int grouped_moe_bm = 128;
 
     // sampling defaults
     float temperature = 0.0f;

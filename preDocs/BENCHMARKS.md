@@ -127,13 +127,16 @@ max_batch=16。下面表格的 tok/s 含整波 prefill，括号内为 `decode_ms
 当前结果（`--no-graph` 对照差异在 ±3% 噪声内；括号内为 `decode_ms − prefill_ms`
 换算的纯 decode 吞吐）：
 
-| batch | BF16 tok/s | INT4 tok/s |
+| batch | BF16 tok/s | INT4 tok/s（grouped, 2026-09-20） |
 |---|---|---|
-| 1 | 155.8 (221) | 132.9 (221) |
-| 2 | 179.3 (253) | 149.1 (251) |
-| 4 | 253.0 (386) | 228.8 (399) |
-| 8 | 379.2 (578) | 327.1 (520) |
-| 16 | **521.6 (776)** | **429.3 (667)** |
+| 1 | 155.8 (221) | 138.2 |
+| 2 | 179.3 (253) | 180.6 |
+| 4 | 253.0 (386) | 292.4 |
+| 8 | 379.2 (578) | 394.3 |
+| 16 | **521.6 (776)** | **487.6**（多次 488–516） |
+
+> INT4 列在 P3 grouped GEMM（§2.10）后更新；同一命令连续运行 tok/s 波动约 ±5%
+> （decode 占主导）。原始输出：`bench/bench_batch_real_int4_grouped.txt`。
 
 累计提升（同一命令、warmup 稳态）：
 
@@ -226,9 +229,9 @@ CUDA Graph 确实把逐步发射压到常数级。
 
 - **prefill 的逐专家 `moe_gemm_int4_tc` 是最大头**：12096 次小 GEMM（avg 55µs）。
   每个 prefill 波对 11 层 × 64 专家 × {gate,up,down} 各发一次，M≈tokens/expert。
-  **已做**：staging 重写 + bn=8 使 kernel 快 ~20%，整波 prefill 227→204ms
-  （§2.5/§2.6）。**剩余**：发射次数仍需 grouped GEMM（一层一次 launch，block 映射
-  到 (expert,n-tile)）或合并 gate/up 来消除。
+  **已做**：staging 重写 + bn=8 使 kernel 快 ~20%（§2.5/§2.6）；随后 **grouped
+  GEMM（§2.10）** 把一层 ~192 次 launch 压到 2 次、去掉每层 router D2H，整波
+  prefill 213→**120 ms**。**本节表格为 grouped 之前的快照。**
 - decode 的 masked INT4 专家（gate_up+down 18.9%）是第二块；其权重读取受带宽限制，
   但每专家仅 1–2 token 时也偏延迟受限，可考虑小批量 grouped GEMM。
 - `rswa_attn_ragged` 7%：prefill attention 的 grid=(total,heads)，total 大时较可观。
@@ -248,6 +251,50 @@ CUDA Graph 确实把逐步发射压到常数级。
 验收线为 rel_l2 ≤ 6e-4（tAgent 2.3），实测约 **50×** 余量。GPU 端用 f32 GEMM
 （`matmul_t_f32w`）而非 bf16 tensor core：bf16 激活舍入在深层视觉栈里累积到 ~11%。
 `--selftest` 的 layernorm / relpos attention / full attention rel_l2 ≤ 1e-6。
+
+## 2.10 grouped INT4 专家 GEMM（2026-09-20，`bench/bench_batch_real_int4_grouped.txt`）
+
+device router + grouped expert GEMM（`CORE_TECH.md` §5.9）。命令同 §2.6：
+
+```bash
+./build-cuda/benchmarks/bench_cuda_batch --real --int4 --prompt 64 --steps 16 --max-batch 16
+```
+
+整波 prefill（16 请求，改变前后）：
+
+| 指标 | 优化前（逐专家 host 路径） | grouped（bn=32/bm=128） |
+|---|---|---|
+| 整波 prefill (B=16) | **213 ms** | **120 ms** |
+| B=1 / 2 / 4 / 8 prefill | 48 / 88 / 76 / 113 ms | 43 / 49 / 59 / 80 ms |
+| INT4 B=16 tok/s | 429 | 488–516 |
+
+tile 扫描（B=16 prefill ms，`--only-batch 16`，`preDocs/bench/bench_grouped_tuning.txt`）：
+
+| bn\bm | 64 | 128 |
+|---|---|---|
+| 8 | 152.7 | 147.3 |
+| 16 | 145.5 | 124.2 |
+| 32 | 157.5 | **121.2** |
+| 64 | 199.5 | 138.3 |
+
+要点：**BM=128 是最大收益**（8 warp×16 行，每专家的 m-tile 数减半，权重不再重复
+stage）；`BN` 太小则 A 面板复用差、太大则 block 数/占用下降，32 是拐点。
+
+B=16 单次 prefill 的 kernel 分解（`bench/bench_nsys_batch_int4_grouped.txt`，
+两次 forward，故除以 2）：
+
+| kernel | 每次 prefill | 说明 |
+|---|---|---|
+| `moe_grouped_gate_up_int4_kernel<32,64,128>` | 44 ms | 一层一次（11 层），含 gate+up+SiLU |
+| `rswa_attn_ragged_kernel<128>` | 21 ms | prefill attention（新的第二大头，未优化） |
+| `moe_grouped_down_int4_kernel<32,64,128>` | 21 ms | 一层一次，含 scatter |
+| `matmul_t_bf16_tc_pipe_kernel<64,3,false>` | 20 ms | q/k/v/o + shared 投影 |
+| `matmul_t_bf16_tc_pipe_kernel<64,4,true>` | 5 ms | 16 请求的 lm_head |
+| `moe_router_topk_kernel` | 0.4 ms | device router |
+
+host API 侧不再有每层 router 的 D2H：整段 trace 只有 8 次 D2H（都是最后一次
+`[requests, vocab]` logits 回读，66 MB）。权重上传（2.07 GB H2D）仍占 host API 大头
+（任务 2.9）。
 
 ## 3. 回归快照
 

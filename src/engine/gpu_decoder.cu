@@ -187,6 +187,11 @@ GpuDecoder::GpuDecoder(ModelConfig cfg, const DecoderWeights& weights)
             upload_linear(lw.shared.down, dl.shared_down);
         }
     }
+    for (const DevLayer& L : layers_)
+        if (L.is_moe) {
+            int4_experts_ = L.int4_experts;
+            break;
+        }
     cu_check(cudaMalloc(&final_norm_, h * sizeof(float)), "final_norm");
     cu_check(cudaMemcpy(final_norm_, weights.final_norm.data(), h * sizeof(float),
                         cudaMemcpyHostToDevice), "final_norm copy");
@@ -476,7 +481,7 @@ void GpuDecoder::attention_block(int li, const float* x, int seq, const int* pos
 }
 
 void GpuDecoder::mlp_block(int li, const float* h1, const float* normed2, int seq, bool dev_moe,
-                           float* out, cudaStream_t stream) {
+                           bool grouped, float* out, cudaStream_t stream) {
     const int h = cfg_.hidden_size;
     const int mi = std::max(cfg_.intermediate_size,
                             cfg_.moe_intermediate_size * std::max(cfg_.n_shared_experts, 1));
@@ -509,7 +514,22 @@ void GpuDecoder::mlp_block(int li, const float* h1, const float* normed2, int se
                               router_cap_, stream);
         cu_check(cudaMemsetAsync(s.moe_out, 0, static_cast<std::size_t>(seq) * h * sizeof(float),
                                  stream), "moe_out zero");
-        if (L.int4_experts) {
+        if (grouped && L.int4_experts) {
+            // One grouped launch per projection: every expert reads its token
+            // list from the device grouping table, so there is no host loop and
+            // no per-layer D2H/H2D.
+            ++grouped_moe_calls_;
+            cuda::moe_grouped_gate_up_int4(
+                normed2, L.gate_i4.packed, L.gate_i4.scales, L.gate_i4.zeros, L.gate_i4.pstride,
+                L.gate_i4.sstride, L.gate_i4.ng, L.up_i4.packed, L.up_i4.scales, L.up_i4.zeros,
+                L.up_i4.pstride, L.up_i4.sstride, L.up_i4.ng, d_assign_token_, d_count_, ne,
+                router_cap_, h, inter, L.gate_i4.group, d_act_, grouped_bn_, grouped_bm_, stream);
+            cuda::moe_grouped_down_int4(
+                d_act_, L.down_i4.packed, L.down_i4.scales, L.down_i4.zeros, L.down_i4.pstride,
+                L.down_i4.sstride, L.down_i4.ng, d_assign_token_, d_assign_w_, d_count_, ne,
+                router_cap_, h, inter, L.down_i4.group, s.moe_out, grouped_bn_, grouped_bm_,
+                stream);
+        } else if (L.int4_experts) {
             cuda::moe_experts_masked_int4(
                 normed2, seq, L.gate_i4.packed, L.gate_i4.scales, L.gate_i4.zeros,
                 L.gate_i4.pstride, L.gate_i4.sstride, L.gate_i4.ng, L.up_i4.packed,
@@ -602,7 +622,9 @@ void GpuDecoder::layer_forward(int li, const float* x, int seq, const int* posit
     // expert kernel) so that the whole step is CUDA-Graph capturable.
     const bool dev_moe = (use_graph_ && !prefill) || (prefill && prefill_dev_moe_);
     attention_block(li, x, seq, positions, prefill, q_start, s.h1, s.normed2, stream);
-    mlp_block(li, s.h1, s.normed2, seq, dev_moe, out, stream);
+    // Single-request prefill / decode keep the masked or host path; grouped is
+    // only wired for the ragged multi-request prefill (forward_ragged).
+    mlp_block(li, s.h1, s.normed2, seq, dev_moe, /*grouped=*/false, out, stream);
 }
 
 void GpuDecoder::forward(const float* x_dev, int seq, const int* positions_dev, bool prefill,
@@ -738,7 +760,8 @@ void GpuDecoder::capture_attn_dense_graphs() {
                  "begin attn capture");
         attention_block(li, in, 1, d_pos_, /*prefill=*/false, 0, s.h1, s.normed2, stream_);
         if (!layers_[li].is_moe)
-            mlp_block(li, s.h1, s.normed2, 1, /*dev_moe=*/false, out, stream_);
+            mlp_block(li, s.h1, s.normed2, 1, /*dev_moe=*/false, /*grouped=*/false, out,
+                      stream_);
         cu_check(cudaStreamEndCapture(stream_, &attn_graphs_[li]), "end attn capture");
         cu_check(cudaGraphInstantiate(&attn_graph_execs_[li], attn_graphs_[li], nullptr, nullptr, 0),
                  "instantiate attn graph");
@@ -763,7 +786,8 @@ void GpuDecoder::run_graph_decode_attn_dense(int token, int pos, std::vector<flo
             // MoE is intentionally outside the captured graph.
             LayerScratch s = layer_scratch(scratch_, 1, h, mi);
             float* out = (li % 2 == 0) ? d_pong_ : d_ping_;
-            mlp_block(li, s.h1, s.normed2, 1, /*dev_moe=*/true, out, stream_);
+            mlp_block(li, s.h1, s.normed2, 1, /*dev_moe=*/true, /*grouped=*/false, out,
+                      stream_);
         }
     }
     const float* fin = (cfg_.num_hidden_layers % 2 == 0) ? d_ping_ : d_pong_;
@@ -959,7 +983,7 @@ void GpuDecoder::forward_batch(const float* x, int batch, const int* positions, 
     for (int li = 0; li < cfg_.num_hidden_layers; ++li) {
         LayerScratch s = layer_scratch(scratch_, batch, h, mi);
         attention_block_batch(li, batch, cur, positions, slots, s.h1, s.normed2, stream);
-        mlp_block(li, s.h1, s.normed2, batch, /*dev_moe=*/true, next, stream);
+        mlp_block(li, s.h1, s.normed2, batch, /*dev_moe=*/true, /*grouped=*/false, next, stream);
         cur = next;
         next = (next == d_ping_) ? d_pong_ : d_ping_;
     }
@@ -1007,13 +1031,21 @@ void GpuDecoder::forward_ragged(const float* x, int total, const int* positions,
     // per token but the kernel is well occupied); once several tokens share an
     // expert, the per-expert tensor-core GEMM amortises the weight read and
     // becomes much faster.  Crossover is around 2 tokens/expert.
-    const bool dev_moe = total <= 2 * cfg_.n_routed_experts;
+    // The grouped INT4 kernel removes the per-layer router D2H and the
+    // per-expert host loop, and (unlike the masked kernel) reads every expert
+    // weight exactly once per row tile, so it wins at small *and* large totals.
+    // It needs float4-addressable activations, hence the % 4 guards.
+    const bool grouped =
+        int4_experts_ && (h % 4 == 0) && (cfg_.moe_intermediate_size % 4 == 0);
+    // Without the grouped path, fall back to the masked device kernel for small
+    // batches and the host per-expert path for large ones.
+    const bool dev_moe = grouped || total <= 2 * cfg_.n_routed_experts;
     const float* cur = x;
     float* next = d_ping_;
     for (int li = 0; li < cfg_.num_hidden_layers; ++li) {
         LayerScratch s = layer_scratch(scratch_, total, h, mi);
         attention_block_ragged(li, total, cur, positions, slots, s.h1, s.normed2, stream);
-        mlp_block(li, s.h1, s.normed2, total, dev_moe, next, stream);
+        mlp_block(li, s.h1, s.normed2, total, dev_moe, grouped, next, stream);
         cur = next;
         next = (next == d_ping_) ? d_pong_ : d_ping_;
     }

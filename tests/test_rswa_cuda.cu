@@ -685,6 +685,94 @@ int main() {
         if (worst > 0.05f) ++failures;
     }
 
+    // ---- grouped INT4 expert GEMM (device router) vs per-expert host path ----
+    {
+        ModelConfig cfg;
+        cfg.vocab_size = 256;
+        cfg.hidden_size = 64;
+        cfg.intermediate_size = 128;
+        cfg.moe_intermediate_size = 32;
+        cfg.num_hidden_layers = 2;
+        cfg.num_attention_heads = 4;
+        cfg.num_key_value_heads = 4;
+        cfg.first_k_dense_replace = 1;
+        cfg.n_routed_experts = 8;
+        cfg.n_shared_experts = 1;
+        cfg.num_experts_per_tok = 2;
+        cfg.norm_topk_prob = true;
+        cfg.sliding_window = 8;
+        cfg.max_position_embeddings = 256;
+        cfg.projector_input_dim = 2048;
+        cfg.projector_n_embed = 64;
+
+        DecoderWeights w = DecoderWeights::random(cfg, 6161);
+        auto quantize_linear = [](Linear& lin, int group) {
+            if (lin.weight.fmt != WeightFormat::F32_OWNED) return;
+            lin.weight.q = quantize_int4_awq(lin.weight.f32.data(), lin.weight.rows,
+                                             lin.weight.cols, group);
+            lin.weight.fmt = WeightFormat::INT4;
+            lin.weight.f32.clear();
+        };
+        for (auto& L : w.layers)
+            if (L.is_moe)
+                for (auto& ex : L.experts) {
+                    quantize_linear(ex.gate, 32);
+                    quantize_linear(ex.up, 32);
+                    quantize_linear(ex.down, 32);
+                }
+
+        cuda::GpuDecoder gpu(cfg, w);
+        // Total ~600 rows with top_k=2 over 8 experts, so several experts get
+        // more than 128 assigned tokens and the BM=128 kernel runs multiple
+        // row tiles.  The per-request reference uses the per-expert host path.
+        std::vector<std::vector<int>> prompts(3);
+        const int plen[3] = {200, 180, 220};
+        for (int r = 0; r < 3; ++r) {
+            prompts[r].resize(plen[r]);
+            for (int t = 0; t < plen[r]; ++t)
+                prompts[r][t] = (r * 37 + t * 13 + 1) % cfg.vocab_size;
+        }
+        std::vector<int> slots = {1, 2, 0};
+        gpu.batch_configure(3, 256);
+
+        const int h = cfg.hidden_size;
+        std::vector<float> embeds;
+        std::vector<int> starts, lengths;
+        for (std::size_t r = 0; r < prompts.size(); ++r) {
+            starts.push_back(static_cast<int>(embeds.size()) / h);
+            lengths.push_back(static_cast<int>(prompts[r].size()));
+            embeds.resize(embeds.size() + prompts[r].size() * h);
+            float* dst = embeds.data() + static_cast<std::size_t>(starts.back()) * h;
+            for (std::size_t t = 0; t < prompts[r].size(); ++t)
+                w.embed_tokens.row(prompts[r][t], dst + t * h);
+        }
+        std::vector<std::vector<float>> ragged;
+        gpu.batch_prefill_embeds(embeds.data(), starts, lengths, slots, ragged);
+
+        auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+            double num = 0, den = 0;
+            for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+                const double e = static_cast<double>(a[i]) - b[i];
+                num += e * e;
+                den += static_cast<double>(b[i]) * b[i];
+            }
+            return std::sqrt(num / (den + 1e-30));
+        };
+        float worst = 0.0f;
+        for (std::size_t r = 0; r < prompts.size(); ++r) {
+            std::vector<float> ref;
+            gpu.prefill_tokens(prompts[r], ref);
+            worst = std::max(worst, static_cast<float>(rel(ragged[r], ref)));
+        }
+        const bool used_grouped = gpu.grouped_moe_calls() > 0;
+        // Both paths use the same INT4 weights; only the launch scheme differs,
+        // so the only difference is device-router vs host top-k ordering.
+        const bool ok = worst <= 0.01f && used_grouped;
+        std::printf("Grouped INT4 ragged prefill (%zu requests): worst rel_l2=%.6f grouped=%ld %s\n",
+                    prompts.size(), worst, gpu.grouped_moe_calls(), ok ? "OK" : "FAIL");
+        if (!ok) ++failures;
+    }
+
     // ---- batched decode CUDA Graph vs plain (slot permutation + ring wrap) ----
     {
         ModelConfig cfg;
