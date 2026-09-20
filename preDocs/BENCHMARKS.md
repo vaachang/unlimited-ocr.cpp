@@ -296,6 +296,18 @@ host API 侧不再有每层 router 的 D2H：整段 trace 只有 8 次 D2H（都
 `[requests, vocab]` logits 回读，66 MB）。权重上传（2.07 GB H2D）仍占 host API 大头
 （任务 2.9）。
 
+## 2.11 device embedding（2026-09-20，`bench/bench_batch_real_*_grouped.txt`）
+
+embedding 表常驻设备后（`CORE_TECH.md` §5.10）：
+
+| 模型 | batch=16 tok/s | prefill (B=16) | 显存峰值 |
+|---|---|---|---|
+| INT4 | 511–518 | 120 ms | 3.37 GB（+0.33 GB bf16 表） |
+| BF16 | 519–533 | 165–174 ms | 10.4 GB（+0.33 GB） |
+
+每步不再有 `hidden` / `batch*hidden` 的 embedding H2D；`uocr_cuda_tests` greedy
+不变（`compare_ocr` 走 CPU 参考路径，不受影响）。
+
 ## 3. 回归快照
 
 数值对齐的方法、逐项结果与根因分析统一记录在 **`ALIGNMENT.md`**（端到端 OCR

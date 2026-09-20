@@ -82,6 +82,7 @@ unlimited-ocr.cpp/
 ✅ cp.async 流水线 TC GEMM（bf16 + INT4 专家，bank-conflict-free padding；P3）
 ✅ DeepEncoder CUDA 移植（SAM+CLIP+projector 设备内核 + f32 GEMM；P3）
 ✅ ragged prefill device router + grouped INT4 专家 GEMM（一层 2 次 launch、无 D2H；P3）
+✅ device embedding 查表（表设备常驻 + `embed_gather`，每步无 embedding H2D；P3）
 ```
 
 ## 4. 开发历程
@@ -100,6 +101,7 @@ unlimited-ocr.cpp/
 | 2026-09-20 P3 | cp.async 流水线 bf16 TC GEMM（padding 去 bank 冲突）、INT4 专家 GEMM 向量化 staging + `bn=8/bk=64`、cp.async 备选变体 | `CORE_TECH.md` §5.5/§5.5b、`BENCHMARKS.md` §2.5/§2.7、`PITFALLS.md` §16/§17 |
 | 2026-09-20 P3 | DeepEncoder CUDA 移植（`GpuEncoder` + vision 内核 + f32 tiled GEMM），Engine `set_vision_gpu` 分派 | `CORE_TECH.md` §5.8、`BENCHMARKS.md` §2.9、`PITFALLS.md` §18、`tools/compare_vision_gpu` |
 | 2026-09-20 P3 | ragged prefill 的 device router + grouped INT4 专家 GEMM（一层 2 次 launch、无 D2H；`bn=32/bm=128`） | `CORE_TECH.md` §5.9、`BENCHMARKS.md` §2.10、`PITFALLS.md` §19；INT4 整波 prefill 213→120 ms |
+| 2026-09-20 P3 | device embedding 查表（表设备常驻 bf16/f32 + `embed_gather`；单请求 Graph 内 gather、batch 只传 token id） | `CORE_TECH.md` §5.10、`BENCHMARKS.md` §2.11；每步无 embedding H2D，greedy 不变 |
 
 > 每一步的实现/坑/数据分别沉淀在 `CORE_TECH.md` / `PITFALLS.md` / `BENCHMARKS.md`；
 > 当前性能与回归见 `tAgent.md` §1。
@@ -111,4 +113,4 @@ unlimited-ocr.cpp/
 | config | hidden 1280、intermediate 6848、moe_intermediate 896、12 层、heads 10、64 路由专家、top-6、shared 2、首层 dense、vocab 129280 |
 | checkpoint | 2710 个张量，6.21 GiB（BF16）；MoE 专家张量 2112 个（3 × 64 × 11 层） |
 | AWQ INT4（group=128） | 采样专家 rel-L2 ≈ 0.101；单矩阵 0.55 MB（BF16 2.19 MB，约 25%） |
-| 显存（CUDA，INT4） | 权重常驻约 2.2 GB；batch=16 峰值约 3.0 GB |
+| 显存（CUDA，INT4） | 权重常驻约 2.2 GB；batch=16 峰值约 3.37 GB（含 331MB 设备 embedding 表） |

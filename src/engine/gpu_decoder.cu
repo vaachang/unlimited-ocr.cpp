@@ -202,12 +202,12 @@ GpuDecoder::GpuDecoder(ModelConfig cfg, const DecoderWeights& weights)
     }
     cu_check(cudaMalloc(&d_logits_, static_cast<std::size_t>(cfg_.vocab_size) * sizeof(float)),
              "d_logits");
+    upload_embedding(weights.embed_tokens);
     cu_check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream");
-    cu_check(cudaMallocHost(&h_embed_pinned_, static_cast<std::size_t>(h) * sizeof(float)),
-             "pinned embed");
+    cu_check(cudaMallocHost(&h_tok_pinned_, sizeof(int)), "pinned token");
     cu_check(cudaMallocHost(&h_pos_pinned_, sizeof(int)), "pinned pos");
+    *h_tok_pinned_ = 0;
     *h_pos_pinned_ = 0;
-    for (int i = 0; i < h; ++i) h_embed_pinned_[i] = 0.0f;
     cu_check(cudaEventCreate(&ev_a_), "event a");
     cu_check(cudaEventCreate(&ev_b_), "event b");
     cu_check(cudaEventCreate(&ev_c_), "event c");
@@ -292,8 +292,10 @@ GpuDecoder::~GpuDecoder() {
     if (ev_b_) cudaEventDestroy(ev_b_);
     if (ev_c_) cudaEventDestroy(ev_c_);
     if (stream_) cudaStreamDestroy(stream_);
-    if (h_embed_pinned_) cudaFreeHost(h_embed_pinned_);
+    if (h_tok_pinned_) cudaFreeHost(h_tok_pinned_);
     if (h_pos_pinned_) cudaFreeHost(h_pos_pinned_);
+    f(d_embed_);
+    f(d_token_ids_);
 }
 
 void GpuDecoder::upload_linear(const Linear& src, DevLinear& dst) {
@@ -353,6 +355,39 @@ void GpuDecoder::upload_expert_table(const std::vector<ExpertWeights>& experts, 
                             q.zeros.size() * sizeof(float), cudaMemcpyHostToDevice),
                  "i4 zeros copy");
     }
+}
+
+void GpuDecoder::upload_embedding(const WeightMatrix& emb) {
+    if (emb.empty()) return;
+    const std::size_t n = static_cast<std::size_t>(emb.rows) * emb.cols;
+    if (emb.fmt == WeightFormat::BF16_EXT) {
+        // The checkpoint is bf16; keep the table bf16 on device so gathering is
+        // bit-identical to the host `row()` path while using half the memory.
+        embed_bf16_ = true;
+        cu_check(cudaMalloc(&d_embed_, n * sizeof(std::uint16_t)), "embed table");
+        cu_check(cudaMemcpy(d_embed_, emb.ext, n * sizeof(std::uint16_t),
+                            cudaMemcpyHostToDevice),
+                 "embed table copy");
+    } else {
+        std::vector<float> f;
+        emb.to_f32(f);
+        embed_bf16_ = false;
+        cu_check(cudaMalloc(&d_embed_, f.size() * sizeof(float)), "embed table");
+        cu_check(cudaMemcpy(d_embed_, f.data(), f.size() * sizeof(float), cudaMemcpyHostToDevice),
+                 "embed table copy");
+    }
+}
+
+void GpuDecoder::ensure_token_ids(int n) {
+    if (n <= token_ids_cap_ && d_token_ids_ != nullptr) return;
+    // The captured graphs bake `d_token_ids_`, so a reallocation invalidates
+    // them (same rule as `ensure_scratch`).
+    invalidate_graph();
+    invalidate_batch_graphs();
+    if (d_token_ids_) cudaFree(d_token_ids_);
+    token_ids_cap_ = n < 1 ? 1 : n;
+    cu_check(cudaMalloc(&d_token_ids_, static_cast<std::size_t>(token_ids_cap_) * sizeof(int)),
+             "token ids");
 }
 
 void GpuDecoder::ensure_scratch(int seq) {
@@ -730,9 +765,11 @@ void GpuDecoder::capture_decode_graph() {
     const int h = cfg_.hidden_size;
     ensure_scratch(1);
     ensure_router_scratch(1);
+    ensure_token_ids(1);
     cu_check(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal), "begin capture");
-    cu_check(cudaMemcpyAsync(d_xin_, h_embed_pinned_, static_cast<std::size_t>(h) * sizeof(float),
-                             cudaMemcpyHostToDevice, stream_), "capture embed");
+    // The token embedding is gathered on device from the (small) staged token
+    // id, so the captured graph no longer bakes a full hidden-size H2D.
+    cuda::embed_gather(d_token_ids_, d_embed_, embed_bf16_, d_xin_, 1, h, stream_);
     cu_check(cudaMemcpyAsync(d_pos_, h_pos_pinned_, sizeof(int), cudaMemcpyHostToDevice, stream_),
              "capture pos");
     forward(d_xin_, 1, d_pos_, /*prefill=*/false, 0, d_hidden_, stream_);
@@ -776,8 +813,8 @@ void GpuDecoder::run_graph_decode_attn_dense(int token, int pos, std::vector<flo
                             cfg_.moe_intermediate_size * std::max(cfg_.n_shared_experts, 1));
     ensure_scratch(1);
     ensure_router_scratch(1);
-    cu_check(cudaMemcpyAsync(d_ping_, h_embed_pinned_, static_cast<std::size_t>(h) * sizeof(float),
-                             cudaMemcpyHostToDevice, stream_), "ad embed");
+    ensure_token_ids(1);
+    cuda::embed_gather(d_token_ids_, d_embed_, embed_bf16_, d_ping_, 1, h, stream_);
     cu_check(cudaMemcpyAsync(d_pos_, h_pos_pinned_, sizeof(int), cudaMemcpyHostToDevice, stream_),
              "ad pos");
     for (int li = 0; li < cfg_.num_hidden_layers; ++li) {
@@ -800,7 +837,11 @@ void GpuDecoder::run_graph_decode_attn_dense(int token, int pos, std::vector<flo
 }
 
 void GpuDecoder::run_graph_decode(int token, int pos, std::vector<float>& logits) {
-    host_weights_->embed_tokens.row(token, h_embed_pinned_);
+    ensure_token_ids(1);
+    *h_tok_pinned_ = token;
+    cu_check(cudaMemcpyAsync(d_token_ids_, h_tok_pinned_, sizeof(int), cudaMemcpyHostToDevice,
+                             stream_),
+             "token id H2D");
     *h_pos_pinned_ = pos;
     if (!graph_ready_) {
         if (graph_scope_ == GraphScope::kAttnDense)
@@ -851,6 +892,9 @@ void GpuDecoder::prefill_tokens(const std::vector<int>& tokens, std::vector<floa
 // ---------------------------------------------------------------------------
 
 void GpuDecoder::batch_configure(int slots, int capacity) {
+    // Pre-size the token-id staging to the slot count so batched decode never
+    // reallocates (and invalidates captured graphs) as the batch grows.
+    ensure_token_ids(slots);
     // Reuse the current allocation (and any captured batched graphs) when the
     // shape is unchanged: only the per-slot state must be cleared.  Graphs are
     // keyed by batch size and read the slot map from device memory, so they
@@ -1158,11 +1202,13 @@ void GpuDecoder::batch_decode(const std::vector<int>& tokens, const std::vector<
     ensure_scratch(batch);
     ensure_router_scratch(batch);
 
-    std::vector<float> embeds(static_cast<std::size_t>(batch) * h);
-    for (int b = 0; b < batch; ++b)
-        host_weights_->embed_tokens.row(tokens[b], embeds.data() + static_cast<std::size_t>(b) * h);
-    cu_check(cudaMemcpy(d_xin_, embeds.data(), embeds.size() * sizeof(float),
-                        cudaMemcpyHostToDevice), "batch embeds");
+    // Device-side embedding gather: only `batch` token ids cross the bus
+    // instead of `batch * hidden` floats.
+    ensure_token_ids(batch);
+    cu_check(cudaMemcpyAsync(d_token_ids_, tokens.data(), batch * sizeof(int),
+                             cudaMemcpyHostToDevice, 0),
+             "batch token ids");
+    cuda::embed_gather(d_token_ids_, d_embed_, embed_bf16_, d_xin_, batch, h, 0);
     cu_check(cudaMemcpy(d_pos_, positions.data(), batch * sizeof(int), cudaMemcpyHostToDevice),
              "batch pos");
     cu_check(cudaMemcpy(d_batch_slots_, slots.data(), batch * sizeof(int), cudaMemcpyHostToDevice),
@@ -1211,10 +1257,12 @@ void GpuDecoder::decode_token(int token, int pos, std::vector<float>& logits) {
         return;
     }
     const int h = cfg_.hidden_size;
-    std::vector<float> embed(h);
-    host_weights_->embed_tokens.row(token, embed.data());
     ensure_scratch(1);
-    cu_check(cudaMemcpy(d_xin_, embed.data(), h * sizeof(float), cudaMemcpyHostToDevice), "embed H2D");
+    ensure_token_ids(1);
+    *h_tok_pinned_ = token;
+    cu_check(cudaMemcpyAsync(d_token_ids_, h_tok_pinned_, sizeof(int), cudaMemcpyHostToDevice, 0),
+             "token id H2D");
+    cuda::embed_gather(d_token_ids_, d_embed_, embed_bf16_, d_xin_, 1, h, 0);
     cu_check(cudaMemcpy(d_pos_, &pos, sizeof(int), cudaMemcpyHostToDevice), "pos H2D");
     cu_check(cudaEventRecord(ev_a_, 0), "ev a");
     forward(d_xin_, 1, d_pos_, /*prefill=*/false, pos, d_hidden_, 0);

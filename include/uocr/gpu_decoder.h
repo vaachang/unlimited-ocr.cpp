@@ -134,6 +134,9 @@ private:
     void upload_linear(const Linear& src, DevLinear& dst);
     void upload_expert_table(const std::vector<ExpertWeights>& experts, int which,
                              DevExpertTable& dst);
+    // Device-resident token embedding table + per-step id staging (task 2.5).
+    void upload_embedding(const WeightMatrix& emb);
+    void ensure_token_ids(int n);
     void forward(const float* x_dev, int seq, const int* positions_dev, bool prefill, int q_start,
                  float* out_dev, cudaStream_t stream);
     void layer_forward(int li, const float* x, int seq, const int* positions, bool prefill,
@@ -232,7 +235,12 @@ private:
     // captured.  Separate from the single-request graph above.
     std::vector<cudaGraph_t> batch_graphs_;
     std::vector<cudaGraphExec_t> batch_graph_execs_;
-    float* h_embed_pinned_ = nullptr;
+    // Device-resident embedding table (`d_embed_` is bf16 when embed_bf16_).
+    void* d_embed_ = nullptr;
+    bool embed_bf16_ = false;
+    int* d_token_ids_ = nullptr;  // [token_ids_cap_] staging for embed_gather
+    int token_ids_cap_ = 0;
+    int* h_tok_pinned_ = nullptr;
     int* h_pos_pinned_ = nullptr;
     cudaEvent_t ev_a_ = nullptr, ev_b_ = nullptr, ev_c_ = nullptr;
     float last_forward_ms_ = 0.0f, last_logits_ms_ = 0.0f;

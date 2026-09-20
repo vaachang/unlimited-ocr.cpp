@@ -1,5 +1,6 @@
 // Small elementwise / scatter helpers used by the device decoder.
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include "uocr/cuda_ops.h"
@@ -43,7 +44,43 @@ __global__ void gather_rows_kernel(float* __restrict__ dst, const float* __restr
     dst[idx] = src[static_cast<std::size_t>(row_idx[r]) * cols + c];
 }
 
+__global__ void embed_gather_bf16_kernel(const int* __restrict__ ids,
+                                         const std::uint16_t* __restrict__ table,
+                                         float* __restrict__ out, int rows, int hidden) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * hidden) return;
+    const int r = idx / hidden;
+    const int c = idx - r * hidden;
+    const __nv_bfloat16 v = __ushort_as_bfloat16(
+        __ldg(table + static_cast<std::size_t>(ids[r]) * hidden + c));
+    out[idx] = __bfloat162float(v);
+}
+
+__global__ void embed_gather_f32_kernel(const int* __restrict__ ids,
+                                        const float* __restrict__ table,
+                                        float* __restrict__ out, int rows, int hidden) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * hidden) return;
+    const int r = idx / hidden;
+    const int c = idx - r * hidden;
+    out[idx] = __ldg(table + static_cast<std::size_t>(ids[r]) * hidden + c);
+}
+
 }  // namespace
+
+void embed_gather(const int* ids, const void* table, bool bf16_table, float* out, int rows,
+                  int hidden, cudaStream_t stream) {
+    if (rows <= 0 || hidden <= 0) return;
+    const int threads = 256;
+    const int total = rows * hidden;
+    const int blocks = (total + threads - 1) / threads;
+    if (bf16_table)
+        embed_gather_bf16_kernel<<<blocks, threads, 0, stream>>>(
+            ids, static_cast<const std::uint16_t*>(table), out, rows, hidden);
+    else
+        embed_gather_f32_kernel<<<blocks, threads, 0, stream>>>(
+            ids, static_cast<const float*>(table), out, rows, hidden);
+}
 
 void gather_rows(float* dst, const float* src, const int* row_idx, int rows, int cols,
                  cudaStream_t stream) {

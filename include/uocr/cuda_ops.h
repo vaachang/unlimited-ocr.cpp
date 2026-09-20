@@ -226,6 +226,12 @@ void scatter_add_scaled(float* out, const float* vals, const int* row_idx, const
 void gather_rows(float* dst, const float* src, const int* row_idx, int rows, int cols,
                  cudaStream_t stream = 0);
 
+// out[r, :] = table[ids[r], :] for a device-resident embedding table.
+// `bf16_table` selects the table element type (bf16 stored as uint16 vs f32).
+// Used to remove the per-step host embedding gather + H2D (task 2.5).
+void embed_gather(const int* ids, const void* table, bool bf16_table, float* out, int rows,
+                  int hidden, cudaStream_t stream = 0);
+
 // ---------------------------------------------------------------------------
 // DeepEncoder (vision) kernels.  See src/kernels/cuda/vision_ops.cu.
 // ---------------------------------------------------------------------------

@@ -90,7 +90,7 @@ MoE 权重在 `DecoderWeights::load(..., quantize_experts_int4=true)` 时按需�
 | `rmsnorm.cu` | `rmsnorm_kernel` | 块内归约 |
 | `rope_fused.cu` | `rope_kernel`, `rmsnorm_head_kernel` | 融合逐头 RMSNorm + RoPE |
 | `backend.cu` | `matmul_t(_bf16)`, `device_info` | 稠密 GEMM、设备信息 |
-| `gpu_ops.cu` | `silu_mul`, `add_scaled`, `gather_rows`, `scatter_add_scaled` | 设备端逐元素 / 分组 MoE 辅助 |
+| `gpu_ops.cu` | `silu_mul`, `add_scaled`, `gather_rows`, `scatter_add_scaled`, `embed_gather` | 设备端逐元素 / 分组 MoE 辅助 + embedding 查表（§5.10） |
 | `gpu_cache.cu` / `gpu_cache.h` | `GpuRSWACache` | device-resident 固定+环形 KV cache |
 | `gpu_decoder.cu` / `gpu_decoder.h` | `GpuDecoder` | 完整设备端 MoE decoder（bf16 权重常驻；路由 top-k 在 host 调度） |
 
@@ -302,6 +302,29 @@ ragged 大批量 prefill 原来走 `mlp_block(dev_moe=false)`：每层 router lo
   （原 per-expert host 路径的同步与发射开销被消除）。
 - **剩余**：`rswa_attn_ragged`（prefill attention，B=16 时 ~21 ms）成为新的第二大头，
   未在本项处理；BF16 专家的大批量 prefill 仍走 host 路径（未加 grouped BF16 内核）。
+
+### 5.10 device embedding 查表（P3 收尾，2026-09-20）
+
+原来每一步 decode 都在 host 上 `embed_tokens.row(token, h_embed_pinned_)` 再
+`cudaMemcpyAsync` 整个 hidden（1280 float = 5KB）到 `d_xin_`；单请求 Graph 还把这次
+H2D 录制进图。改为：
+
+- **表常驻设备**：`upload_embedding` 把 `embed_tokens` 拷到 `d_embed_`。源是
+  `BF16_EXT`（真实 checkpoint）时直接存 bf16（331MB），gather 时转 f32——与 host
+  `row()` 逐位一致；源是 F32 时存 f32。避免了一律升 f32 的 662MB 开销。
+- **`embed_gather`**（`src/kernels/cuda/gpu_ops.cu`）：`out[r,:] = table[ids[r],:]`，
+  bf16/f32 两个模板分支。
+- **单请求 decode**：只把 token id 写入 pinned 再 H2D（4B），Graph 内执行
+  `embed_gather`（不再录 H2D）。
+- **batched decode**：H2D `batch` 个 token id（`d_token_ids_`），`embed_gather` 在
+  Graph 外写入 `d_xin_` 后 replay；Graph 只需按行数缓存，不受 token 变化影响。
+- **失效规则**：`d_token_ids_` 重新分配会使已捕获 Graph 失效
+  （`ensure_token_ids` 调 `invalidate_graph`/`invalidate_batch_graphs`）；`batch_configure`
+  按 slot 数预分配，避免 batch 增长时反复失效。
+- **`attn_dense` scope**：逐层图读 `d_ping_`，gather 在图外写 `d_ping_` 后 launch。
+- **验收**：`uocr_cuda_tests` 全部通过、greedy 不变；真实模型 batch=16 吞吐在噪声内
+  （BF16/INT4 ~520/518 tok/s），显存 +331MB（bf16 表）。剩余：单请求 prefill 仍
+  host 查表（每请求一次）。
 
 ## 6. 与 `prj.md` 三大创新点的对应
 

@@ -20,7 +20,8 @@
 - **完成度**：M1–M6、P0（端到端 OCR 对齐 E0–E5）、P1（R-SWA 环形覆写 / CUDA 设备端
   decoder）、P2（TC INT4 GEMM、CUDA Graph、device INT4 权重、连续批处理、batched graph、
   bf16 TC GEMM）、P3（cp.async 流水线 TC GEMM、DeepEncoder CUDA 移植、**grouped INT4
-  专家 GEMM + device router**）均已完成。**约 94–96%**（对照 `prj.md`）。
+  专家 GEMM + device router**、**device embedding 查表**）均已完成。**约 95–97%**
+  （对照 `prj.md`）。
 - **回归**：`compare_ocr` greedy **24/24**（CPU 参考路径）；`uocr_tests` **20/20**；
   `uocr_cuda_tests` **全过**（batched 排列 / ragged prefill / **grouped INT4 ragged
   prefill** / slot 复用 / batched graph / TC vs ref）。
@@ -28,9 +29,9 @@
 
   | 指标 | 值 |
   |---|---|
-  | BF16 batch=16 吞吐 | **521.6 tok/s** |
-  | INT4 batch=16 吞吐 | **488–516 tok/s**（显存峰值 3.0GB） |
-  | 整波 prefill（16 请求） | **161 ms** BF16 / **120 ms** INT4 |
+  | BF16 batch=16 吞吐 | **~520 tok/s**（显存峰值 10.4GB） |
+  | INT4 batch=16 吞吐 | **~518 tok/s**（显存峰值 3.37GB，含 331MB bf16 embedding 表） |
+  | 整波 prefill（16 请求） | **~165 ms** BF16 / **120 ms** INT4 |
   | batch=1 吞吐 | 155.8 BF16 / 138.2 INT4 tok/s |
   | lm_head m=16（n=129280） | **1174 µs**（原 2652，2.3×） |
   | 单图视觉编码（1024, GPU） | **612 ms**（CPU 参考 ~2 min；rel_l2 1.1e-5） |
@@ -52,9 +53,9 @@ ctest --test-dir build-cuda --output-on-failure
 
 按收益/成本排序。每项给出目标、方案、验收与涉及文件；完成后在本文档勾掉并更新 §1。
 
-> **2026-09-20 优先级**：2.4 device router + 2.2 grouped expert GEMM（均已完成，见下）
-> → 2.5 device embedding → 2.9 权重加载；2.10/2.11 为已完成项收尾；2.6/2.7 需先确认；
-> 2.8 受 ncu 权限限制。✅ 表示已完成（保留一段背景说明）。
+> **2026-09-20 优先级**：2.4 device router + 2.2 grouped expert GEMM、2.5 device
+> embedding 均已完成（见下）→ 2.9 权重加载；2.10/2.11 为已完成项收尾；2.6/2.7 需先
+> 确认；2.8 受 ncu 权限限制。✅ 表示已完成（保留一段背景说明）。
 
 ### ✅ 2.1 高性能 TC GEMM 重写（2026-09-20 完成）
 
@@ -96,15 +97,19 @@ ctest --test-dir build-cuda --output-on-failure
 - **剩余**：BF16 专家的 ragged 大批量 prefill 仍走 host 逐专家路径（未加 grouped
   BF16 内核）；`rswa_attn_ragged` 成为新的第二大头（B=16 ~21 ms），未优化。
 
-### 2.5 device embedding / position 查表
+### ✅ 2.5 device embedding 查表（2026-09-20 完成）
 
-- **问题**：每步 `host_weights_->embed_tokens.row()` 在 host 查表再 H2D
-  （`h_embed_pinned_`），graph replay 前需写 pinned staging。
-- **方案**：embedding 表常驻设备（bf16/f32），token id 在设备端 gather；position
-  表同样驻留。注意 vocab 129280×1280 的 bf16 表约 331MB，需纳入显存预算（INT4
-  路径当前 2.2GB，可接受）。
-- **验收**：每步无 embedding H2D；batch 越大收益越明显；greedy token 不变。
-- **涉及**：`src/engine/gpu_decoder.cu`（`decode_token`/`batch_decode`/`run_graph_decode`）。
+- **已做**：`upload_embedding` 把 `embed_tokens` 常驻设备（源为 BF16 时存 bf16，
+  否则 f32，保证与 host `row()` 逐位一致）；新增 `embed_gather` 内核按下标 gather。
+  单请求 Graph 内用 gather 取代原来 `hidden` 长度的 H2D，`batch_decode` 只 H2D
+  `batch` 个 token id（4B/行）。`d_token_ids_` 容量变化会使已捕获 Graph 失效
+  （`ensure_token_ids`），`batch_configure` 预分配到 slot 数以免反复失效。
+  见 `CORE_TECH.md` §5.10。
+- **结果**：每步不再有 `hidden`/`batch*hidden` 的 embedding H2D；真实模型
+  BF16/INT4 batch=16 约 **520/518 tok/s**（原 522/488–516，噪声内），greedy 不变；
+  显存 +331MB（bf16 表）。
+- **剩余**：单请求 `prefill_tokens` 仍在 host 查表（每请求一次，不是每步）；
+  position 仍是 4B pinned H2D（本就是 int，未做成表）。
 
 ### 2.9 权重加载优化（prj.md 6.1）
 
@@ -164,7 +169,7 @@ ctest --test-dir build-cuda --output-on-failure
 | MoE router / top-k（decode、prefill） | **GPU** | `moe_router_topk`（INT4 expert 的 ragged 路径也走设备端，无 D2H） |
 | MoE 专家 MLP（INT4，ragged prefill） | **GPU** | grouped gate+up+SiLU / down 各一次 launch（§5.9） |
 | MoE 专家 MLP（BF16，ragged 大批量 prefill） | **CPU 调度 + GPU GEMM** | 仍 host top-k + 逐专家 GEMM（未加 grouped BF16） |
-| token embedding 查表 | **CPU** | host gather + 每步 H2D（任务 2.5） |
+| token embedding 查表 | **GPU** | embedding 表设备常驻 + `embed_gather`；单请求 prefill 仍 host gather |
 | **DeepEncoder 视觉编码器（SAM+CLIP+projector）** | **GPU** | `GpuEncoder`（f32 GEMM + vision 内核）；`set_vision_gpu()` 后启用 |
 | 采样 / no-repeat-ngram | CPU | 每步 D2H logits 后采样，属设计选择 |
 | tokenizer / 图像预处理 / 调度 | CPU | 设计如此 |
@@ -201,13 +206,15 @@ ctest --test-dir build-cuda --output-on-failure
 | P2 INT4 专家调优 | BN 模板 + staging 重写 | 整波 prefill −10% |
 | P3 TC GEMM 重写 | bf16 cp.async 流水线 + padding；INT4 向量化 staging + bn8/bk64；cp.async 备选变体 | BF16 batch16 416→**522** tok/s、prefill 212→**161** ms；lm_head m≤16 **2.3×**；INT4 batch16→**429** |
 | P3 DeepEncoder CUDA | SAM+CLIP+projector 设备内核 + f32 GEMM；`GpuEncoder` + Engine 分派 | 单图 1024 **612 ms**（CPU ~2 min）；visual rel_l2 **1.1e-5** |
-| P3 grouped MoE | device router + grouped INT4 gate_up/down（一层 2 次 launch、无 D2H）；tile `bn=32/bm=128` | INT4 整波 prefill 213→**120 ms**、B=16 **488–516** tok/s；ragged rel_l2 1.7e-3 vs host |
+| P3 grouped MoE | device router + grouped INT4 gate_up/down（一层 2 次 launch、无 D2H）；tile `bn=32/bm=128` | INT4 整波 prefill 213→**120 ms**、B=16 **~518** tok/s；ragged rel_l2 1.7e-3 vs host |
+| P3 device embedding | bf16/f32 表设备常驻 + `embed_gather`；单请求 Graph 内 gather、batch 只传 token id | 每步无隐含 H2D；greedy 不变；显存 +331MB |
 
 ---
 
 ## 5. 已知遗留 / 技术债
 
-- **embedding 查表在 host**（lm_head 已在设备）；见任务 2.5。
+- 单请求 `GpuDecoder::prefill_tokens` 仍在 host 查 embedding（每请求一次，非每步）；
+  position 仍是 4B pinned H2D（本就是 int，未做成表）。
 - BF16 专家的 ragged 大批量 prefill 仍是 host top-k + 逐专家 GEMM（grouped 只做了
   INT4）；`rswa_attn_ragged`（B=16 ~21 ms）是 grouped 之后的第二大头。
 - 视觉编码器 f32 GEMM 目前是 CUDA-core tiled（~1.8 TFLOPS）；bf16 tensor-core 需
