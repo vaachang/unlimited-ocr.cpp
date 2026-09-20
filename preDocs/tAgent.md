@@ -35,7 +35,7 @@
   | lm_head m=16（n=129280） | **1174 µs**（原 2652，2.3×） |
   | 单图视觉编码（1024, GPU） | **612 ms**（CPU 参考 ~2 min；rel_l2 1.1e-5） |
 
-- 性能数据明细见 `BENCHMARKS.md` §2.5–2.8；历史进度见 `PROGRESS.md` §4。
+- 性能数据明细见 `BENCHMARKS.md` §2.5–2.9；历史进度见 `PROGRESS.md` §4。
 
 **快速验证**：
 
@@ -52,27 +52,20 @@ ctest --test-dir build-cuda --output-on-failure
 
 按收益/成本排序。每项给出目标、方案、验收与涉及文件；完成后在本文档勾掉并更新 §1。
 
+> **2026-09-20 优先级**：2.4 device router → 2.2 grouped expert GEMM → 2.5 device
+> embedding → 2.9 权重加载；2.10/2.11 为已完成项收尾；2.6/2.7 需先确认；2.8 受
+> ncu 权限限制。✅ 表示已完成（保留一段背景说明）。
+
 ### ✅ 2.1 高性能 TC GEMM 重写（2026-09-20 完成）
 
 - **已做**：`matmul_t_bf16` 换成 cp.async 多级 ring + bank-conflict-free padding 的
   `matmul_t_bf16_tc_pipe_kernel`（m≤16 的 n 拆分小 tile / m>16 的 64×64 tile）；
   INT4 专家 GEMM 激活 staging 向量化并把默认 tile 改为 `bn=8/bk=64`，另加 cp.async
   备选变体。详见 `CORE_TECH.md` §5.5 / §5.5b，数据见 `BENCHMARKS.md` §2.5/§2.7。
-- **结果**：lm_head m=8/16 2.3×；BF16 batch=16 416→~520 tok/s、整波 prefill
-  212→~164 ms；INT4 batch=16 387→~431 tok/s。
+- **结果**：lm_head m=8/16 2.3×；BF16 batch=16 416→**522** tok/s、整波 prefill
+  212→**161** ms；INT4 batch=16 387→**429** tok/s。
 - **剩余**（并入 2.2）：m>16 的 bf16 kernel 每 n-tile 重读 A；`moe_gemm_int4_tc`
   仍是逐专家发射，grouped GEMM 未做。
-
-### 2.2 Grouped expert GEMM（当前最大剩余项）
-
-- **问题**：`forward_ragged` 每层逐专家发 3×64 个 `moe_gemm_int4_tc`
-  （整轮 12096 次、avg 55µs），发射与低占用开销大。
-- **方案**：一层一次 launch，block 映射到 `(expert, m-tile, n-tile)`；设备端维护
-  每专家 token 分组表（依赖 2.4）。
-- **验收**：prefill 的 `moe_gemm_int4_tc` kernel 数量大幅下降，整波 prefill 下降；
-  logits 与逐专家路径一致。
-- **涉及**：`src/kernels/cuda/moe_gemm_int4.cu`、`src/engine/gpu_decoder.cu`
-  （`mlp_block` / `forward_ragged`）。
 
 ### ✅ 2.3 DeepEncoder CUDA 移植（2026-09-20 完成）
 
@@ -85,24 +78,57 @@ ctest --test-dir build-cuda --output-on-failure
 - **结果**：`tools/compare_vision_gpu` visual rel_l2 **1.1e-5**（验收 ≤6e-4）；
   单图 1024 编码 **612 ms**（CPU ~2 min）、640 153 ms、224 34 ms。
   详见 `CORE_TECH.md` §5.8、`BENCHMARKS.md` §2.9、`PITFALLS.md` §18。
-- **剩余**：512/768 等任意尺寸、FP16 权重与 tensor-core（需误差补偿）、CUDA Graph
-  捕获视觉栈。
+- **剩余**：见 2.10。
 
-### 2.4 大批量 prefill 的 device router
+### 2.4 大批量 prefill 的 device router（建议先做，解锁 2.2）
 
 - **问题**：`GpuDecoder::mlp_block(dev_moe=false)` 分支（ragged 大批量 prefill 走此分支）
-  每层 router logits D2H + host top-k/分组 + 每专家 H2D 索引，形成同步点。
-- **方案**：把 top-k 下放设备端（复用 `moe_router_topk`），输出设备端分组表，供 2.2。
-- **验收**：ragged prefill 每层无 D2H 同步；logits 与 host 路由一致。
-- **涉及**：`src/engine/gpu_decoder.cu`（`mlp_block`）、`src/kernels/cuda/moe_device.cu`。
+  每层 router logits **D2H** + host top-k/分组 + 每专家索引 **H2D**，形成同步点，
+  阻塞 CUDA Graph 且拖慢整波 prefill。
+- **方案**：把 softmax/sigmoid + top-k 下放设备端（复用 `moe_router_topk`），直接产出
+  设备端 `(assign_token, assign_w, count)` 分组表；`forward_ragged` 的逐专家循环改为
+  读设备分组表（或直接接 2.2 的 grouped GEMM）。注意 `moe_router_topk` 当前假定
+  `count` 已清零、`cap` 固定，ragged 下需按 `total`/`top_k` 重新推导容量。
+- **验收**：ragged prefill 每层无 D2H/H2D 同步（nsys 上无 `cudaMemcpy` 同步点）；
+  logits 与 host 路由路径 rel_l2 ≤ 1e-4；`bench_cuda_batch` 整波 prefill 不退化。
+- **涉及**：`src/engine/gpu_decoder.cu`（`mlp_block` / `forward_ragged` / scratch）、
+  `src/kernels/cuda/moe_device.cu`。
+
+### 2.2 Grouped expert GEMM（依赖 2.4；prefill 最大剩余项）
+
+- **问题**：`forward_ragged` 每层逐专家发 3×64 个 `moe_gemm_int4_tc`
+  （整轮约 12096 次、avg ~50µs），nsys 上占 GPU kernel 时间 >50%。
+- **方案**：一层一次 launch：block 映射到 `(expert, m-tile, n-tile)`，设备端按专家
+  token 分组表取 A 行；gate/up/down 各一次（或合并 gate+up）。M 很小时回退到现有
+  masked matvec。
+- **验收**：整波 prefill 明显下降（目标 <150 ms INT4）；每层 `moe_gemm_int4_tc`
+  launch 数从 ~192 降到 3；all-close logits（rel_l2 ≤ 2e-3）。
+- **涉及**：`src/kernels/cuda/moe_gemm_int4.cu`、`src/engine/gpu_decoder.cu`
+  （`mlp_block` / `forward_ragged`）。
 
 ### 2.5 device embedding / position 查表
 
 - **问题**：每步 `host_weights_->embed_tokens.row()` 在 host 查表再 H2D
-  （`h_embed_pinned_`）。
-- **方案**：embedding 表常驻设备，token id 在设备端 gather；position 同理。
+  （`h_embed_pinned_`），graph replay 前需写 pinned staging。
+- **方案**：embedding 表常驻设备（bf16/f32），token id 在设备端 gather；position
+  表同样驻留。注意 vocab 129280×1280 的 bf16 表约 331MB，需纳入显存预算（INT4
+  路径当前 2.2GB，可接受）。
 - **验收**：每步无 embedding H2D；batch 越大收益越明显；greedy token 不变。
 - **涉及**：`src/engine/gpu_decoder.cu`（`decode_token`/`batch_decode`/`run_graph_decode`）。
+
+### 2.9 权重加载优化（prj.md 6.1）
+
+- **问题**：nsys 显示权重上传（2.08GB H2D）占 host API 76%，首次加载慢。
+- **方案**：`mmap` + `cudaHostRegister` pinned 直通，或 `cudaMemcpyAsync` 分块流水
+  上传；INT4 量化与上传重叠。
+- **验收**：模型加载墙钟明显下降；显存不变。
+- **涉及**：`src/runtime/weights.cpp`、`src/engine/gpu_decoder.cu`、`GpuEncoder` 构造。
+
+### 2.8 性能记录补全
+
+- **方案**：用 ncu 采 SM/DRAM 峰值利用率；KV Cache 碎片率；纯 decode 的
+  TTFT/TPOT 分解。**注意**：本机 `ncu` 报 `ERR_NVGPUCTRPERM`（PITFALLS §17），
+  该子项暂时做不了，只能用 nsys + 消融。
 
 ### 2.6 Prefill KV 分区写入优化（prj.md 创新点三）
 
@@ -115,22 +141,31 @@ ctest --test-dir build-cuda --output-on-failure
 - **方案**：接入 OmniDocBench v1.6（AWQ vs BF16 综合分）、AWQ vs 朴素 INT4 消融。
 - **注意**：需下载外部工具链/数据，**先询问确认**。
 
-### 2.8 性能记录补全
+### 2.10 视觉编码器性能收尾（P3 遗留）
 
-- **方案**：用 ncu 采 SM/DRAM 峰值利用率（nsys kernel 分解已完成，见
-  `BENCHMARKS.md` §2.8）；KV Cache 碎片率；纯 decode 的 TTFT/TPOT 分解。
+- **现状**：`GpuEncoder` 1024 输入 612 ms，其中 f32 tiled GEMM 约 1.8 TFLOPS，
+  是主要成本；权重 bf16、激活/累加 f32。
+- **方案**：① bf16 tensor-core + 误差补偿（A 拆成 hi/lo 两片 bf16 做 2~3 次 mma，
+  保持 ~16-bit 有效尾数）；② CUDA Graph 捕获整个视觉栈；③ 支持任意非方形尺寸。
+- **验收**：1024 编码降到 ~150–250 ms；rel_l2 仍 ≤6e-4；`compare_vision_gpu` 通过。
+- **涉及**：`src/engine/gpu_encoder.cu`、`src/kernels/cuda/vision_ops.cu`、
+  `src/kernels/cuda/backend.cu`。
 
-### 2.9 权重加载优化（prj.md 6.1）
+### 2.11 CUDA 端真实 INT4 OCR 端到端回归（技术债）
 
-- **方案**：`mmap` + `cudaHostRegister` pinned DMA 直通（nsys 显示权重上传 2.08GB H2D
-  占 host API 76%）。
+- **问题**：当前 OCR 对齐（greedy 24/24）走 CPU 参考路径；CUDA 后端（`GpuDecoder`
+  + `GpuEncoder`）尚未与参考做端到端 greedy 回归。
+- **方案**：导出/复用 `ref_ocr`，用 `compare_ocr --gpu-vision` + CUDA 解码器跑
+  teacher-forced greedy，对比 token 与 logits。
+- **注意**：需要 `ref_ocr` 参考张量（当前仓库无，需重新导出，**先确认**）。
+- **涉及**：`tools/compare_ocr.cpp`、`tools/reference/export_reference.py`。
 
-> 2.3–2.5 是「能上 GPU 但仍在 CPU」的模型部分（见 §3）；tokenizer、图像预处理、
+> 2.4–2.5 是「能上 GPU 但仍在 CPU」的模型部分（见 §3）；tokenizer、图像预处理、
 > 采样/ngram、调度留 CPU 属设计选择。
 
 ---
 
-## 3. GPU 卸载现状（2026-09-19 审计）
+## 3. GPU 卸载现状（2026-09-20 审计）
 
 | 模型/计算部分 | 执行位置 | 备注 |
 |---|---|---|
