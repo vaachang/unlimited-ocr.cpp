@@ -18,6 +18,7 @@
 #include "uocr/deep_encoder.h"
 #include "uocr/image.h"
 #include "uocr/moe_decoder.h"
+#include "uocr/prompt.h"
 #include "uocr/sampler.h"
 #include "uocr/tokenizer.h"
 #include "uocr/weights.h"
@@ -84,6 +85,14 @@ public:
     // is larger than 1x1.  Requires `set_vision()`.
     std::vector<float> image_embeddings(const ImageRGB& image, bool crop_mode = true,
                                         int base_size = 0, int image_size = 0);
+
+    // Spatial crop grid that `image_embeddings()` will use for `image`: 1x1 when
+    // crop_mode is off or the image already fits in `image_size`, otherwise the
+    // Gundam grid chosen by `dynamic_preprocess`.  Feed the result into
+    // `build_ocr_prompt()` so the prompt's `<image>` token count matches the
+    // number of visual embeddings (otherwise the two desynchronise).
+    std::vector<ImageSpatialCrop> image_crops(const ImageRGB& image, bool crop_mode = true,
+                                              int image_size = 0) const;
 
     // Text prompt -> embeddings (embed_tokens only).  Images are scattered by
     // the caller / generate_from_image().

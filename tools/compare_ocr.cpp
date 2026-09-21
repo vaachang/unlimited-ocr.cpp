@@ -121,22 +121,8 @@ int main(int argc, char** argv) {
 
     ModelConfig cfg = ModelConfig::from_json_file(model_dir + "/config.json");
     Tokenizer tok = Tokenizer::from_file(model_dir + "/tokenizer.json");
-
-    // ---- 1. layout ----
     const std::string prompt = manifest.at("prompt").get<std::string>();
     const bool crop_mode = manifest.at("crop_mode").get<bool>();
-    std::vector<ImageSpatialCrop> crops{{1, 1}};
-    PromptLayout layout = build_ocr_prompt(tok, split_on(prompt, "<image>"), crops, cfg, crop_mode);
-    std::vector<int> ref_ids = load_i32(ref_dir, T.at("input_ids"));
-    std::vector<int> ref_mask = load_i32(ref_dir, T.at("images_seq_mask"));
-    bool layout_ok = layout.input_ids == ref_ids &&
-                     layout.images_seq_mask.size() == ref_mask.size();
-    for (std::size_t i = 0; layout_ok && i < ref_mask.size(); ++i)
-        if (layout.images_seq_mask[i] != static_cast<std::uint8_t>(ref_mask[i])) layout_ok = false;
-    std::printf("layout                 : ids=%zu mask_true=%zu  %s\n", layout.input_ids.size(),
-                static_cast<std::size_t>(std::count(layout.images_seq_mask.begin(),
-                                                    layout.images_seq_mask.end(), 1)),
-                layout_ok ? "OK" : "MISMATCH");
 
     // ---- 2. image preprocessing ----
     const int h = manifest.at("image_hw")[0].get<int>();
@@ -182,6 +168,20 @@ int main(int argc, char** argv) {
 #else
     std::printf("decoder backend        : CPU/f32\n");
 #endif
+
+    // ---- 1. layout (same crop grid the vision path will use) ----
+    std::vector<ImageSpatialCrop> crops = engine->image_crops(image, crop_mode);
+    PromptLayout layout = build_ocr_prompt(tok, split_on(prompt, "<image>"), crops, cfg, crop_mode);
+    std::vector<int> ref_ids = load_i32(ref_dir, T.at("input_ids"));
+    std::vector<int> ref_mask = load_i32(ref_dir, T.at("images_seq_mask"));
+    bool layout_ok = layout.input_ids == ref_ids &&
+                     layout.images_seq_mask.size() == ref_mask.size();
+    for (std::size_t i = 0; layout_ok && i < ref_mask.size(); ++i)
+        if (layout.images_seq_mask[i] != static_cast<std::uint8_t>(ref_mask[i])) layout_ok = false;
+    std::printf("layout                 : ids=%zu mask_true=%zu  %s\n", layout.input_ids.size(),
+                static_cast<std::size_t>(std::count(layout.images_seq_mask.begin(),
+                                                    layout.images_seq_mask.end(), 1)),
+                layout_ok ? "OK" : "MISMATCH");
 
     const std::string weights_path = model_dir + "/model-00001-of-000001.safetensors";
     std::printf("loading vision weights (this takes a while) ...\n");

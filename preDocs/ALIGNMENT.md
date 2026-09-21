@@ -226,6 +226,31 @@ OMP_NUM_THREADS=8 ./build/tools/compare_ocr --model models --ref /tmp/opencode/r
   仍分叉。**真实 OCR 精度需 OmniDocBench 评估（任务 2.7）**；量化器本身是
   round-to-nearest，`quantize_int4_awq` 的名字并不名副其实（未用激活统计）。
 
+### 5.3 多 crop（>640px）端到端对齐（2.12，2026-09-21）
+
+`>640px` 的图片按参考 `infer` 走 Gundam 动态切图（最多 32 个 640 局部 crop + 1024
+全局视图）。为验证该路径，临时脚本（`/tmp/opencode/export_ocr_large.py`，仿
+`export_reference.py --mode ocr` 但实现 `dynamic_preprocess` 与动态 token 布局）
+导出了 800×400 参考（crop_ratio `(2,1)`，2 个局部 crop，488 ids / 483 visual）：
+
+```bash
+./build-cuda/tools/compare_ocr --model models --ref /tmp/opencode/ref_ocr_large --gpu --gpu-vision
+# 以及 CPU vision：... --gpu
+```
+
+| 路径 | visual rel_l2 | prefill logits rel_l2 | top-1 | greedy |
+|---|---|---|---|---|
+| 修复前（CPU/GPU vision） | 0.430 / 0.431 | — | 3051 ✓（退化） | 1/16 |
+| 修复后 CPU vision | **0.0572** | 0.0247 | 1 ✓ | **16/16** |
+| 修复后 CUDA/BF16 + GPU vision | **0.0572** | 0.0244 | 1 ✓ | **16/16** |
+
+- 布局 `ids=488 mask_true=483` 与参考完全一致。
+- 修复内容：见 `PITFALLS.md` §21（`UOCR_THROW` 缺 `throw`；`Engine::image_crops`
+  统一布局/视觉 crop；`image_embeddings` 多 crop 拼接按参考重写；SAM
+  `pos_embed`/`rel_pos` 对非 1024 输入插值）。修复后误差与 1×1 路径同量级
+  （0.057 vs 0.042），属 bf16/f32 正常漂移。
+- **该参考尚未入库**（临时目录），入库为任务 2.13。
+
 ## 6. R-SWA 环形覆写验证（P1，已完成）
 
 用 `--decode-steps 140` 跑过 `P+W=16+128=144` 的覆写拐点（`ref_decoder140`）：

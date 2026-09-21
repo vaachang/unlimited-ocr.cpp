@@ -79,6 +79,28 @@ std::vector<float> bicubic_resize(const std::vector<float>& src, int Hi, int Wi,
     return out;
 }
 
+// 1D linear resample of an (L,C) table to Lout rows (align_corners=False),
+// matching SAM `get_rel_pos` when the stored rel-pos length differs from the
+// attention grid (global 64x64 table reused for a 40x40 local view).
+std::vector<float> linear_resample(const std::vector<float>& src, int L, int C, int Lout) {
+    if (L == Lout) return src;
+    std::vector<float> out(static_cast<std::size_t>(Lout) * C);
+    const float scale = static_cast<float>(L) / static_cast<float>(Lout);
+    for (int o = 0; o < Lout; ++o) {
+        const float x = (static_cast<float>(o) + 0.5f) * scale - 0.5f;
+        int x0 = static_cast<int>(std::floor(x));
+        const float frac = x - static_cast<float>(x0);
+        int x1 = x0 + 1;
+        x0 = std::clamp(x0, 0, L - 1);
+        x1 = std::clamp(x1, 0, L - 1);
+        const float* p0 = src.data() + static_cast<std::size_t>(x0) * C;
+        const float* p1 = src.data() + static_cast<std::size_t>(x1) * C;
+        float* po = out.data() + static_cast<std::size_t>(o) * C;
+        for (int c = 0; c < C; ++c) po[c] = p0[c] + frac * (p1[c] - p0[c]);
+    }
+    return out;
+}
+
 }  // namespace
 
 struct GpuEncoder::Impl {
@@ -125,6 +147,7 @@ struct GpuEncoder::Impl {
         const std::uint16_t* projw = nullptr;
         float* projb = nullptr;
         float *rh = nullptr, *rw = nullptr;
+        std::vector<float> rh_host, rw_host;
         float *n2w = nullptr, *n2b = nullptr;
         const std::uint16_t* m1w = nullptr;
         float* m1b = nullptr;
@@ -157,6 +180,8 @@ struct GpuEncoder::Impl {
     float* proj_b = nullptr;
 
     std::vector<float> image_newline_host, view_sep_host;
+    std::vector<float> sam_pos_host;
+    int sam_pos_grid = 64;
     int clip_pos_rows = 16;
 
     void load(const VisionWeights& vw, const DecoderWeights& pw) {
@@ -165,6 +190,9 @@ struct GpuEncoder::Impl {
         upload_mat_f32(vw.sam.patch_w, &patch_w);
         upload_f32(vw.sam.patch_b, &patch_b);
         upload_f32(vw.sam.pos_embed, &sam_pos);
+        sam_pos_host = vw.sam.pos_embed;
+        sam_pos_grid = static_cast<int>(
+            std::lround(std::sqrt(static_cast<double>(vw.sam.pos_embed.size() / cfg.sam_embed_dim))));
         blocks.resize(vw.sam.blocks.size());
         for (std::size_t i = 0; i < vw.sam.blocks.size(); ++i) {
             const SAMBlockWeights& b = vw.sam.blocks[i];
@@ -177,6 +205,8 @@ struct GpuEncoder::Impl {
             upload_f32(b.proj_b, &d.projb);
             upload_f32(b.rel_pos_h, &d.rh);
             upload_f32(b.rel_pos_w, &d.rw);
+            d.rh_host = b.rel_pos_h;
+            d.rw_host = b.rel_pos_w;
             upload_f32(b.norm2_w, &d.n2w);
             upload_f32(b.norm2_b, &d.n2b);
             upload_mat(b.mlp_lin1_w, &d.m1w);
@@ -284,7 +314,18 @@ void GpuEncoder::encode(const float* image_chw, int height, int width, Tensor& o
         float* col = f32buf(static_cast<std::size_t>(N) * k);
         cuda::im2col_chw(img, col, 3, height, width, patch, patch, patch, 0, grid, grid);
         cuda::matmul_t_split_bf16(col, I.patch_w, I.patch_b, x, N, dim, k);
-        cuda::add_inplace(x, I.sam_pos, N * dim);
+        float* sam_pos = I.sam_pos;
+        if (grid != I.sam_pos_grid) {
+            // Checkpoint grid is 64x64 (1024 input); interpolate for local
+            // views (e.g. 40x40 for 640) like reference `get_abs_pos_sam`.
+            std::vector<float> resized = bicubic_resize(I.sam_pos_host, I.sam_pos_grid,
+                                                        I.sam_pos_grid, dim, grid, grid);
+            sam_pos = f32buf(resized.size());
+            check(cudaMemcpy(sam_pos, resized.data(), bytes_f32(resized.size()),
+                             cudaMemcpyHostToDevice),
+                  "sam pos H2D");
+        }
+        cuda::add_inplace(x, sam_pos, N * dim);
     }
     record("gpu_sam_pos", x, static_cast<std::size_t>(N) * dim);
 
@@ -303,7 +344,25 @@ void GpuEncoder::encode(const float* image_chw, int height, int width, Tensor& o
         if (is_global) {
             // Global attention runs over the whole grid: QKV then attention.
             cuda::matmul_t_split_bf16(normed, d.qkvw, d.qkvb, qkv, N, 3 * dim, dim);
-            cuda::attention_flash(qkv, d.rh, d.rw, attn, 1, N, grid, grid, sam_heads, true);
+            const int hd = dim / sam_heads;
+            const int max_rel = 2 * grid - 1;
+            float* rh = d.rh;
+            float* rw = d.rw;
+            const int stored_rel = static_cast<int>(d.rh_host.size()) / hd;
+            std::vector<float> rh_r, rw_r;
+            if (stored_rel != max_rel) {
+                // Checkpoint stores the 64x64 grid (127); resize for the actual
+                // grid like reference `get_rel_pos` (linear, align_corners=False).
+                rh_r = linear_resample(d.rh_host, stored_rel, hd, max_rel);
+                rw_r = linear_resample(d.rw_host, stored_rel, hd, max_rel);
+                rh = f32buf(rh_r.size());
+                rw = f32buf(rw_r.size());
+                check(cudaMemcpy(rh, rh_r.data(), bytes_f32(rh_r.size()), cudaMemcpyHostToDevice),
+                      "rel_pos_h H2D");
+                check(cudaMemcpy(rw, rw_r.data(), bytes_f32(rw_r.size()), cudaMemcpyHostToDevice),
+                      "rel_pos_w H2D");
+            }
+            cuda::attention_flash(qkv, rh, rw, attn, 1, N, grid, grid, sam_heads, true);
         } else {
             // Windowed attention mirrors the reference: partition the normed
             // activations (zero padding) *then* apply QKV, so the padded window

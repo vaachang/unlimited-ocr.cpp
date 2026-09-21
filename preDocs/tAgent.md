@@ -27,10 +27,18 @@
   默认 CUDA + GPU 视觉 + **BF16 专家**；`--cpu`/`--int4`/`--no-crop-mode` 可选；图片支持
   PNG（libpng）与 PPM）。`EngineConfig::use_int4_experts` 默认改为 **false（BF16）**，
   INT4 作为显存/速度受限时的显式选项；`generate_from_image` 增加单测。
+- **多尺寸修复（2026-09-21）**：修复 `UOCR_THROW` 缺 `throw`（此前所有 `UOCR_CHECK`
+  静默失效）、`>640px` 图片 prompt 布局与视觉 embedding 数量不一致（`ocr_image`
+  写死 1×1 crop 而 `image_embeddings` 动态切图），以及视觉编码器对非 1024 输入的
+  SAM `pos_embed`/global `rel_pos` 插值缺失。新增 `Engine::image_crops()` 作为
+  「布局/视觉使用同一套 crop」的唯一来源，`image_token_count()` 与
+  `image_embeddings` 计数互相校验。验证：800×400 多 crop 参考 visual rel_l2
+  **0.057**、prefill 0.024、greedy **16/16**；1×1 参考对齐不变（0.0418、24/24）；
+  `uocr_tests` **27/27**。现在 **>640px 图片可直接用默认 crop mode**。
 - **回归**：`ocr_image` 在参考图上与 PyTorch 参考输出**逐字一致**；`compare_ocr`
   greedy **24/24**（CPU/f32 与 **CUDA/BF16+GPU vision** 两条路径）；`uocr_tests`
-  **24/24**（含 PNG/PPM 图像加载）；`uocr_cuda_tests` **全过**；
-  `compare_vision_gpu_selftest` **全过**。
+  **27/27**（含 PNG/PPM 图像加载 + 多尺寸布局/异常校验回归）；`uocr_cuda_tests`
+  **全过**；`compare_vision_gpu_selftest` **全过**。
   **INT4（group-128 RTN）** 端到端与参考分叉（top-1 翻转、0/24），CPU/INT4 与
   CUDA/INT4 **完全一致**，属量化精度问题（见 2.11 / `ALIGNMENT.md` §5.2），故默认
   不再用 INT4。
@@ -64,18 +72,53 @@ ctest --test-dir build-cuda --output-on-failure
 
 按收益/成本排序。每项给出目标、方案、验收与涉及文件；完成后在本文档勾掉并更新 §1。
 
-> **下一步优先级（2026-09-21）**：
-> 1. ✅ **2.10 TC attention 调通 + occupancy 优化**：1024 编码 366→238–246ms，
->    visual rel_l2 1.44e-4。剩余（非阻塞）：整栈 CUDA Graph / 非方形尺寸 /
->    进一步砍 `sRel` / 视觉 GEMM。
-> 2. ✅ **2.11 CUDA 端 INT4 OCR 端到端回归**：CUDA/BF16 24/24；CUDA/INT4 与
->    CPU/INT4 一致但量化精度不足（根因是 RTN 非真 AWQ）。
+> **下一步优先级（2026-09-21，更新）**：
+> 1. ✅ **2.12 可用性修复**：`UOCR_THROW` 补 `throw`；`Engine::image_crops` 统一多 crop
+>    布局/视觉；视觉 SAM `pos_embed`/`rel_pos` 对非 1024 输入插值。>640px 图片默认
+>    crop mode 现已可用（见 §1、`PITFALLS.md` §21）。
+> 2. 🔶 **2.13 多 crop 参考回归入库**：把临时导出脚本固化进 `export_reference.py`，
+>    导出 `ref_ocr_large` 并注册 CTest，防多尺寸路径回归。**建议下一步做**。
 > 3. 🔶 **2.7 精度评测**：本地量化消融已做；OmniDocBench 待外部工具链（Docker/
 >    TeX Live）。真正 AWQ/GPTQ 需校准前向，**先确认**。
-> 4. ⛔ **2.6 Prefill KV 分区**：分析后判定与参考不兼容且本负载无 gap，**不实现**。
-> 5. 2.8 受 ncu 权限限制（nsys 可用）。
+> 4. 2.14 **BF16 专家 ragged prefill** 仍走 host 逐专家路径（可加 grouped BF16 内核）；
+>    `rswa_attn_ragged`（B=16 ~21ms）可优化。
+> 5. ⛔ **2.6 Prefill KV 分区**：分析后判定与参考不兼容且本负载无 gap，**不实现**。
+> 6. 2.8 受 ncu 权限限制（nsys 可用）。
 >
 > 以下 ✅/🔶 是 2026-09-20/21 的完成快照。✅ 已完成；🔶 部分完成；⛔ 分析后不实现。
+
+### ✅ 2.12 可用性修复：异常校验 + 多 crop 端到端（2026-09-21 完成）
+
+- **已做**：
+  1. `include/uocr/common.h` 的 `UOCR_THROW` 此前漏了 `throw`，导致全项目
+     `UOCR_CHECK` 静默失效；已补 `throw`。
+  2. 新增 `Engine::image_crops()` 作为「prompt 布局 / 视觉 embedding 使用哪套 crop」
+     的唯一来源；`ocr_image`、`compare_ocr` 均改用它；`image_token_count()` 与
+     `image_embeddings`、`build_ocr_prompt` 三方计数互相校验。
+  3. `image_embeddings()` 多 crop 拼接按参考重写：各 crop 先拼成
+     `(hcn·h2)×(wcn·w2)` 大网格、**整体**每行加一次 `image_newline`，再接 global
+     视图与 `view_seperator`（原来逐个 crop 各带 newline 再首尾相接，数量/顺序都错）。
+  4. 视觉编码器（CPU `deep_encoder.cpp` + GPU `gpu_encoder.cu`）对非 1024 输入做
+     SAM `pos_embed`（bicubic）与 global `rel_pos`（linear, `align_corners=False`）
+     插值，对齐参考 `get_abs_pos_sam` / `get_rel_pos`。
+- **验收**：`uocr_tests` **27/27**；1×1 参考对齐不变（visual 0.0418、greedy 24/24）；
+  新增 800×400 多 crop 参考 visual rel_l2 **0.057**、prefill logits 0.024、
+  greedy **16/16**（修复前 0.43/解码发散）；`1280×720` 图片默认 crop mode 可正确识别。
+- **涉及**：`common.h`、`engine.{h,cpp}`、`prompt.{h,cpp}`、`deep_encoder.cpp`、
+  `gpu_encoder.cu`、`tools/{ocr_image,compare_ocr}.cpp`、`tests/test_image.cpp`。
+  细节见 `PITFALLS.md` §21。
+
+### 🔶 2.13 多 crop 参考回归入库（下一步，2026-09-21）
+
+- **目标**：把本轮用于验证的临时导出流程固化进仓库与 CTest，防止多尺寸/多 crop
+  路径再次静默回归（本轮两个 bug 正是因为没有覆盖多 crop 的参考回归）。
+- **方案**：扩展 `tools/reference/export_reference.py --mode ocr`：支持任意
+  `--image-file` 与 `dynamic_preprocess`（按 `infer` 生成 crop 比例、`images_crop`、
+  token 布局），导出 `ref_ocr_large`；在 `CMakeLists.txt` 的
+  `ENGINE_REFERENCE_DIR` 分支注册 `compare_ocr`（多 crop ref）。`compare_ocr` 已改为
+  用 `engine->image_crops()` 构建布局，可直接复用。
+- **验收**：注册后 CTest 通过；多 crop visual rel_l2 ≤6e-4（当前 0.057）、greedy 全中。
+- **涉及**：`tools/reference/export_reference.py`、`CMakeLists.txt`、`ALIGNMENT.md`。
 
 ### ✅ 2.1 高性能 TC GEMM 重写（2026-09-20 完成）
 
@@ -305,6 +348,9 @@ ctest --test-dir build-cuda --output-on-failure
   表 32KB）限制。整栈 CUDA Graph 未做。**任意长宽比的输入图片可用**（`ocr_image`
   经 `image_embeddings` 做 aspect-preserving resize + 居中 pad 成正方形后再喂
   编码器）；只有直接调用 `GpuEncoder::encode` 时才要求正方形。见任务 2.10。
+- 视觉编码器的 **非 1024 输入**（Gundam 640 局部 crop）现已做 SAM `pos_embed` /
+  global `rel_pos` 插值（2.12）；多 crop 端到端已通过临时参考验证（visual rel_l2
+  0.057），但**参考回归尚未入库**（任务 2.13）。
 - 单请求 `GpuDecoder::prefill_tokens` 仍在 host 查 embedding（每请求一次，非每步）；
   position 仍是 4B pinned H2D（本就是 int，未做成表）。
 - BF16 专家的 ragged 大批量 prefill 仍是 host top-k + 逐专家 GEMM（grouped 只做了

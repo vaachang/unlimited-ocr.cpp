@@ -150,8 +150,9 @@ int main(int argc, char** argv) {
         engine->set_vision(std::make_shared<DeepEncoder>(cfg, std::move(vw), std::move(dw)));
     }
 
-    // Build the token layout: one image, a single 1x1 dynamic grid.
-    std::vector<ImageSpatialCrop> crops{{1, 1}};
+    // Build the token layout with the same crop grid the vision path will use,
+    // so the number of <image> tokens matches the visual embedding count.
+    std::vector<ImageSpatialCrop> crops = engine->image_crops(image, crop_mode);
     PromptLayout layout =
         build_ocr_prompt(tok, split_on(prompt, "<image>"), crops, cfg, crop_mode);
 

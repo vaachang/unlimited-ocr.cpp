@@ -296,16 +296,43 @@ std::vector<float> window_unpartition(const std::vector<float>& windows, int ws,
     return x;
 }
 
+// 1D linear resample of an (L,C) row-major table to Lout rows, matching
+// torch.nn.functional.interpolate(mode="linear", align_corners=False), which
+// SAM's `get_rel_pos` applies when the stored rel-pos length differs from the
+// attention grid (e.g. the 64x64 global table reused for a 40x40 local view).
+std::vector<float> linear_resample(const std::vector<float>& src, int L, int C, int Lout) {
+    if (L == Lout) return src;
+    std::vector<float> out(static_cast<std::size_t>(Lout) * C);
+    const float scale = static_cast<float>(L) / static_cast<float>(Lout);
+    for (int o = 0; o < Lout; ++o) {
+        const float x = (static_cast<float>(o) + 0.5f) * scale - 0.5f;
+        int x0 = static_cast<int>(std::floor(x));
+        const float frac = x - static_cast<float>(x0);
+        int x1 = x0 + 1;
+        x0 = std::clamp(x0, 0, L - 1);
+        x1 = std::clamp(x1, 0, L - 1);
+        const float* p0 = src.data() + static_cast<std::size_t>(x0) * C;
+        const float* p1 = src.data() + static_cast<std::size_t>(x1) * C;
+        float* po = out.data() + static_cast<std::size_t>(o) * C;
+        for (int c = 0; c < C; ++c) po[c] = p0[c] + frac * (p1[c] - p0[c]);
+    }
+    return out;
+}
+
 // get_rel_pos for the q_size == k_size case used by SAM.
 void build_rel_pos(const std::vector<float>& rel, int q, int k, int hd, std::vector<float>& out) {
     out.assign(static_cast<std::size_t>(q) * k * hd, 0.0f);
+    const int max_rel = 2 * std::max(q, k) - 1;
+    const int stored = static_cast<int>(rel.size()) / hd;
+    std::vector<float> resized =
+        (stored == max_rel) ? rel : linear_resample(rel, stored, hd, max_rel);
     const float scale_q = std::max(static_cast<float>(k) / q, 1.0f);
     const float scale_k = std::max(static_cast<float>(q) / k, 1.0f);
     for (int i = 0; i < q; ++i) {
         for (int j = 0; j < k; ++j) {
             int idx = static_cast<int>(std::lround((i * scale_q - j * scale_k) + (k - 1) * scale_k));
-            idx = std::clamp(idx, 0, static_cast<int>(rel.size()) / hd - 1);
-            const float* ps = rel.data() + static_cast<std::size_t>(idx) * hd;
+            idx = std::clamp(idx, 0, max_rel - 1);
+            const float* ps = resized.data() + static_cast<std::size_t>(idx) * hd;
             std::memcpy(out.data() + (static_cast<std::size_t>(i) * k + j) * hd, ps,
                         hd * sizeof(float));
         }
@@ -409,10 +436,25 @@ std::vector<float> DeepEncoder::sam_forward(const float* image_chw, int h, int w
                     feat[(static_cast<std::size_t>(c) * Ho + hh) * Wo + ww];
     record("sam_patch", x);
 
-    // absolute positional embedding (already at the target 64x64 grid)
-    for (int i = 0; i < Ho * Wo; ++i)
-        for (int c = 0; c < dim; ++c)
-            x[static_cast<std::size_t>(i) * dim + c] += vw_.sam.pos_embed[static_cast<std::size_t>(i) * dim + c];
+    // absolute positional embedding; the checkpoint stores the 64x64 (1024
+    // input) grid, so interpolate it to the actual grid (reference
+    // `get_abs_pos_sam`) before adding.
+    {
+        const int src_grid = static_cast<int>(
+            std::lround(std::sqrt(static_cast<double>(vw_.sam.pos_embed.size() / dim))));
+        if (src_grid == Ho && src_grid == Wo) {
+            for (int i = 0; i < Ho * Wo; ++i)
+                for (int c = 0; c < dim; ++c)
+                    x[static_cast<std::size_t>(i) * dim + c] +=
+                        vw_.sam.pos_embed[static_cast<std::size_t>(i) * dim + c];
+        } else {
+            std::vector<float> pos =
+                bicubic_resize(vw_.sam.pos_embed, src_grid, src_grid, dim, Ho, Wo);
+            UOCR_CHECK(pos.size() == static_cast<std::size_t>(Ho) * Wo * dim,
+                       "sam pos embed resize size mismatch");
+            for (std::size_t i = 0; i < pos.size(); ++i) x[i] += pos[i];
+        }
+    }
     record("sam_pos", x);
 
     const int heads = cfg_.sam_heads;

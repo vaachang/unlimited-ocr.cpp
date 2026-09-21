@@ -447,6 +447,8 @@ std::vector<float> Engine::image_embeddings(const ImageRGB& image, bool crop_mod
     const int hidden = mcfg_.hidden_size;
     const int patch = mcfg_.patch_size;
     const int ds = mcfg_.downsample_ratio;
+    const int nq = static_cast<int>(std::ceil(static_cast<double>(image_size / patch) / ds));
+    const int nqb = static_cast<int>(std::ceil(static_cast<double>(base_size / patch) / ds));
 
     auto encode_view = [&](const ImageRGB& view, int size) {
         std::vector<float> chw = to_tensor_normalized(view);
@@ -468,6 +470,9 @@ std::vector<float> Engine::image_embeddings(const ImageRGB& image, bool crop_mod
         view = pad_square(view, image_size, 127);
         Tensor g = encode_view(view, image_size);
         result.assign(g.data(), g.data() + g.numel());
+        UOCR_CHECK(result.size() / static_cast<std::size_t>(hidden) ==
+                       static_cast<std::size_t>(nq * (nq + 1) + 1),
+                   "image_embeddings: single-view token count does not match layout formula");
         return result;
     }
 
@@ -475,8 +480,6 @@ std::vector<float> Engine::image_embeddings(const ImageRGB& image, bool crop_mod
     ImageRGB gview = pad_square(image, base_size, 127);
     Tensor global = encode_view(gview, base_size);
 
-    const int nq = static_cast<int>(
-        std::ceil(static_cast<double>(image_size / patch) / ds));
     // Reference `infer`: images that already fit within image_size use a single
     // global view (crop_ratio [1,1]); otherwise run dynamic_preprocess.
     const bool fits = image.width <= image_size && image.height <= image_size;
@@ -485,22 +488,93 @@ std::vector<float> Engine::image_embeddings(const ImageRGB& image, bool crop_mod
     const bool use_local = !fits && (dp.width_crop_num > 1 || dp.height_crop_num > 1);
     if (!use_local) {
         result.assign(global.data(), global.data() + global.numel());
+        UOCR_CHECK(result.size() / static_cast<std::size_t>(hidden) ==
+                       static_cast<std::size_t>(nqb * (nqb + 1) + 1),
+                   "image_embeddings: global token count does not match layout formula");
         return result;
     }
 
-    // local crops: each encode returns rows*(cols)+1; drop its view_seperator
-    const int global_total = static_cast<int>(global.dim(0));
-    const int global_no_sep = global_total - 1;
-    for (const ImageRGB& crop : dp.crops) {
-        Tensor lf = encode_view(crop, image_size);
-        const int n = static_cast<int>(lf.dim(0)) - 1;  // drop view_seperator
-        result.insert(result.end(), lf.data(), lf.data() + static_cast<std::size_t>(n) * hidden);
+    // Multi-view (Gundam) assembly, matching reference `UnlimitedOCRModel`:
+    //   * the local crops are laid out on the (height_crop_num x width_crop_num)
+    //     grid and flattened to (hcn*nq) x (wcn*nq) BEFORE a single
+    //     `image_newline` is appended to every merged row;
+    //   * the global view (which already carries its own row newlines) follows;
+    //   * a final `view_seperator` closes the sequence.
+    // Simply concatenating the per-crop encodings would emit one newline per
+    // individual crop instead, yielding a different token sequence and
+    // desynchronising the prompt layout, so re-stitch the raw patch tokens.
+    const int gl = nq;  // local grid edge
+    const int wcn = dp.width_crop_num;
+    const int hcn = dp.height_crop_num;
+    UOCR_CHECK(static_cast<int>(dp.crops.size()) == wcn * hcn,
+               "image_embeddings: crop count does not match crop grid");
+    const int merged_rows = hcn * gl;
+    const int merged_cols = wcn * gl;
+
+    std::vector<float> merged(static_cast<std::size_t>(merged_rows) * merged_cols * hidden);
+    const int lf_cols = gl + 1;  // raw tokens + one trailing image_newline per row
+    for (int r = 0; r < hcn; ++r) {
+        for (int c = 0; c < wcn; ++c) {
+            Tensor lf = encode_view(dp.crops[static_cast<std::size_t>(r) * wcn + c], image_size);
+            UOCR_CHECK(static_cast<int>(lf.dim(0)) == gl * lf_cols + 1,
+                       "image_embeddings: unexpected local view token count");
+            for (int ry = 0; ry < gl; ++ry) {
+                const float* src = lf.data() + static_cast<std::size_t>(ry * lf_cols) * hidden;
+                float* dst = merged.data() + (static_cast<std::size_t>(r * gl + ry) * merged_cols +
+                                              static_cast<std::size_t>(c) * gl) *
+                                                 hidden;
+                std::memcpy(dst, src, static_cast<std::size_t>(gl) * hidden * sizeof(float));
+            }
+        }
     }
-    result.insert(result.end(), global.data(),
-                  global.data() + static_cast<std::size_t>(global_no_sep) * hidden);
-    result.insert(result.end(), weights_.view_seperator.begin(), weights_.view_seperator.end());
-    (void)nq;
+
+    const int global_total = static_cast<int>(global.dim(0));
+    UOCR_CHECK(global_total == nqb * (nqb + 1) + 1,
+               "image_embeddings: unexpected global view token count");
+    const int global_raw = global_total - 1;  // drop only the view_seperator
+    const int rows_total = merged_rows;
+    const int cols_total = merged_cols + 1;
+
+    result.assign(
+        static_cast<std::size_t>(rows_total * cols_total + global_raw + 1) * hidden,
+        0.0f);
+    std::size_t pos = 0;
+    for (int r = 0; r < rows_total; ++r) {
+        std::memcpy(result.data() + pos * hidden,
+                    merged.data() + static_cast<std::size_t>(r) * merged_cols * hidden,
+                    static_cast<std::size_t>(merged_cols) * hidden * sizeof(float));
+        pos += static_cast<std::size_t>(merged_cols);
+        std::memcpy(result.data() + pos * hidden, weights_.image_newline.data(),
+                    static_cast<std::size_t>(hidden) * sizeof(float));
+        pos += 1;
+    }
+    std::memcpy(result.data() + pos * hidden, global.data(),
+                static_cast<std::size_t>(global_raw) * hidden * sizeof(float));
+    pos += static_cast<std::size_t>(global_raw);
+    std::memcpy(result.data() + pos * hidden, weights_.view_seperator.data(),
+                static_cast<std::size_t>(hidden) * sizeof(float));
+    UOCR_CHECK(result.size() / static_cast<std::size_t>(hidden) ==
+                   static_cast<std::size_t>(nqb * (nqb + 1) + 1 +
+                                           (nq * wcn + 1) * (nq * hcn)),
+               "image_embeddings: multi-view token count does not match layout formula");
     return result;
+}
+
+std::vector<ImageSpatialCrop> Engine::image_crops(const ImageRGB& image, bool crop_mode,
+                                                  int image_size) const {
+    std::vector<ImageSpatialCrop> crops;
+    if (!crop_mode) {
+        crops.push_back(ImageSpatialCrop{1, 1});
+        return crops;
+    }
+    if (image_size <= 0) image_size = mcfg_.candidate_image_size;
+    if (image.width <= image_size && image.height <= image_size) {
+        crops.push_back(ImageSpatialCrop{1, 1});
+        return crops;
+    }
+    DynamicPreprocess dp = dynamic_preprocess(image, image_size);
+    crops.push_back(ImageSpatialCrop{dp.width_crop_num, dp.height_crop_num});
+    return crops;
 }
 
 }  // namespace uocr

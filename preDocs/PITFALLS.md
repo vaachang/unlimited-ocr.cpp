@@ -356,3 +356,26 @@ position_ids = arange(past_key_values_length, seq_length + past_key_values_lengt
    全量对比 sS/P/O」分段定位，比盲猜 mma fragment 布局快得多（本次 QK^T、PV 在
    隔离测试里都正确，问题只在共享内存布局）。
 
+
+## 21. 两个静默失败陷阱：UOCR_THROW 缺 throw + 视觉编码器的尺寸假设（2026-09-21）
+
+1. **`UOCR_THROW` 少了 `throw`**：`common.h` 里
+   `#define UOCR_THROW(msg) ::uocr::Error((msg), __FILE__, __LINE__)` 只构造了一个
+   临时异常对象随即丢弃，于是全项目所有 `UOCR_CHECK` 都是**空操作**。表现：
+   prompt 布局与视觉 embedding 数量不匹配时（例如 273 槽 vs 3353 个 embedding）
+   不报错，继续拿错位特征跑出乱码/空结果；compare 工具「打不开文件」等前置检查
+   也全部失效。修复：补上 `throw`；改完必须重跑全部 ctest（本轮 27/27 通过）。
+   **教训**：别把“校验没触发”当成正常——它可能意味着校验根本没生效。
+2. **视觉编码器隐含「输入 1024」假设**：SAM 的 `pos_embed`（64×64）和 global
+   attention 的 `rel_pos`（2×64−1 = 127）在参考实现里会按实际输入网格插值
+   （`get_abs_pos_sam` / `get_rel_pos`），而引擎原来直接按前 N 行索引。对 640
+   局部 crop（网格 40×40）会严重错位：local 特征 rel_l2 高达 **0.6**。
+   修复：pos_embed 用 bicubic、rel_pos 用 linear（`align_corners=False`）
+   插值到 `2*grid-1`。修复后 800×400 多 crop 参考：visual rel_l2 **0.057**、
+   prefill logits 0.024、greedy **16/16**（修复前 0.43/发散）。
+3. **多 crop 的 token 拼接方式**：参考先把各 crop 拼成 `(hcn*h2)×(wcn*w2)` 大网格，
+   再**整体**对每一行加一次 `image_newline`，最后接 global 视图 + `view_seperator`；
+   引擎原来逐个 crop 各带各的 newline 再顺序拼接，token 数量与顺序都不同。
+   见 `Engine::image_embeddings`（`engine.cpp`）。`Engine::image_crops()` 现在是
+   「布局用哪套 crop」的唯一来源，`ocr_image`/`compare_ocr` 都从它取，
+   `image_token_count()` 与 `image_embeddings` 的计数互相校验。

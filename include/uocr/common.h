@@ -36,7 +36,7 @@ public:
         : std::runtime_error(std::string(file) + ":" + std::to_string(line) + ": " + what) {}
 };
 
-#define UOCR_THROW(msg) ::uocr::Error((msg), __FILE__, __LINE__)
+#define UOCR_THROW(msg) throw ::uocr::Error((msg), __FILE__, __LINE__)
 #define UOCR_CHECK(cond, msg)                        \
     do {                                             \
         if (!(cond)) UOCR_THROW(msg);                \

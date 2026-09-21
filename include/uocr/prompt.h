@@ -34,4 +34,14 @@ PromptLayout build_ocr_prompt(const Tokenizer& tok, const std::vector<std::strin
                               const std::vector<ImageSpatialCrop>& crops, const ModelConfig& cfg,
                               bool crop_mode = true);
 
+// Number of `<image>` token ids the layout contains for one image, following the
+// reference `infer()` formula:
+//   crop mode, fits        : num_queries_base * (num_queries_base + 1) + 1
+//   crop mode, local views : above + (num_queries*wcn + 1) * (num_queries*hcn)
+//   non-crop mode          : num_queries * (num_queries + 1) + 1
+// `image_embeddings()` asserts its visual-embedding count equals this, which
+// keeps the prompt layout and the vision path in lock-step.
+int image_token_count(const ModelConfig& cfg, bool crop_mode, int width_crop_num,
+                      int height_crop_num);
+
 }  // namespace uocr

@@ -6,6 +6,25 @@
 
 namespace uocr {
 
+int image_token_count(const ModelConfig& cfg, bool crop_mode, int width_crop_num,
+                      int height_crop_num) {
+    const int patch_size = cfg.patch_size;              // 16
+    const int downsample_ratio = cfg.downsample_ratio;  // 4
+    const int image_size = cfg.candidate_image_size;    // 640 (local view)
+    const int base_size = cfg.base_size;                // 1024 (global view)
+    const int num_queries = static_cast<int>(
+        std::ceil(static_cast<double>(image_size / patch_size) / downsample_ratio));
+    const int num_queries_base = static_cast<int>(
+        std::ceil(static_cast<double>(base_size / patch_size) / downsample_ratio));
+
+    if (!crop_mode) return num_queries * (num_queries + 1) + 1;
+
+    int n = num_queries_base * (num_queries_base + 1) + 1;
+    if (width_crop_num > 1 || height_crop_num > 1)
+        n += (num_queries * width_crop_num + 1) * (num_queries * height_crop_num);
+    return n;
+}
+
 PromptLayout build_ocr_prompt(const Tokenizer& tok, const std::vector<std::string>& text_splits,
                               const std::vector<ImageSpatialCrop>& crops, const ModelConfig& cfg,
                               bool crop_mode) {
@@ -64,6 +83,12 @@ PromptLayout build_ocr_prompt(const Tokenizer& tok, const std::vector<std::strin
     // prepend bos
     out.input_ids.insert(out.input_ids.begin(), cfg.bos_token_id);
     out.images_seq_mask.insert(out.images_seq_mask.begin(), 0);
+
+    int expected = 0;
+    for (const auto& c : crops)
+        expected += image_token_count(cfg, crop_mode, c.width_crop_num, c.height_crop_num);
+    UOCR_CHECK(out.num_image_tokens == expected,
+               "build_ocr_prompt: image token count does not match layout formula");
 
     return out;
 }
