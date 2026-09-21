@@ -31,6 +31,10 @@ cmake -S . -B build-cuda -DENGINE_BACKEND=CUDA -DCMAKE_BUILD_TYPE=Release
 cmake --build build-cuda -j8
 ctest --test-dir build-cuda --output-on-failure          # uocr_tests / uocr_cuda_tests / vision selftest
 
+# 模型权重：把 HuggingFace `baidu/Unlimited-OCR` 的
+#   model-00001-of-000001.safetensors + config.json + tokenizer.json
+# 放到 `models/` 目录（默认 `--model models`）。
+
 # CPU 参考构建
 cmake -S . -B build -DENGINE_BACKEND=CPU -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j8 && ctest --test-dir build --output-on-failure

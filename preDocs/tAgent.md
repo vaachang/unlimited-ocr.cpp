@@ -29,7 +29,8 @@
   INT4 作为显存/速度受限时的显式选项；`generate_from_image` 增加单测。
 - **回归**：`ocr_image` 在参考图上与 PyTorch 参考输出**逐字一致**；`compare_ocr`
   greedy **24/24**（CPU/f32 与 **CUDA/BF16+GPU vision** 两条路径）；`uocr_tests`
-  **21/21**；`uocr_cuda_tests` **全过**；`compare_vision_gpu_selftest` **全过**。
+  **24/24**（含 PNG/PPM 图像加载）；`uocr_cuda_tests` **全过**；
+  `compare_vision_gpu_selftest` **全过**。
   **INT4（group-128 RTN）** 端到端与参考分叉（top-1 翻转、0/24），CPU/INT4 与
   CUDA/INT4 **完全一致**，属量化精度问题（见 2.11 / `ALIGNMENT.md` §5.2），故默认
   不再用 INT4。
@@ -310,8 +311,6 @@ ctest --test-dir build-cuda --output-on-failure
   INT4）；`rswa_attn_ragged`（B=16 ~21 ms）是 grouped 之后的第二大头。
 - 视觉编码器 f32 GEMM 已由 **split-bf16 tensor-core GEMM** 取代（激活 hi/lo 两片
   补偿误差），视觉栈保持 6e-4；f32 CUDA-core 版本仅作 `k%8≠0` 回退。
-- `GpuDecoder::mlp_block_batch` 为未定义的空声明，可删除。
-- `GpuDecoder::batch_import_prefill` 已无调用者，可删除。
 - **INT4 量化精度不足**：当前 `quantize_int4_awq` 实为 group-wise RTN（非激活感知
   AWQ），单专家权重 rel-L2 ≈ 0.10、端到端 prefill logits ≈ 0.36，合成用例 top-1
   翻转。CUDA/INT4 与 CPU/INT4 一致（移植无误）。真实 OCR 精度待 OmniDocBench

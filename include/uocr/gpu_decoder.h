@@ -67,11 +67,10 @@ public:
     double last_logits_ms() const { return last_logits_ms_; }
 
     // ---- continuous batching ----
-    // Each slot owns an independent R-SWA KV cache (capacity = max_seq_len).
-    // Prefill a slot from the single-request path with `batch_import_prefill`,
-    // then advance all active slots together with `batch_decode`.
+    // Each slot owns an independent R-SWA KV cache.  Prefill slots in one
+    // ragged batch with `batch_prefill_embeds`, then advance all active slots
+    // together with `batch_decode`.
     void batch_configure(int slots, int capacity);
-    void batch_import_prefill(int slot, int prefill_len);
     // `slots` maps decode order (row) to cache slot; it may be any permutation
     // of the configured slots, so requests are free to occupy any slot.
     void batch_decode(const std::vector<int>& tokens, const std::vector<int>& positions,
@@ -173,8 +172,6 @@ private:
     // Batched layer pieces (device MoE, per-slot R-SWA attention).
     void attention_block_batch(int li, int batch, const float* x, const int* positions,
                                const int* slots, float* h1, float* normed2, cudaStream_t stream);
-    void mlp_block_batch(int li, int batch, const float* h1, const float* normed2, float* out,
-                         cudaStream_t stream);
     void forward_batch(const float* x, int batch, const int* positions, const int* slots,
                        float* out, cudaStream_t stream);
 

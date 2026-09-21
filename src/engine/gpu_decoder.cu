@@ -959,29 +959,6 @@ void GpuDecoder::batch_configure(int slots, int capacity) {
     slot_prefill_len_.assign(slots, 0);
 }
 
-void GpuDecoder::batch_import_prefill(int slot, int prefill_len) {
-    UOCR_CHECK(slot < batch_slots_, "batch slot out of range");
-    const int stride = batch_stride_;
-    const std::size_t bytes = static_cast<std::size_t>(prefill_len) * stride * sizeof(float);
-    for (int l = 0; l < cfg_.num_hidden_layers; ++l) {
-        float* dst_k = batch_k_[l] + static_cast<std::size_t>(slot) * batch_cap_ * stride;
-        float* dst_v = batch_v_[l] + static_cast<std::size_t>(slot) * batch_cap_ * stride;
-        cu_check(cudaMemcpy(dst_k, cache_.keys(l), bytes, cudaMemcpyDeviceToDevice), "batch k imp");
-        cu_check(cudaMemcpy(dst_v, cache_.values(l), bytes, cudaMemcpyDeviceToDevice),
-                 "batch v imp");
-        const int idx = l * batch_slots_ + slot;
-        const int zero = 0;
-        cu_check(cudaMemcpy(d_batch_len_ + idx, &prefill_len, sizeof(int),
-                            cudaMemcpyHostToDevice), "batch len imp");
-        cu_check(cudaMemcpy(d_batch_ring_ + idx, &zero, sizeof(int), cudaMemcpyHostToDevice),
-                 "batch ring imp");
-    }
-    cu_check(cudaMemcpy(d_batch_prefill_ + slot, &prefill_len, sizeof(int),
-                        cudaMemcpyHostToDevice),
-             "batch prefill imp");
-    slot_prefill_len_[slot] = prefill_len;
-}
-
 void GpuDecoder::attention_block_batch(int li, int batch, const float* x, const int* positions,
                                        const int* slots, float* h1, float* normed2,
                                        cudaStream_t stream) {
