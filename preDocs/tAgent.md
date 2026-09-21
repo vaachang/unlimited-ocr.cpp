@@ -14,14 +14,15 @@
 
 ---
 
-## 1. 当前状态（2026-09-20 快照）
+## 1. 当前状态（2026-09-21 快照）
 
 - **后端**：CPU 参考（OpenMP）+ CUDA 生产（sm_120），`-DENGINE_BACKEND=CPU|CUDA` 双构建。
 - **完成度**：M1–M6、P0（端到端 OCR 对齐 E0–E5）、P1（R-SWA 环形覆写 / CUDA 设备端
   decoder）、P2（TC INT4 GEMM、CUDA Graph、device INT4 权重、连续批处理、batched graph、
   bf16 TC GEMM）、P3（cp.async 流水线 TC GEMM、DeepEncoder CUDA 移植、**grouped INT4
-  专家 GEMM + device router**、**device embedding 查表**）均已完成。**约 95–97%**
-  （对照 `prj.md`）。
+  专家 GEMM + device router**、**device embedding 查表**、**INT4 量化并行加载**、
+  **视觉 split-bf16 TC GEMM + relpos 因式分解**）均已完成。**约 95–97%**（对照 `prj.md`）。
+  唯一未完成的子项是视觉 encoder 的 tensor-core attention（已写但未调通，见任务 2.10）。
 - **回归**：`compare_ocr` greedy **24/24**（CPU 参考路径）；`uocr_tests` **20/20**；
   `uocr_cuda_tests` **全过**（batched 排列 / ragged prefill / **grouped INT4 ragged
   prefill** / slot 复用 / batched graph / TC vs ref）。
@@ -53,11 +54,15 @@ ctest --test-dir build-cuda --output-on-failure
 
 按收益/成本排序。每项给出目标、方案、验收与涉及文件；完成后在本文档勾掉并更新 §1。
 
-> **2026-09-20 优先级**：2.4 device router + 2.2 grouped expert GEMM、2.5 device
-> embedding、2.9 权重加载均已完成（见下）；2.10 视觉编码器**部分完成**（split-bf16
-> GEMM + relpos 因式分解，1024 612→366ms；离 150–250ms 目标仍差 tensor-core
-> attention）→ 下一步做 2.10 收尾（TC attention）或 2.11 CUDA 端 OCR 回归（需先导出
-> 参考张量）；2.6/2.7 需先确认；2.8 受 ncu 权限限制。✅ 已完成；🔶 部分完成。
+> **下一步优先级（2026-09-21）**：
+> 1. **2.10 收尾 — 调通 tensor-core flash attention**（`attention_flash_tc_kernel`
+>    已写好且快，但数值错误、dispatch 关闭；详尽的调试计划见该节）。调通后 1024
+>    编码可望进入 150–250ms 验收区间。
+> 2. **2.11 CUDA 端真实 INT4 OCR 端到端回归**（需先导出 `ref_ocr`，**先确认**）。
+> 3. 2.10 的②整栈 CUDA Graph / ③非方形尺寸（收益小、非阻塞）。
+> 4. 2.6 Prefill KV 分区、2.7 精度评测（均**需先确认**）；2.8 受 ncu 权限限制。
+>
+> 以下 ✅/🔶 是 2026-09-20/21 的完成快照。✅ 已完成；🔶 部分完成。
 
 ### ✅ 2.1 高性能 TC GEMM 重写（2026-09-20 完成）
 
@@ -143,23 +148,41 @@ ctest --test-dir build-cuda --output-on-failure
 - **方案**：接入 OmniDocBench v1.6（AWQ vs BF16 综合分）、AWQ vs 朴素 INT4 消融。
 - **注意**：需下载外部工具链/数据，**先询问确认**。
 
-### 🔶 2.10 视觉编码器性能收尾（部分完成，2026-09-20）
+### 🔶 2.10 视觉编码器性能收尾（部分完成；下一步：调通 TC attention）
 
-- **已完成① split-bf16 tensor-core**：`matmul_t_split_bf16`（激活拆 hi/lo 两片 bf16、
-  每个权重面板做 2 次 mma、f32 累加），视觉线性/卷积全部改用它；`k%8≠0` 回退 f32。
-  1024 的 GEMM 由 178 → 98 ms，rel_l2 仍 8.2e-5。
-- **已完成① attention**：SAM global attention 的 relpos 因式分解（预计算每 query
-  的 `H+W` 查找表，内层循环去掉每 key 的 global load 与 warp 归约），attention
-  404 → 239 ms；另用每 warp 4 query / `float2` shared 读 / `__expf`。
-- **结果**：1024 编码 **612 → 366 ms**（640 153→95、224 34→18），rel_l2 8.2e-5
-  （验收 6e-4）。`compare_vision_gpu` selftest 与 GPU-vs-CPU 对比均过。
-- **未达验收（目标 150–250 ms）**：剩余瓶颈是 **f32 CUDA-core SAM attention**
-  （1024 时 239 ms，~1 TFLOPS）。要达标需要 **tensor-core flash attention**
-  （Q/K/P/V 都做 hi/lo 拆分以保精度），是一项较大的内核重写，**尚未做**。
-- **未做②③**：整栈 CUDA Graph 捕获（kernel 时间占比高、launch 开销小，收益有限）；
-  非方形尺寸支持（`encode` 仍要求正方形）。
+- **已完成（已提交 `f678751`，1024 612→366 ms，rel_l2 8.2e-5）**
+  1. **split-bf16 tensor-core GEMM**：`matmul_t_split_bf16`（激活拆 `hi=bf16(x)`、
+     `lo=bf16(x-hi)`，权重本就是精确 bf16，每个权重面板 2 次 mma、f32 累加），
+     视觉线性/卷积全用它；`k%8≠0` 回退 `matmul_t_f32w`。GEMM 178 → 98 ms。
+  2. **SAM attention relpos 因式分解**：`q·(Rh[ih]+Rw[iw])` 拆成
+     `q·Rh[ih] + q·Rw[iw]`，每 query 在 block 起始算好 `H+W` 长度的查找表放 shared，
+     内层循环由「每 key 4 次 global load + 两次 warp 归约」变成 2 次 shared 查表；
+     另加每 warp 4 query、`float2` shared 读、`__expf`。attention 404 → 239 ms。
+- **进行中① tensor-core flash attention（未调通，代码已留在仓库但 dispatch 关闭）**
+  - `attention_flash_tc_kernel<RELPOS>`（`vision_ops.cu`）：Q/K/P/V 全部 hi/lo 拆分，
+    QK^T 与 PV 走 `mma.m16n8k16`（每面板 3 次 mma），score/softmax/relpos 在 shared
+    的 f32 面板上做（非寄存器融合），tile `BM=64/BN=32/RS=72`。
+  - **现状**：能编译、能启动；1024 编码 **~250 ms**（比 f32 的 366 ms 快），
+    但**数值错误**（`visual_embeddings` rel_l2 ≈ 1.12，目标 ≤6e-4）。
+  - **当前 dispatch 被 `constexpr bool kEnableTcAttention = false` 关闭**，
+    正式路径仍走 f32 kernel（366 ms），因此主干是正确可用的。
+  - **下一步调试计划**：
+    a. 加一个**输出缓冲置零**的定向测试：把 `compare_vision_gpu --selftest` 的
+       attention case 换成 `H=W=64, B=1`（`S=4096`），并把 `d_out` 初始化为 0，
+       与 `cpu_sam_attention` 对比——现有 selftest 用 ref 预填充输出，TC launch
+       失败时会假阳性通过，务必改掉。
+    b. 逐段核对 fragment：先只验证 QK^T（把 PV 换成 CPU 参考的 P·V），再验证
+       softmax（`sS`/`sL`），最后验证 PV 的 `V^T` staging 与 `sAlpha` 按行缩放。
+    c. 重点怀疑：PV 的 A=`P`（[query][key]）与 B=`V^T`（[d][key]）fragment 布局、
+       `sV` 转置 staging、以及 online softmax 的 `alpha` rescale 与 `sL` 更新顺序。
+- **未做②③**：整栈 CUDA Graph 捕获（kernel 时间主导、launch 开销 ~1 ms，收益小）；
+  非方形尺寸支持（`encode` 仍 `UOCR_CHECK(height==width)`）。
+- **环境约束（重要）**：sm_120 的 `cudaDevAttrMaxSharedMemoryPerBlockOptin` 只有
+  **101376 B（~99 KB）**、每 SM shared 102400 B。BN=64 需要 ~121 KB 会 launch
+  失败（`invalid argument`）；现用 BN=32（~97 KB）才放得下。
 - **涉及**：`src/kernels/cuda/backend.cu`、`src/kernels/cuda/vision_ops.cu`、
-  `src/engine/gpu_encoder.cu`。详见 `CORE_TECH.md` §5.8、`BENCHMARKS.md` §2.9。
+  `src/engine/gpu_encoder.cu`。详见 `CORE_TECH.md` §5.8/§5.11、`BENCHMARKS.md` §2.9、
+  `PITFALLS.md` §20。
 
 ### 2.11 CUDA 端真实 INT4 OCR 端到端回归（技术债）
 
@@ -185,7 +208,7 @@ ctest --test-dir build-cuda --output-on-failure
 | MoE 专家 MLP（INT4，ragged prefill） | **GPU** | grouped gate+up+SiLU / down 各一次 launch（§5.9） |
 | MoE 专家 MLP（BF16，ragged 大批量 prefill） | **CPU 调度 + GPU GEMM** | 仍 host top-k + 逐专家 GEMM（未加 grouped BF16） |
 | token embedding 查表 | **GPU** | embedding 表设备常驻 + `embed_gather`；单请求 prefill 仍 host gather |
-| **DeepEncoder 视觉编码器（SAM+CLIP+projector）** | **GPU** | `GpuEncoder`（f32 GEMM + vision 内核）；`set_vision_gpu()` 后启用 |
+| **DeepEncoder 视觉编码器（SAM+CLIP+projector）** | **GPU** | `GpuEncoder`（split-bf16 TC GEMM + vision 内核；attention 仍 f32 CUDA-core）；`set_vision_gpu()` 后启用 |
 | 采样 / no-repeat-ngram | CPU | 每步 D2H logits 后采样，属设计选择 |
 | tokenizer / 图像预处理 / 调度 | CPU | 设计如此 |
 
@@ -225,14 +248,16 @@ ctest --test-dir build-cuda --output-on-failure
 | P3 device embedding | bf16/f32 表设备常驻 + `embed_gather`；单请求 Graph 内 gather、batch 只传 token id | 每步无隐含 H2D；greedy 不变；显存 +331MB |
 | P3 权重加载 | INT4 专家量化改为 OpenMP 并行（`weights.cpp` 专家循环） | 真实模型加载墙钟 **20.5 → 7.4s**；显存不变 |
 | P3 视觉编码器 | split-bf16 TC GEMM（激活 hi/lo）+ SAM attention relpos 因式分解 | 1024 编码 **612→366ms**、640 153→95ms；rel_l2 8.2e-5（未达 150–250 目标） |
+| P3 视觉编码器（WIP） | tensor-core flash attention（Q/K/P/V hi/lo 拆分；`attention_flash_tc_kernel`） | 1024 **~250ms** 但数值错误（rel_l2 1.12）；dispatch 关闭，待调试 |
 
 ---
 
 ## 5. 已知遗留 / 技术债
 
 - **视觉编码器离 150–250ms 目标仍有差距**：f32 CUDA-core SAM attention（1024 时
-  ~239ms）需要 tensor-core flash attention 才能再上一档（任务 2.10 剩余）。非方形
-  尺寸支持与整栈 CUDA Graph 未做。
+  ~239ms）需要 tensor-core flash attention 才能再上一档。TC 内核已写好但**数值未
+  调通**（rel_l2 1.12）、dispatch 关闭；调试计划见任务 2.10。非方形尺寸支持与整栈
+  CUDA Graph 未做。
 - 单请求 `GpuDecoder::prefill_tokens` 仍在 host 查 embedding（每请求一次，非每步）；
   position 仍是 4B pinned H2D（本就是 int，未做成表）。
 - BF16 专家的 ragged 大批量 prefill 仍是 host top-k + 逐专家 GEMM（grouped 只做了

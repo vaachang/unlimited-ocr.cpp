@@ -256,7 +256,12 @@ CUDA Graph 确实把逐步发射压到常数级。
 
 1024 的 kernel 分解（`nsys`）：attention_flash(RELPOS) **239 ms**（4 个 SAM global
 块各 ~52 ms）、`matmul_t_split_bf16` **98 ms**、其余 <5 ms。**未达 150–250ms 目标**：
-f32 CUDA-core attention 只有 ~1 TFLOPS，进一步提速需要 tensor-core attention（未做）。
+f32 CUDA-core attention 只有 ~1 TFLOPS，进一步提速需要 tensor-core attention。
+
+> **WIP**：`attention_flash_tc_kernel`（split-bf16 TC attention，见 `CORE_TECH.md`
+> §5.11）实测 1024 编码 **~250 ms**，已进入目标区间，但 `visual_embeddings`
+> rel_l2 ≈ **1.12**（目标 6e-4），因此 dispatch 关闭、正式路径仍是上表 366 ms。
+> 调通后本节数字预计更新为 ~250 ms。
 
 ## 2.10 grouped INT4 专家 GEMM（2026-09-20，`bench/bench_batch_real_int4_grouped.txt`）
 

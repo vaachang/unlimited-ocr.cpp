@@ -323,3 +323,21 @@ position_ids = arange(past_key_values_length, seq_length + past_key_values_lengt
   差异，端到端 logits 会差 ~1.8e-3（与既有 ragged 回归同量级），不是 grouped GEMM
   的 bug；以 host router 作参考时不要期望 <1e-4。
 
+## 20. sm_120 的 shared 上限 + TC attention 的假阳性测试（2026-09-21）
+
+写视觉 tensor-core attention 时踩到两点：
+
+1. **sm_120（RTX 5060 Ti）的 shared 上限比数据中心卡低很多**：
+   `cudaDevAttrMaxSharedMemoryPerBlockOptin = 101376 B（~99 KB）`、
+   `sharedMemPerMultiprocessor = 102400 B`。用 `BM=BN=64/x4 split 面板 + f32 分数`
+   需要 ~121 KB，`cudaFuncSetAttribute` 直接返回 `invalid argument`、kernel launch
+   也 `invalid argument`。改成 `BN=32`（~97 KB）才放得下。**注意**：`cudaGetLastError`
+   必须在 launch 后显式检查；否则失败的 launch 会留下未初始化的输出，看起来像
+   “跑通了”。
+2. **selftest 的输出 buffer 用参考值预填充 → launch 失败时假阳性通过**：
+   `compare_vision_gpu --selftest` 原来写 `float* d_out = dev_up(ref);` 再跑 kernel；
+   如果 kernel launch 失败，`d_out` 原封不动等于 `ref`，`report` 打出 rel_l2=0，
+   误以为正确。定向验证新 kernel 时**必须把输出缓冲置零**（或填 NaN），并检查
+   launch 错误。另外原来的 attention selftest 是 `H=W=14, S=196`，根本走不到
+   “大 S 才启用”的 TC 分支——要专门加 `H=W=64, S=4096` 的 case。
+

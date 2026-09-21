@@ -327,6 +327,295 @@ __global__ void attention_flash_kernel(const float* __restrict__ qkv,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tensor-core flash attention (split-bf16), for the large SAM global blocks.
+//
+// Same math as `attention_flash_kernel`, but Q/K/P/V are split into hi/lo bf16
+// and multiplied with `mma.m16n8k16` (three mmas per panel, f32 accumulate),
+// which keeps f32-level accuracy at tensor-core throughput.  Q/K are staged
+// once per block, then per K/V tile:
+//   S = (Qhi+Qlo)(Khi+Klo)^T  (TC)  -> +relpos -> online softmax -> P (split)
+//   O = O*alpha + (Phi+Plo)(Vhi+Vlo) (TC)
+// The score/softmax/relpos path works in f32 via a materialised shared tile,
+// which keeps the fragment bookkeeping tractable.
+// ---------------------------------------------------------------------------
+constexpr int kTcBM = 64;   // queries per block
+constexpr int kTcBN = 32;   // keys per tile (shared budget: sm_120 opt-in is 99KB)
+constexpr int kTcRS = kAttnHD + 8;
+
+__device__ __forceinline__ unsigned tc_smem_addr(const void* p) {
+    return static_cast<unsigned>(__cvta_generic_to_shared(p));
+}
+
+template <bool RELPOS>
+__global__ void attention_flash_tc_kernel(const float* __restrict__ qkv,
+                                          const float* __restrict__ relh,
+                                          const float* __restrict__ relw,
+                                          float* __restrict__ out, int S, int H, int W,
+                                          int heads) {
+    const int C = heads * kAttnHD;
+    const int b = blockIdx.x / heads;
+    const int h = blockIdx.x % heads;
+    const int m0 = blockIdx.y * kTcBM;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    constexpr int RS = kTcRS;
+
+    extern __shared__ __nv_bfloat16 smem_bf[];
+    __nv_bfloat16* sQhi = smem_bf;
+    __nv_bfloat16* sQlo = sQhi + kTcBM * RS;
+    __nv_bfloat16* sKhi = sQlo + kTcBM * RS;
+    __nv_bfloat16* sKlo = sKhi + kTcBN * RS;
+    __nv_bfloat16* sVhi = sKlo + kTcBN * RS;
+    __nv_bfloat16* sVlo = sVhi + kTcBN * RS;
+    __nv_bfloat16* sPhi = sVlo + kTcBN * RS;
+    __nv_bfloat16* sPlo = sPhi + kTcBM * RS;
+    float* sS = reinterpret_cast<float*>(sPlo + kTcBM * RS);
+    float* sRel = sS + kTcBM * kTcBN;
+    float* sM = sRel + (RELPOS ? kTcBM * (H + W) : 0);
+    float* sL = sM + kTcBM;
+    float* sAlpha = sL + kTcBM;
+
+    // ---- stage Q (split) ----
+    for (int i = tid; i < kTcBM * kAttnHD; i += blockDim.x) {
+        const int r = i / kAttnHD, d = i % kAttnHD;
+        const int qr = m0 + r;
+        float v = 0.0f;
+        if (qr < S) v = qkv[(static_cast<std::size_t>(b) * S + qr) * 3 * C + h * kAttnHD + d];
+        const __nv_bfloat16 hi = __float2bfloat16(v);
+        sQhi[r * RS + d] = hi;
+        sQlo[r * RS + d] = __float2bfloat16(v - __bfloat162float(hi));
+    }
+    for (int i = tid; i < kTcBM; i += blockDim.x) {
+        sM[i] = -INFINITY;
+        sL[i] = 0.0f;
+    }
+    __syncthreads();
+
+    // ---- per-query relpos tables (once per block) ----
+    if (RELPOS) {
+        const int RH = H + W;
+        for (int i = tid; i < kTcBM * RH; i += blockDim.x) {
+            const int r = i / RH, c = i % RH;
+            const int qr = m0 + r;
+            float acc = 0.0f;
+            if (qr < S) {
+                const int qh = qr / W, qw = qr % W;
+                const float* rrow;
+                if (c < H)
+                    rrow = relh + static_cast<std::size_t>(qh - c + (H - 1)) * kAttnHD;
+                else
+                    rrow = relw + static_cast<std::size_t>(qw - (c - H) + (W - 1)) * kAttnHD;
+                for (int d = 0; d < kAttnHD; ++d) {
+                    const float qd = __bfloat162float(sQhi[r * RS + d]) +
+                                     __bfloat162float(sQlo[r * RS + d]);
+                    acc += qd * rrow[d];
+                }
+            }
+            sRel[i] = acc;
+        }
+        __syncthreads();
+    }
+
+    const float scale = 1.0f / sqrtf(static_cast<float>(kAttnHD));
+    float cO[8][4] = {};
+    const int g = lane >> 2;
+    const int tig = lane & 3;
+
+    const int nkt = (S + kTcBN - 1) / kTcBN;
+    for (int kt = 0; kt < nkt; ++kt) {
+        // ---- stage K (split, [key][d]) and V (split, transposed [d][key]) ----
+        for (int i = tid; i < kTcBN * kAttnHD; i += blockDim.x) {
+            const int j = i / kAttnHD, d = i % kAttnHD;
+            const int key = kt * kTcBN + j;
+            float kv = 0.0f, vv = 0.0f;
+            if (key < S) {
+                const float* base =
+                    qkv + (static_cast<std::size_t>(b) * S + key) * 3 * C + h * kAttnHD;
+                kv = base[C + d];
+                vv = base[2 * C + d];
+            }
+            const __nv_bfloat16 kh = __float2bfloat16(kv);
+            sKhi[j * RS + d] = kh;
+            sKlo[j * RS + d] = __float2bfloat16(kv - __bfloat162float(kh));
+            const __nv_bfloat16 vh = __float2bfloat16(vv);
+            sVhi[d * RS + j] = vh;
+            sVlo[d * RS + j] = __float2bfloat16(vv - __bfloat162float(vh));
+        }
+        __syncthreads();
+
+        // ---- S = Q K^T via TC, each warp owns 16 query rows ----
+        float cS[8][4] = {};
+        for (int kk = 0; kk < kAttnHD; kk += 16) {
+            const int arow = warp * 16 + (lane & 15);
+            const __nv_bfloat16* ah = sQhi + arow * RS + kk + (lane >> 4) * 8;
+            const __nv_bfloat16* al = sQlo + arow * RS + kk + (lane >> 4) * 8;
+            unsigned ah0, ah1, ah2, ah3, al0, al1, al2, al3;
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                         : "=r"(ah0), "=r"(ah1), "=r"(ah2), "=r"(ah3)
+                         : "r"(tc_smem_addr(ah)));
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                         : "=r"(al0), "=r"(al1), "=r"(al2), "=r"(al3)
+                         : "r"(tc_smem_addr(al)));
+#pragma unroll
+            for (int nt = 0; nt < kTcBN / 8; ++nt) {
+                const __nv_bfloat16* bh = sKhi + (nt * 8 + (lane & 7)) * RS + kk + ((lane >> 3) & 1) * 8;
+                const __nv_bfloat16* bl = sKlo + (nt * 8 + (lane & 7)) * RS + kk + ((lane >> 3) & 1) * 8;
+                unsigned bh0, bh1, bl0, bl1;
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                             : "=r"(bh0), "=r"(bh1)
+                             : "r"(tc_smem_addr(bh)));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                             : "=r"(bl0), "=r"(bl1)
+                             : "r"(tc_smem_addr(bl)));
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+                    : "+f"(cS[nt][0]), "+f"(cS[nt][1]), "+f"(cS[nt][2]), "+f"(cS[nt][3])
+                    : "r"(ah0), "r"(ah1), "r"(ah2), "r"(ah3), "r"(bh0), "r"(bh1));
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+                    : "+f"(cS[nt][0]), "+f"(cS[nt][1]), "+f"(cS[nt][2]), "+f"(cS[nt][3])
+                    : "r"(ah0), "r"(ah1), "r"(ah2), "r"(ah3), "r"(bl0), "r"(bl1));
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+                    : "+f"(cS[nt][0]), "+f"(cS[nt][1]), "+f"(cS[nt][2]), "+f"(cS[nt][3])
+                    : "r"(al0), "r"(al1), "r"(al2), "r"(al3), "r"(bh0), "r"(bh1));
+            }
+        }
+        // ---- write scores (+relpos), masking padded keys ----
+        for (int nt = 0; nt < kTcBN / 8; ++nt) {
+            const int c0 = nt * 8 + tig * 2, c1 = c0 + 1;
+            const int r0 = warp * 16 + g, r1 = r0 + 8;
+            const int key0 = kt * kTcBN + c0, key1 = key0 + 1;
+            if (r0 < kTcBM) {
+                if (key0 < S) {
+                    const float rel = RELPOS ? (sRel[r0 * (H + W) + key0 / W] +
+                                                sRel[r0 * (H + W) + H + key0 % W]) : 0.0f;
+                    sS[r0 * kTcBN + c0] = cS[nt][0] * scale + rel;
+                } else sS[r0 * kTcBN + c0] = -INFINITY;
+                if (key1 < S) {
+                    const float rel = RELPOS ? (sRel[r0 * (H + W) + key1 / W] +
+                                                sRel[r0 * (H + W) + H + key1 % W]) : 0.0f;
+                    sS[r0 * kTcBN + c1] = cS[nt][1] * scale + rel;
+                } else sS[r0 * kTcBN + c1] = -INFINITY;
+            }
+            if (r1 < kTcBM) {
+                if (key0 < S) {
+                    const float rel = RELPOS ? (sRel[r1 * (H + W) + key0 / W] +
+                                                sRel[r1 * (H + W) + H + key0 % W]) : 0.0f;
+                    sS[r1 * kTcBN + c0] = cS[nt][2] * scale + rel;
+                } else sS[r1 * kTcBN + c0] = -INFINITY;
+                if (key1 < S) {
+                    const float rel = RELPOS ? (sRel[r1 * (H + W) + key1 / W] +
+                                                sRel[r1 * (H + W) + H + key1 % W]) : 0.0f;
+                    sS[r1 * kTcBN + c1] = cS[nt][3] * scale + rel;
+                } else sS[r1 * kTcBN + c1] = -INFINITY;
+            }
+        }
+        __syncthreads();
+
+        // ---- online softmax: one thread per query row; writes split P ----
+        const int jmax = min(kTcBN, S - kt * kTcBN);
+        for (int r = tid; r < kTcBM; r += blockDim.x) {
+            float rowmax = -INFINITY;
+            for (int j = 0; j < jmax; ++j) rowmax = fmaxf(rowmax, sS[r * kTcBN + j]);
+            const float mnew = fmaxf(sM[r], rowmax);
+            const float alpha = __expf(sM[r] - mnew);
+            float sum = 0.0f;
+            for (int j = 0; j < jmax; ++j) {
+                const float p = __expf(sS[r * kTcBN + j] - mnew);
+                sum += p;
+                const __nv_bfloat16 ph = __float2bfloat16(p);
+                sPhi[r * RS + j] = ph;
+                sPlo[r * RS + j] = __float2bfloat16(p - __bfloat162float(ph));
+            }
+            for (int j = jmax; j < kTcBN; ++j) {
+                sPhi[r * RS + j] = __float2bfloat16(0.0f);
+                sPlo[r * RS + j] = __float2bfloat16(0.0f);
+            }
+            sL[r] = sL[r] * alpha + sum;
+            sM[r] = mnew;
+            sAlpha[r] = alpha;
+        }
+        __syncthreads();
+
+        // ---- rescale O by alpha (per fragment row) then O += P V via TC ----
+        const float a0 = sAlpha[warp * 16 + g];
+        const float a1 = sAlpha[warp * 16 + g + 8];
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            cO[nt][0] *= a0;
+            cO[nt][1] *= a0;
+            cO[nt][2] *= a1;
+            cO[nt][3] *= a1;
+        }
+        for (int kk = 0; kk < kTcBN; kk += 16) {
+            const int arow = warp * 16 + (lane & 15);
+            const __nv_bfloat16* ah = sPhi + arow * RS + kk + (lane >> 4) * 8;
+            const __nv_bfloat16* al = sPlo + arow * RS + kk + (lane >> 4) * 8;
+            unsigned ah0, ah1, ah2, ah3, al0, al1, al2, al3;
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                         : "=r"(ah0), "=r"(ah1), "=r"(ah2), "=r"(ah3)
+                         : "r"(tc_smem_addr(ah)));
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                         : "=r"(al0), "=r"(al1), "=r"(al2), "=r"(al3)
+                         : "r"(tc_smem_addr(al)));
+#pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                const __nv_bfloat16* bh = sVhi + (nt * 8 + (lane & 7)) * RS + kk + ((lane >> 3) & 1) * 8;
+                const __nv_bfloat16* bl = sVlo + (nt * 8 + (lane & 7)) * RS + kk + ((lane >> 3) & 1) * 8;
+                unsigned bh0, bh1, bl0, bl1;
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                             : "=r"(bh0), "=r"(bh1)
+                             : "r"(tc_smem_addr(bh)));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                             : "=r"(bl0), "=r"(bl1)
+                             : "r"(tc_smem_addr(bl)));
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+                    : "+f"(cO[nt][0]), "+f"(cO[nt][1]), "+f"(cO[nt][2]), "+f"(cO[nt][3])
+                    : "r"(ah0), "r"(ah1), "r"(ah2), "r"(ah3), "r"(bh0), "r"(bh1));
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+                    : "+f"(cO[nt][0]), "+f"(cO[nt][1]), "+f"(cO[nt][2]), "+f"(cO[nt][3])
+                    : "r"(ah0), "r"(ah1), "r"(ah2), "r"(ah3), "r"(bl0), "r"(bl1));
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+                    : "+f"(cO[nt][0]), "+f"(cO[nt][1]), "+f"(cO[nt][2]), "+f"(cO[nt][3])
+                    : "r"(al0), "r"(al1), "r"(al2), "r"(al3), "r"(bh0), "r"(bh1));
+            }
+        }
+        __syncthreads();
+    }
+
+    (void)H;
+    (void)W;
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) {
+        const int c0 = nt * 8 + tig * 2, c1 = c0 + 1;
+        const int r0 = warp * 16 + g, r1 = r0 + 8;
+        if (r0 < kTcBM && m0 + r0 < S) {
+            const float inv = sL[r0] > 0.0f ? 1.0f / sL[r0] : 0.0f;
+            float* op = out + (static_cast<std::size_t>(b) * S + m0 + r0) * C + h * kAttnHD;
+            op[c0] = cO[nt][0] * inv;
+            op[c1] = cO[nt][1] * inv;
+        }
+        if (r1 < kTcBM && m0 + r1 < S) {
+            const float inv = sL[r1] > 0.0f ? 1.0f / sL[r1] : 0.0f;
+            float* op = out + (static_cast<std::size_t>(b) * S + m0 + r1) * C + h * kAttnHD;
+            op[c0] = cO[nt][2] * inv;
+            op[c1] = cO[nt][3] * inv;
+        }
+    }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -407,6 +696,37 @@ void window_unpartition(const float* win, float* x, int H, int W, int C, int ws,
 void attention_flash(const float* qkv, const float* relh, const float* relw, float* out, int B,
                      int S, int H, int W, int heads, bool relpos, cudaStream_t stream) {
     if (B <= 0 || S <= 0 || heads <= 0) return;
+    // WIP: `attention_flash_tc_kernel` (tensor-core, split-bf16) compiles and is
+    // fast (~250 ms for a 1024px image) but is **not yet numerically correct**
+    // (visual rel_l2 ~1.1 vs the 6e-4 budget), so the dispatch below is disabled
+    // and the f32 kernel is used for every call.  See `tAgent.md` 2.10 and
+    // `PITFALLS.md` for the design and the open debugging questions.
+    constexpr bool kEnableTcAttention = false;
+    if (kEnableTcAttention && relpos && S >= 512) {
+        const std::size_t bytes =
+            (static_cast<std::size_t>(4) * kTcBM + 4 * kTcBN) * kTcRS * sizeof(std::uint16_t) +
+            static_cast<std::size_t>(kTcBM) * kTcBN * sizeof(float) +
+            static_cast<std::size_t>(3) * kTcBM * sizeof(float) +
+            static_cast<std::size_t>(kTcBM) * (H + W) * sizeof(float);
+        static int max_optin = -1;
+        if (max_optin < 0) {
+            int m = 0;
+            cudaDeviceGetAttribute(&m, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+            max_optin = m;
+        }
+        if (static_cast<int>(bytes) > max_optin) {
+            // Too large for the TC tile (very high resolution): fall back to f32.
+        } else {
+            cudaFuncSetAttribute(attention_flash_tc_kernel<true>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(bytes));
+            const dim3 tb(128);
+            const dim3 tg(B * heads, (S + kTcBM - 1) / kTcBM);
+            attention_flash_tc_kernel<true><<<tg, tb, bytes, stream>>>(qkv, relh, relw, out, S, H,
+                                                                       W, heads);
+            return;
+        }
+    }
     const dim3 block(32 * kAttnWarps);
     const dim3 grid(B * heads, (S + kAttnWarps * kAttnQP - 1) / (kAttnWarps * kAttnQP));
     const std::size_t kv = static_cast<std::size_t>(2) * kAttnKT * kAttnHD;

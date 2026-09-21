@@ -343,6 +343,32 @@ H2D 录制进图。改为：
   （BF16/INT4 ~520/518 tok/s），显存 +331MB（bf16 表）。剩余：单请求 prefill 仍
   host 查表（每请求一次）。
 
+### 5.11 tensor-core flash attention（WIP，未调通）
+
+`attention_flash_tc_kernel<RELPOS>`（`src/kernels/cuda/vision_ops.cu`）是给 SAM
+global attention 准备的 tensor-core 版本，**目前数值错误，dispatch 由
+`kEnableTcAttention=false` 关闭**，正式路径仍走 f32 kernel。
+
+- **设计**：Block = 128 线程（4 warp）× 64 query，per-head；tile `BM=64/BN=32/RS=72`。
+  - Q 常驻 shared（`sQhi/sQlo`，split-bf16）；每个 k-tile stage K（`[key][hd]`、
+    split）与 V（**转置** `[hd][key]`、split）——转置是因为 PV 的 B 操作数是
+    `V^T`（mma `row.col` 要求 B 为 `[n][k]` 行主序）。
+  - `S = Q·K^T`：3 次 mma/面板（`QhiKhi + QhiKlo + QloKhi`），写出到 f32 shared
+    `sS[64][32]`，同时按 `sRel` 查表加 relpos、把越界 key 置 `-inf`。
+  - online softmax 用 64 个线程（一线程一行）在 `sS` 上算 max/exp，`P` 以 split-bf16
+    写回 `sPhi/sPlo`；`sAlpha` 记录每行 `exp(m_old-m_new)`。
+  - `O = O*alpha + P·V`：先按 `sAlpha` 缩放寄存器里的 `cO` fragment，再 3 次 mma
+    （`PhiVhi + PhiVlo + PloVhi`）。`sRel` 是每 query 的 `[H+W]` relpos 查找表，
+    在 block 起始算一次。
+- **共享内存**：~97 KB（`4*BM + 4*BN` 行 × 72 bf16 + `sS` + `sRel` + m/l/alpha）。
+- **现状**：编译/启动正常；1024 编码 ~250 ms（比 f32 的 366 ms 快），但 visual
+  rel_l2 ≈ 1.12（目标 6e-4）。selftest 的 windowed case（`S=196`）从未走到 TC
+  （阈值 `S>=512`），且其输出 buffer 用参考预填充，TC launch 失败时会假阳性通过——
+  调试时必须改成**输出置零 + `H=W=64`** 的定向测试。
+- **调试建议**：分段隔离——只验证 QK^T（PV 用参考 P·V）、softmax（`sS`/`sL`）、
+  PV（`V^T` staging 与 `sAlpha` 行缩放）；重点怀疑 `V^T` 的 fragment 布局与
+  online-softmax 的 rescale/`sL` 更新顺序。
+
 ## 6. 与 `prj.md` 三大创新点的对应
 
 | prj.md 创新点 | 本项目实现 | 状态 |
