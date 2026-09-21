@@ -24,6 +24,10 @@
   **视觉 split-bf16 TC GEMM + relpos 因式分解**、**视觉 tensor-core flash attention**）
   均已完成（2.6 分析后判定不适用/不实现，见该节）。**约 98%**（对照 `prj.md`；
   仅剩 2.7 精度评测/2.8 profiling 受外部工具与权限限制，2.14 为纯性能项）。
+- **收尾决定（2026-09-21）**：项目判定为**可用、完整**，本轮不再改功能代码。
+  2.14（BF16 grouped ragged prefill）保留为性能可选项；2.7（OmniDocBench）需先安装
+  外部工具链（Docker/TeX Live 等）；2.8 受本机 `ncu` 权限限制。若后续要做，按 §2 各节
+  的验收口径实施。
 - **入口/可用性**：新增独立 CLI `tools/ocr_image`（`--image page.png` → 打印识别文本，
   默认 CUDA + GPU 视觉 + **BF16 专家**；`--cpu`/`--int4`/`--no-crop-mode` 可选；图片支持
   PNG（libpng）与 PPM）。`EngineConfig::use_int4_experts` 默认改为 **false（BF16）**，
