@@ -246,7 +246,7 @@ CUDA Graph 确实把逐步发射压到常数级。
 |---|---|---|---|---|---|---|---|
 | 224 | **18 ms** | 18 ms | 34 ms | — | 3.9e-5 | 5.1e-5 | 1.6e-5 |
 | 640 | **75 ms** | 95 ms | 153 ms | ~43 s | 7.4e-5 | 9.0e-5 | 1.9e-5 |
-| 1024 | **248–254 ms** | 366 ms | 612 ms | ~2 min | **1.44e-4** | 1.77e-4 | 4.6e-5 |
+| 1024 | **238–246 ms** | 366 ms | 612 ms | ~2 min | **1.44e-4** | 1.77e-4 | 4.6e-5 |
 
 验收线为 rel_l2 ≤ 6e-4（tAgent 2.10），实测约 **4×** 余量。提升来自：视觉线性/
 卷积改用 **split-bf16 tensor-core GEMM**（`matmul_t_split_bf16`，激活 hi/lo 两片，
@@ -255,12 +255,14 @@ CUDA Graph 确实把逐步发射压到常数级。
 `CORE_TECH.md` §5.11）。`--selftest` 的 layernorm / relpos attention / full
 attention / **大 S TC attention** rel_l2 ≤ 1e-5。
 
-1024 的 kernel 分解（P3 收尾时 `nsys`）：attention_flash(RELPOS) **239 ms**（4 个
-SAM global 块各 ~52 ms）、`matmul_t_split_bf16` **98 ms**、其余 <5 ms。改用 TC
-attention 后总时间 **366 → ~250 ms**，进入 150–250ms 目标区间（略贴上限）；TC
-attention 本身约 121 ms（f32 为 239 ms，~2×）。进一步提速受限于 **每个 block
-~90 KB shared 只能 1 block/SM**（`sRel` 因式分解表 32 KB 是最大项，见
-`CORE_TECH.md` §5.11「剩余」）。
+1024 的 kernel 分解（TC attention + 8-warp n-split 后，`nsys`）：`matmul_t_split_bf16`
+**98 ms**（已超过 attention 成为最大头）、`attention_flash_tc_kernel`（4 个 SAM global
+块各 ~20 ms）合计 **81 ms**、windowed f32 `attention_flash_kernel<true>` 30 ms、
+CLIP f32 attention 5 ms、gelu 3 ms、其余 <3 ms。改用 TC attention 后总时间
+**366 → ~240 ms**，进入 150–250ms 目标区间。TC attention 本身 81 ms（f32 为
+239 ms，~3×）。进一步提升：windowed attention/f32 仍占 30 ms，以及 kernel 受
+**90 KB shared → 1 block/SM** 限制（`sRel` 因式分解表 32 KB 是最大项，见
+`CORE_TECH.md` §5.11）。
 
 > 当 `S < 512`（windowed/CLIP）或 tile shared 超过 sm_120 的 101376 B opt-in
 > 上限时，`attention_flash` 自动回退 f32 CUDA-core 版本（正确性不变）。

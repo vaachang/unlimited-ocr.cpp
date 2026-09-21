@@ -107,6 +107,8 @@ unlimited-ocr.cpp/
 | 2026-09-20 P3 | 视觉编码器性能：split-bf16 TC GEMM（激活 hi/lo 补偿）+ SAM attention relpos 因式分解 | `CORE_TECH.md` §5.8、`BENCHMARKS.md` §2.9；1024 编码 612→366ms，rel_l2 8.2e-5（未达 150–250 目标） |
 | 2026-09-21 P3 | 视觉 tensor-core flash attention（WIP）：Q/K/P/V hi/lo 拆分 + shared 分数/softmax，~250ms 但数值错误，dispatch 关闭 | `CORE_TECH.md` §5.11、`PITFALLS.md` §20；下一步调试见 `tAgent.md` 2.10 |
 | 2026-09-21 P3 | 修通视觉 TC attention：真因是 V^T 面板按错误行数分配/寻址（越界写坏 sV/sPhi），改为按 `kAttnHD` 分配 + V/P 窄 stride `kTcRS2`；selftest 加输出置零的 S=1024 case 并注册 ctest | `CORE_TECH.md` §5.11、`PITFALLS.md` §20、`BENCHMARKS.md` §2.9；1024 编码 366→248–254ms，rel_l2 1.44e-4；640 95→75ms |
+| 2026-09-21 P3 | TC attention occupancy：block 8 warp、mma n 维对半拆（`kTcSplit=2`），每调度器 2 warp 掩盖延迟；nsys 复核（GEMM 98ms 成最大头、TC attention 81ms、windowed f32 30ms） | `CORE_TECH.md` §5.11、`BENCHMARKS.md` §2.9；1024 编码 248→238–246ms，rel_l2 不变 |
+| 2026-09-21 P3 | CUDA/INT4 端到端 OCR 回归（2.11）：`compare_ocr --gpu/--int4`；CUDA/BF16 24/24、CUDA/INT4 与 CPU/INT4 一致但量化精度不足 | `ALIGNMENT.md` §5.2、`tAgent.md` 2.11 |
 
 > 每一步的实现/坑/数据分别沉淀在 `CORE_TECH.md` / `PITFALLS.md` / `BENCHMARKS.md`；
 > 当前性能与回归见 `tAgent.md` §1。

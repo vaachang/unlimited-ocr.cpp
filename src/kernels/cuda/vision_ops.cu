@@ -346,6 +346,16 @@ constexpr int kTcRS = kAttnHD + 8;
 // narrower (still 16B-aligned and conflict-free for ldmatrix) stride keeps the
 // whole kernel inside the 99KB opt-in limit even for 1024px (S=4096).
 constexpr int kTcRS2 = kTcBN + 8;
+// The block runs 8 warps, but shared memory (sRel) keeps it at 1 block/SM.  The
+// extra warps split the mma n-dimension in half (S keys and PV head dims), so
+// each warp does half the tensor-core work while a second warp per scheduler
+// hides the shared/ldmatrix latency.  wq = query-row group (4 x 16 rows),
+// wn = which n-half.
+constexpr int kTcMmaWarps = 4;
+constexpr int kTcSplit = 2;
+constexpr int kTcWarps = kTcMmaWarps * kTcSplit;
+constexpr int kTcNtS = (kTcBN / 8) / kTcSplit;            // S n-tiles per warp
+constexpr int kTcNtO = (kAttnHD / 8) / kTcSplit;          // PV n-tiles per warp
 
 __device__ __forceinline__ unsigned tc_smem_addr(const void* p) {
     return static_cast<unsigned>(__cvta_generic_to_shared(p));
@@ -364,6 +374,10 @@ __global__ void attention_flash_tc_kernel(const float* __restrict__ qkv,
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
+    const int wq = warp & (kTcMmaWarps - 1);  // query-row group (0..3)
+    const int wn = warp >> 2;                 // n-half (0..1)
+    const int ntS0 = wn * kTcNtS;
+    const int ntO0 = wn * kTcNtO;
     constexpr int RS = kTcRS;
     constexpr int RS2 = kTcRS2;
 
@@ -424,7 +438,7 @@ __global__ void attention_flash_tc_kernel(const float* __restrict__ qkv,
     }
 
     const float scale = 1.0f / sqrtf(static_cast<float>(kAttnHD));
-    float cO[8][4] = {};
+    float cO[kTcNtO][4] = {};
     const int g = lane >> 2;
     const int tig = lane & 3;
 
@@ -450,10 +464,10 @@ __global__ void attention_flash_tc_kernel(const float* __restrict__ qkv,
         }
         __syncthreads();
 
-        // ---- S = Q K^T via TC, each warp owns 16 query rows ----
-        float cS[8][4] = {};
+        // ---- S = Q K^T via TC; warp (wq, wn) owns 16 query rows x n-half keys ----
+        float cS[kTcNtS][4] = {};
         for (int kk = 0; kk < kAttnHD; kk += 16) {
-            const int arow = warp * 16 + (lane & 15);
+            const int arow = wq * 16 + (lane & 15);
             const __nv_bfloat16* ah = sQhi + arow * RS + kk + (lane >> 4) * 8;
             const __nv_bfloat16* al = sQlo + arow * RS + kk + (lane >> 4) * 8;
             unsigned ah0, ah1, ah2, ah3, al0, al1, al2, al3;
@@ -464,9 +478,10 @@ __global__ void attention_flash_tc_kernel(const float* __restrict__ qkv,
                          : "=r"(al0), "=r"(al1), "=r"(al2), "=r"(al3)
                          : "r"(tc_smem_addr(al)));
 #pragma unroll
-            for (int nt = 0; nt < kTcBN / 8; ++nt) {
-                const __nv_bfloat16* bh = sKhi + (nt * 8 + (lane & 7)) * RS + kk + ((lane >> 3) & 1) * 8;
-                const __nv_bfloat16* bl = sKlo + (nt * 8 + (lane & 7)) * RS + kk + ((lane >> 3) & 1) * 8;
+            for (int nt = 0; nt < kTcNtS; ++nt) {
+                const int ntg = ntS0 + nt;
+                const __nv_bfloat16* bh = sKhi + (ntg * 8 + (lane & 7)) * RS + kk + ((lane >> 3) & 1) * 8;
+                const __nv_bfloat16* bl = sKlo + (ntg * 8 + (lane & 7)) * RS + kk + ((lane >> 3) & 1) * 8;
                 unsigned bh0, bh1, bl0, bl1;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
                              : "=r"(bh0), "=r"(bh1)
@@ -492,9 +507,10 @@ __global__ void attention_flash_tc_kernel(const float* __restrict__ qkv,
             }
         }
         // ---- write scores (+relpos), masking padded keys ----
-        for (int nt = 0; nt < kTcBN / 8; ++nt) {
-            const int c0 = nt * 8 + tig * 2, c1 = c0 + 1;
-            const int r0 = warp * 16 + g, r1 = r0 + 8;
+        for (int nt = 0; nt < kTcNtS; ++nt) {
+            const int ntg = ntS0 + nt;
+            const int c0 = ntg * 8 + tig * 2, c1 = c0 + 1;
+            const int r0 = wq * 16 + g, r1 = r0 + 8;
             const int key0 = kt * kTcBN + c0, key1 = key0 + 1;
             if (r0 < kTcBM) {
                 if (key0 < S) {
@@ -549,17 +565,17 @@ __global__ void attention_flash_tc_kernel(const float* __restrict__ qkv,
         __syncthreads();
 
         // ---- rescale O by alpha (per fragment row) then O += P V via TC ----
-        const float a0 = sAlpha[warp * 16 + g];
-        const float a1 = sAlpha[warp * 16 + g + 8];
+        const float a0 = sAlpha[wq * 16 + g];
+        const float a1 = sAlpha[wq * 16 + g + 8];
 #pragma unroll
-        for (int nt = 0; nt < 8; ++nt) {
+        for (int nt = 0; nt < kTcNtO; ++nt) {
             cO[nt][0] *= a0;
             cO[nt][1] *= a0;
             cO[nt][2] *= a1;
             cO[nt][3] *= a1;
         }
         for (int kk = 0; kk < kTcBN; kk += 16) {
-            const int arow = warp * 16 + (lane & 15);
+            const int arow = wq * 16 + (lane & 15);
             const __nv_bfloat16* ah = sPhi + arow * RS2 + kk + (lane >> 4) * 8;
             const __nv_bfloat16* al = sPlo + arow * RS2 + kk + (lane >> 4) * 8;
             unsigned ah0, ah1, ah2, ah3, al0, al1, al2, al3;
@@ -570,9 +586,10 @@ __global__ void attention_flash_tc_kernel(const float* __restrict__ qkv,
                          : "=r"(al0), "=r"(al1), "=r"(al2), "=r"(al3)
                          : "r"(tc_smem_addr(al)));
 #pragma unroll
-            for (int nt = 0; nt < 8; ++nt) {
-                const __nv_bfloat16* bh = sVhi + (nt * 8 + (lane & 7)) * RS2 + kk + ((lane >> 3) & 1) * 8;
-                const __nv_bfloat16* bl = sVlo + (nt * 8 + (lane & 7)) * RS2 + kk + ((lane >> 3) & 1) * 8;
+            for (int nt = 0; nt < kTcNtO; ++nt) {
+                const int ntg = ntO0 + nt;
+                const __nv_bfloat16* bh = sVhi + (ntg * 8 + (lane & 7)) * RS2 + kk + ((lane >> 3) & 1) * 8;
+                const __nv_bfloat16* bl = sVlo + (ntg * 8 + (lane & 7)) * RS2 + kk + ((lane >> 3) & 1) * 8;
                 unsigned bh0, bh1, bl0, bl1;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
                              : "=r"(bh0), "=r"(bh1)
@@ -603,9 +620,10 @@ __global__ void attention_flash_tc_kernel(const float* __restrict__ qkv,
     (void)H;
     (void)W;
 #pragma unroll
-    for (int nt = 0; nt < 8; ++nt) {
-        const int c0 = nt * 8 + tig * 2, c1 = c0 + 1;
-        const int r0 = warp * 16 + g, r1 = r0 + 8;
+    for (int nt = 0; nt < kTcNtO; ++nt) {
+        const int ntg = ntO0 + nt;
+        const int c0 = ntg * 8 + tig * 2, c1 = c0 + 1;
+        const int r0 = wq * 16 + g, r1 = r0 + 8;
         if (r0 < kTcBM && m0 + r0 < S) {
             const float inv = sL[r0] > 0.0f ? 1.0f / sL[r0] : 0.0f;
             float* op = out + (static_cast<std::size_t>(b) * S + m0 + r0) * C + h * kAttnHD;
@@ -726,7 +744,7 @@ void attention_flash(const float* qkv, const float* relh, const float* relw, flo
             cudaFuncSetAttribute(attention_flash_tc_kernel<true>,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  static_cast<int>(bytes));
-            const dim3 tb(128);
+            const dim3 tb(kTcWarps * 32);
             const dim3 tg(B * heads, (S + kTcBM - 1) / kTcBM);
             attention_flash_tc_kernel<true><<<tg, tb, bytes, stream>>>(qkv, relh, relw, out, S, H,
                                                                        W, heads);

@@ -349,7 +349,11 @@ H2D 录制进图。改为：
 global attention（S≥512）准备的 tensor-core 版本，`attention_flash` 在
 `relpos && S>=512` 且 tile shared 放得下时启用，否则回退 f32 kernel。
 
-- **设计**：Block = 128 线程（4 warp）× 64 query，per-head；tile `BM=64/BN=32`。
+- **设计**：Block = **256 线程（8 warp）** × 64 query，per-head；tile `BM=64/BN=32`。
+  8 个 warp 把 **mma 的 n 维对半拆**（`kTcSplit=2`）：`wq=warp&3` 选 16 个 query 行，
+  `wn=warp>>2` 选 n 的一半（S 的 2/4 个 n-tile、PV 的 4/8 个 n-tile），每个 warp 的
+  tensor-core 工作量减半；因为 shared 不变仍是 1 block/SM，这样每个调度器有 2 个
+  warp 来掩盖 `ldmatrix`/shared 延迟（1024 全局 attention 4 个块合计 **81 ms**）。
   - Q 常驻 shared（`sQhi/sQlo`，split-bf16，stride `RS=HD+8=72`）；每个 k-tile
     stage K（`[key][hd]`、split、stride RS）与 V（**转置** `[hd][key]`、split）——
     转置是因为 PV 的 B 操作数是 `V^T`（mma `row.col` 要求 B 为 `[n][k]` 行主序）。
@@ -371,11 +375,13 @@ global attention（S≥512）准备的 tensor-core 版本，`attention_flash` �
   不存在**（它不转置 V）。
 - **验收**（`compare_vision_gpu --selftest` 新增 `H=W=32/S=1024`、输出**置零**的
   TC case）rel_l2 **9e-6**；真实模型 `--size 1024` visual rel_l2 **1.44e-4**
-  （sam 4.6e-5 / clip 1.77e-4），编码 **366 → 248–254 ms**。见 `BENCHMARKS.md`
+  （sam 4.6e-5 / clip 1.77e-4），编码 **366 → 238–240 ms**。见 `BENCHMARKS.md`
   §2.9。
-- **剩余（非阻塞）**：每个 block ~90 KB shared → **1 block/SM**，占用率低；`sRel`
-  （1024 时 32 KB）是最大项，进一步提速需缩减/pipeline 该表或减小 tile。整栈
-  CUDA Graph 捕获与非方形尺寸支持仍未做。
+- **剩余（非阻塞）**：每个 block ~90 KB shared → **1 block/SM**；8-warp n-split 已
+  改善延迟掩盖，但 nsys 显示当前最大头已是 **`matmul_t_split_bf16`（98 ms）**，
+  全局 attention 81 ms、windowed f32 attention 30 ms。进一步提速需缩减 `sRel`
+  （32 KB，最大项）/改 register-resident flash attention，或优化视觉 GEMM
+  （cp.async）。整栈 CUDA Graph 捕获与非方形尺寸支持仍未做。
 
 
 ## 6. 与 `prj.md` 三大创新点的对应

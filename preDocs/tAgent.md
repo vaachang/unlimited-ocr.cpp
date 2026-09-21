@@ -36,7 +36,7 @@
   | 整波 prefill（16 请求） | **~165 ms** BF16 / **120 ms** INT4 |
   | batch=1 吞吐 | 155.8 BF16 / 138.2 INT4 tok/s |
   | lm_head m=16（n=129280） | **1174 µs**（原 2652，2.3×） |
-  | 单图视觉编码（1024, GPU） | **248–254 ms**（CPU 参考 ~2 min；rel_l2 1.44e-4；TC attention 后） |
+  | 单图视觉编码（1024, GPU） | **238–246 ms**（CPU 参考 ~2 min；rel_l2 1.44e-4；TC attention + 8-warp n-split） |
 
 - 性能数据明细见 `BENCHMARKS.md` §2.5–2.10；历史进度见 `PROGRESS.md` §4。
 
@@ -166,11 +166,16 @@ ctest --test-dir build-cuda --output-on-failure
     `kTcRS2=kTcBN+8`，launcher 重算（1024 时 89856 B < 101376 上限）。详见
     `CORE_TECH.md` §5.11、`PITFALLS.md` §20。
   - **验收**：`compare_vision_gpu --selftest` 新增 `H=W=32/S=1024`、**输出置零**的
-    TC case，rel_l2 **9e-6**，已注册 ctest；真实模型 1024 编码 **248–254 ms**
-    （原 366）、visual rel_l2 **1.44e-4**（原 8.2e-5，仍 ≪6e-4）。640 95→75 ms、
-    224 18 ms。
-  - **剩余（非阻塞）**：每个 block ~90 KB shared → 1 block/SM，occupancy 低；
-    `sRel`（1024 时 32 KB）是最大项。整栈 CUDA Graph 捕获、非方形尺寸支持未做。
+    TC case，rel_l2 **9e-6**，已注册 ctest；真实模型 1024 编码 **238–246 ms**
+    （原 366）、visual rel_l2 **1.44e-4**（原 8.2e-5，仍 ≪6e-4）。640 75 ms、
+    224 20 ms。
+  - **已做（occupancy）**：block 改 8 warp，把 mma 的 n 维对半拆（`kTcSplit=2`），
+    每 warp tensor-core 工作量减半、每调度器 2 warp 掩盖延迟；1024 全局 attention
+    4 块合计 81 ms。nsys 显示当前最大头已是 **`matmul_t_split_bf16` 98 ms**（视觉
+    GEMM），windowed f32 attention 30 ms。
+  - **剩余（非阻塞）**：仍 1 block/SM（`sRel` 32 KB）；进一步需 register-resident
+    flash attention / 缩减 sRel / 优化视觉 GEMM（cp.async）。整栈 CUDA Graph 捕获、
+    非方形尺寸支持未做。
 - **环境约束（重要）**：sm_120 的 `cudaDevAttrMaxSharedMemoryPerBlockOptin` 只有
   **101376 B（~99 KB）**、每 SM shared 102400 B；tile shared 超过上限时自动回退
   f32 kernel（正确性不变）。
@@ -247,15 +252,16 @@ ctest --test-dir build-cuda --output-on-failure
 | P3 device embedding | bf16/f32 表设备常驻 + `embed_gather`；单请求 Graph 内 gather、batch 只传 token id | 每步无隐含 H2D；greedy 不变；显存 +331MB |
 | P3 权重加载 | INT4 专家量化改为 OpenMP 并行（`weights.cpp` 专家循环） | 真实模型加载墙钟 **20.5 → 7.4s**；显存不变 |
 | P3 视觉编码器 | split-bf16 TC GEMM（激活 hi/lo）+ SAM attention relpos 因式分解 | 1024 编码 **612→366ms**、640 153→95ms；rel_l2 8.2e-5（未达 150–250 目标） |
-| P3 视觉编码器（TC attn） | tensor-core flash attention（Q/K/P/V hi/lo 拆分；`attention_flash_tc_kernel`）；修 V^T 面板越界 + V/P 窄 stride | 1024 **366→248–254ms**（rel_l2 1.44e-4）；640 95→75ms |
+| P3 视觉编码器（TC attn） | tensor-core flash attention（Q/K/P/V hi/lo 拆分；`attention_flash_tc_kernel`）；修 V^T 面板越界 + V/P 窄 stride；8-warp n-split | 1024 **366→238–246ms**（rel_l2 1.44e-4）；640 75ms |
 
 ---
 
 ## 5. 已知遗留 / 技术债
 
-- **视觉编码器已进入 150–250ms 目标区间**（1024：248–254ms）。进一步提速受限于
-  TC attention 每 block ~90 KB shared → 1 block/SM（`sRel` 表 32 KB 是最大项）；
-  非方形尺寸支持与整栈 CUDA Graph 未做。见任务 2.10。
+- **视觉编码器已进入 150–250ms 目标区间**（1024：238–246ms）。nsys 显示最大头
+  已是视觉 GEMM（`matmul_t_split_bf16` 98ms），其次全局 TC attention 81ms、
+  windowed f32 attention 30ms；TC attention 受 ~90KB shared → 1 block/SM（`sRel`
+  表 32KB）限制。非方形尺寸支持与整栈 CUDA Graph 未做。见任务 2.10。
 - 单请求 `GpuDecoder::prefill_tokens` 仍在 host 查 embedding（每请求一次，非每步）；
   position 仍是 4B pinned H2D（本就是 int，未做成表）。
 - BF16 专家的 ragged 大批量 prefill 仍是 host top-k + 逐专家 GEMM（grouped 只做了
