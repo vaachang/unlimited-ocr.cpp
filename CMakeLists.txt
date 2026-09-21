@@ -174,29 +174,55 @@ endif()
 # weights; they are skipped unless ENGINE_REFERENCE_DIR is provided.
 if(ENGINE_BUILD_TOOLS AND ENGINE_REFERENCE_DIR AND ENGINE_BUILD_TESTS)
     set(_ref ${ENGINE_REFERENCE_DIR})
-    add_test(NAME compare_reference
-             COMMAND compare_reference --model ${CMAKE_SOURCE_DIR}/models --ref ${_ref}/ref_decoder)
-    add_test(NAME compare_tokenizer
-             COMMAND compare_tokenizer --model ${CMAKE_SOURCE_DIR}/models
-                     --ref ${_ref}/ref_tokenizer/tokenizer_cases.json)
-    add_test(NAME compare_layout
-             COMMAND compare_layout --model ${CMAKE_SOURCE_DIR}/models
-                     --ref ${_ref}/ref_layout/layout_cases.json)
-    add_test(NAME compare_image
-             COMMAND compare_image --ref ${_ref}/ref_image)
-    add_test(NAME compare_vision
-             COMMAND compare_vision --model ${CMAKE_SOURCE_DIR}/models --ref ${_ref}/ref_vision)
-    set_tests_properties(compare_vision PROPERTIES ENVIRONMENT "OMP_NUM_THREADS=8")
-    add_test(NAME compare_ocr
-             COMMAND compare_ocr --model ${CMAKE_SOURCE_DIR}/models --ref ${_ref}/ref_ocr --strict)
-    set_tests_properties(compare_ocr PROPERTIES ENVIRONMENT "OMP_NUM_THREADS=8")
+    set(_ref_tests)
+    # Only register the tests whose reference tensors are actually present, so a
+    # partial export (e.g. only ref_ocr + ref_ocr_large) is still usable.
+    if(EXISTS ${_ref}/ref_decoder)
+        add_test(NAME compare_reference
+                 COMMAND compare_reference --model ${CMAKE_SOURCE_DIR}/models --ref ${_ref}/ref_decoder)
+        list(APPEND _ref_tests compare_reference)
+    endif()
+    if(EXISTS ${_ref}/ref_tokenizer/tokenizer_cases.json)
+        add_test(NAME compare_tokenizer
+                 COMMAND compare_tokenizer --model ${CMAKE_SOURCE_DIR}/models
+                         --ref ${_ref}/ref_tokenizer/tokenizer_cases.json)
+        list(APPEND _ref_tests compare_tokenizer)
+    endif()
+    if(EXISTS ${_ref}/ref_layout/layout_cases.json)
+        add_test(NAME compare_layout
+                 COMMAND compare_layout --model ${CMAKE_SOURCE_DIR}/models
+                         --ref ${_ref}/ref_layout/layout_cases.json)
+        list(APPEND _ref_tests compare_layout)
+    endif()
+    if(EXISTS ${_ref}/ref_image)
+        add_test(NAME compare_image
+                 COMMAND compare_image --ref ${_ref}/ref_image)
+        list(APPEND _ref_tests compare_image)
+    endif()
+    if(EXISTS ${_ref}/ref_vision)
+        add_test(NAME compare_vision
+                 COMMAND compare_vision --model ${CMAKE_SOURCE_DIR}/models --ref ${_ref}/ref_vision)
+        set_tests_properties(compare_vision PROPERTIES ENVIRONMENT "OMP_NUM_THREADS=8")
+        list(APPEND _ref_tests compare_vision)
+    endif()
+    if(EXISTS ${_ref}/ref_ocr)
+        add_test(NAME compare_ocr
+                 COMMAND compare_ocr --model ${CMAKE_SOURCE_DIR}/models --ref ${_ref}/ref_ocr --strict)
+        set_tests_properties(compare_ocr PROPERTIES ENVIRONMENT "OMP_NUM_THREADS=8")
+        list(APPEND _ref_tests compare_ocr)
+    endif()
     # Multi-crop path (>640px input, Gundam dynamic_preprocess grid).  Guards the
     # layout / visual-assembly / interpolation code against silent regressions.
-    add_test(NAME compare_ocr_large
-             COMMAND compare_ocr --model ${CMAKE_SOURCE_DIR}/models --ref ${_ref}/ref_ocr_large --strict)
-    set_tests_properties(compare_ocr_large PROPERTIES ENVIRONMENT "OMP_NUM_THREADS=8")
-    set_tests_properties(compare_reference compare_tokenizer compare_layout compare_image
-                         compare_vision compare_ocr compare_ocr_large PROPERTIES LABELS reference)
+    if(EXISTS ${_ref}/ref_ocr_large)
+        add_test(NAME compare_ocr_large
+                 COMMAND compare_ocr --model ${CMAKE_SOURCE_DIR}/models --ref ${_ref}/ref_ocr_large --strict)
+        set_tests_properties(compare_ocr_large PROPERTIES ENVIRONMENT "OMP_NUM_THREADS=8")
+        list(APPEND _ref_tests compare_ocr_large)
+    endif()
+    if(_ref_tests)
+        set_tests_properties(${_ref_tests} PROPERTIES LABELS reference)
+    endif()
+    message(STATUS "reference alignment tests: ${_ref_tests}")
 endif()
 
 message(STATUS "-------------------------------------------------------------")
