@@ -343,16 +343,16 @@ H2D 录制进图。改为：
   （BF16/INT4 ~520/518 tok/s），显存 +331MB（bf16 表）。剩余：单请求 prefill 仍
   host 查表（每请求一次）。
 
-### 5.11 tensor-core flash attention（WIP，未调通）
+### 5.11 tensor-core flash attention（P3 收尾，2026-09-21 调通）
 
 `attention_flash_tc_kernel<RELPOS>`（`src/kernels/cuda/vision_ops.cu`）是给 SAM
-global attention 准备的 tensor-core 版本，**目前数值错误，dispatch 由
-`kEnableTcAttention=false` 关闭**，正式路径仍走 f32 kernel。
+global attention（S≥512）准备的 tensor-core 版本，`attention_flash` 在
+`relpos && S>=512` 且 tile shared 放得下时启用，否则回退 f32 kernel。
 
-- **设计**：Block = 128 线程（4 warp）× 64 query，per-head；tile `BM=64/BN=32/RS=72`。
-  - Q 常驻 shared（`sQhi/sQlo`，split-bf16）；每个 k-tile stage K（`[key][hd]`、
-    split）与 V（**转置** `[hd][key]`、split）——转置是因为 PV 的 B 操作数是
-    `V^T`（mma `row.col` 要求 B 为 `[n][k]` 行主序）。
+- **设计**：Block = 128 线程（4 warp）× 64 query，per-head；tile `BM=64/BN=32`。
+  - Q 常驻 shared（`sQhi/sQlo`，split-bf16，stride `RS=HD+8=72`）；每个 k-tile
+    stage K（`[key][hd]`、split、stride RS）与 V（**转置** `[hd][key]`、split）——
+    转置是因为 PV 的 B 操作数是 `V^T`（mma `row.col` 要求 B 为 `[n][k]` 行主序）。
   - `S = Q·K^T`：3 次 mma/面板（`QhiKhi + QhiKlo + QloKhi`），写出到 f32 shared
     `sS[64][32]`，同时按 `sRel` 查表加 relpos、把越界 key 置 `-inf`。
   - online softmax 用 64 个线程（一线程一行）在 `sS` 上算 max/exp，`P` 以 split-bf16
@@ -360,14 +360,23 @@ global attention 准备的 tensor-core 版本，**目前数值错误，dispatch 
   - `O = O*alpha + P·V`：先按 `sAlpha` 缩放寄存器里的 `cO` fragment，再 3 次 mma
     （`PhiVhi + PhiVlo + PloVhi`）。`sRel` 是每 query 的 `[H+W]` relpos 查找表，
     在 block 起始算一次。
-- **共享内存**：~97 KB（`4*BM + 4*BN` 行 × 72 bf16 + `sS` + `sRel` + m/l/alpha）。
-- **现状**：编译/启动正常；1024 编码 ~250 ms（比 f32 的 366 ms 快），但 visual
-  rel_l2 ≈ 1.12（目标 6e-4）。selftest 的 windowed case（`S=196`）从未走到 TC
-  （阈值 `S>=512`），且其输出 buffer 用参考预填充，TC launch 失败时会假阳性通过——
-  调试时必须改成**输出置零 + `H=W=64`** 的定向测试。
-- **调试建议**：分段隔离——只验证 QK^T（PV 用参考 P·V）、softmax（`sS`/`sL`）、
-  PV（`V^T` staging 与 `sAlpha` 行缩放）；重点怀疑 `V^T` 的 fragment 布局与
-  online-softmax 的 rescale/`sL` 更新顺序。
+- **共享内存**：V/P 只有 `kTcBN` 列，用更窄的 stride `kTcRS2 = kTcBN+8 = 40`
+  （仍 16B 对齐、ldmatrix 无 bank conflict）；bf16 面板共 `(2*BM + 2*BN)*RS +
+  (2*HD + 2*BM)*RS2`。1024px（S=4096, H=W=64）时合计 **89856 B** < sm_120 的
+  101376 B opt-in；更大的 S 自动回退 f32。
+- **踩的坑（已修，详见 `PITFALLS.md` §20）**：`sVhi/sVlo` 是 `[HD][BN]` 的转置矩阵，
+  却按 `kTcBN*RS`（32 行）分配/寻址，`d≥32` 的行越界写进 `sVlo`/`sPhi`，导致 V
+  被破坏、输出 rel_l2≈1.1；同时 launcher 的 shared 字节数也少算了 V 的另外
+  `(HD-BN)` 行。修复为按 `kAttnHD*RS2` 分配并改用 RS2。**这类错误在 f32 kernel 里
+  不存在**（它不转置 V）。
+- **验收**（`compare_vision_gpu --selftest` 新增 `H=W=32/S=1024`、输出**置零**的
+  TC case）rel_l2 **9e-6**；真实模型 `--size 1024` visual rel_l2 **1.44e-4**
+  （sam 4.6e-5 / clip 1.77e-4），编码 **366 → 248–254 ms**。见 `BENCHMARKS.md`
+  §2.9。
+- **剩余（非阻塞）**：每个 block ~90 KB shared → **1 block/SM**，占用率低；`sRel`
+  （1024 时 32 KB）是最大项，进一步提速需缩减/pipeline 该表或减小 tile。整栈
+  CUDA Graph 捕获与非方形尺寸支持仍未做。
+
 
 ## 6. 与 `prj.md` 三大创新点的对应
 

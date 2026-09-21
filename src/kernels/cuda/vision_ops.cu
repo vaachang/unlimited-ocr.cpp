@@ -342,6 +342,10 @@ __global__ void attention_flash_kernel(const float* __restrict__ qkv,
 constexpr int kTcBM = 64;   // queries per block
 constexpr int kTcBN = 32;   // keys per tile (shared budget: sm_120 opt-in is 99KB)
 constexpr int kTcRS = kAttnHD + 8;
+// V^T is [head_dim][key] and P is [query][key]; both have kTcBN columns, so a
+// narrower (still 16B-aligned and conflict-free for ldmatrix) stride keeps the
+// whole kernel inside the 99KB opt-in limit even for 1024px (S=4096).
+constexpr int kTcRS2 = kTcBN + 8;
 
 __device__ __forceinline__ unsigned tc_smem_addr(const void* p) {
     return static_cast<unsigned>(__cvta_generic_to_shared(p));
@@ -361,6 +365,7 @@ __global__ void attention_flash_tc_kernel(const float* __restrict__ qkv,
     const int lane = tid & 31;
     const int warp = tid >> 5;
     constexpr int RS = kTcRS;
+    constexpr int RS2 = kTcRS2;
 
     extern __shared__ __nv_bfloat16 smem_bf[];
     __nv_bfloat16* sQhi = smem_bf;
@@ -368,10 +373,10 @@ __global__ void attention_flash_tc_kernel(const float* __restrict__ qkv,
     __nv_bfloat16* sKhi = sQlo + kTcBM * RS;
     __nv_bfloat16* sKlo = sKhi + kTcBN * RS;
     __nv_bfloat16* sVhi = sKlo + kTcBN * RS;
-    __nv_bfloat16* sVlo = sVhi + kTcBN * RS;
-    __nv_bfloat16* sPhi = sVlo + kTcBN * RS;
-    __nv_bfloat16* sPlo = sPhi + kTcBM * RS;
-    float* sS = reinterpret_cast<float*>(sPlo + kTcBM * RS);
+    __nv_bfloat16* sVlo = sVhi + kAttnHD * RS2;
+    __nv_bfloat16* sPhi = sVlo + kAttnHD * RS2;
+    __nv_bfloat16* sPlo = sPhi + kTcBM * RS2;
+    float* sS = reinterpret_cast<float*>(sPlo + kTcBM * RS2);
     float* sRel = sS + kTcBM * kTcBN;
     float* sM = sRel + (RELPOS ? kTcBM * (H + W) : 0);
     float* sL = sM + kTcBM;
@@ -440,8 +445,8 @@ __global__ void attention_flash_tc_kernel(const float* __restrict__ qkv,
             sKhi[j * RS + d] = kh;
             sKlo[j * RS + d] = __float2bfloat16(kv - __bfloat162float(kh));
             const __nv_bfloat16 vh = __float2bfloat16(vv);
-            sVhi[d * RS + j] = vh;
-            sVlo[d * RS + j] = __float2bfloat16(vv - __bfloat162float(vh));
+            sVhi[d * RS2 + j] = vh;
+            sVlo[d * RS2 + j] = __float2bfloat16(vv - __bfloat162float(vh));
         }
         __syncthreads();
 
@@ -530,12 +535,12 @@ __global__ void attention_flash_tc_kernel(const float* __restrict__ qkv,
                 const float p = __expf(sS[r * kTcBN + j] - mnew);
                 sum += p;
                 const __nv_bfloat16 ph = __float2bfloat16(p);
-                sPhi[r * RS + j] = ph;
-                sPlo[r * RS + j] = __float2bfloat16(p - __bfloat162float(ph));
+                sPhi[r * RS2 + j] = ph;
+                sPlo[r * RS2 + j] = __float2bfloat16(p - __bfloat162float(ph));
             }
             for (int j = jmax; j < kTcBN; ++j) {
-                sPhi[r * RS + j] = __float2bfloat16(0.0f);
-                sPlo[r * RS + j] = __float2bfloat16(0.0f);
+                sPhi[r * RS2 + j] = __float2bfloat16(0.0f);
+                sPlo[r * RS2 + j] = __float2bfloat16(0.0f);
             }
             sL[r] = sL[r] * alpha + sum;
             sM[r] = mnew;
@@ -555,8 +560,8 @@ __global__ void attention_flash_tc_kernel(const float* __restrict__ qkv,
         }
         for (int kk = 0; kk < kTcBN; kk += 16) {
             const int arow = warp * 16 + (lane & 15);
-            const __nv_bfloat16* ah = sPhi + arow * RS + kk + (lane >> 4) * 8;
-            const __nv_bfloat16* al = sPlo + arow * RS + kk + (lane >> 4) * 8;
+            const __nv_bfloat16* ah = sPhi + arow * RS2 + kk + (lane >> 4) * 8;
+            const __nv_bfloat16* al = sPlo + arow * RS2 + kk + (lane >> 4) * 8;
             unsigned ah0, ah1, ah2, ah3, al0, al1, al2, al3;
             asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                          : "=r"(ah0), "=r"(ah1), "=r"(ah2), "=r"(ah3)
@@ -566,8 +571,8 @@ __global__ void attention_flash_tc_kernel(const float* __restrict__ qkv,
                          : "r"(tc_smem_addr(al)));
 #pragma unroll
             for (int nt = 0; nt < 8; ++nt) {
-                const __nv_bfloat16* bh = sVhi + (nt * 8 + (lane & 7)) * RS + kk + ((lane >> 3) & 1) * 8;
-                const __nv_bfloat16* bl = sVlo + (nt * 8 + (lane & 7)) * RS + kk + ((lane >> 3) & 1) * 8;
+                const __nv_bfloat16* bh = sVhi + (nt * 8 + (lane & 7)) * RS2 + kk + ((lane >> 3) & 1) * 8;
+                const __nv_bfloat16* bl = sVlo + (nt * 8 + (lane & 7)) * RS2 + kk + ((lane >> 3) & 1) * 8;
                 unsigned bh0, bh1, bl0, bl1;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
                              : "=r"(bh0), "=r"(bh1)
@@ -696,15 +701,16 @@ void window_unpartition(const float* win, float* x, int H, int W, int C, int ws,
 void attention_flash(const float* qkv, const float* relh, const float* relw, float* out, int B,
                      int S, int H, int W, int heads, bool relpos, cudaStream_t stream) {
     if (B <= 0 || S <= 0 || heads <= 0) return;
-    // WIP: `attention_flash_tc_kernel` (tensor-core, split-bf16) compiles and is
-    // fast (~250 ms for a 1024px image) but is **not yet numerically correct**
-    // (visual rel_l2 ~1.1 vs the 6e-4 budget), so the dispatch below is disabled
-    // and the f32 kernel is used for every call.  See `tAgent.md` 2.10 and
-    // `PITFALLS.md` for the design and the open debugging questions.
-    constexpr bool kEnableTcAttention = false;
+    // SAM global attention (relpos, S>=512) runs on the tensor-core split-bf16
+    // kernel.  It needs a tile of dynamic shared memory; if that exceeds the
+    // device opt-in limit (or the attention is windowed/CLIP), fall back to the
+    // f32 CUDA-core kernel below.  See `CORE_TECH.md` 5.11 / `PITFALLS.md` 20.
+    constexpr bool kEnableTcAttention = true;
     if (kEnableTcAttention && relpos && S >= 512) {
         const std::size_t bytes =
-            (static_cast<std::size_t>(4) * kTcBM + 4 * kTcBN) * kTcRS * sizeof(std::uint16_t) +
+            (static_cast<std::size_t>(2) * kTcBM + 2 * kTcBN) * kTcRS * sizeof(std::uint16_t) +
+            (static_cast<std::size_t>(2) * kAttnHD + 2 * kTcBM) * kTcRS2 *
+                sizeof(std::uint16_t) +
             static_cast<std::size_t>(kTcBM) * kTcBN * sizeof(float) +
             static_cast<std::size_t>(3) * kTcBM * sizeof(float) +
             static_cast<std::size_t>(kTcBM) * (H + W) * sizeof(float);

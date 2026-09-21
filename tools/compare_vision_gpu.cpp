@@ -22,12 +22,12 @@ using namespace uocr;
 
 namespace {
 
-void report(const char* name, const std::vector<float>& ours, const std::vector<float>& ref,
-            std::size_t begin = 0) {
+double report(const char* name, const std::vector<float>& ours, const std::vector<float>& ref,
+              std::size_t begin = 0) {
     if (ours.size() + begin != ref.size()) {
         std::printf("%-20s SIZE MISMATCH ours=%zu ref=%zu begin=%zu\n", name, ours.size(),
                     ref.size(), begin);
-        return;
+        return 1e30;
     }
     double num = 0, den = 0, maxabs = 0;
     for (std::size_t i = 0; i < ours.size(); ++i) {
@@ -36,7 +36,9 @@ void report(const char* name, const std::vector<float>& ours, const std::vector<
         den += static_cast<double>(ref[begin + i]) * ref[begin + i];
         maxabs = std::max(maxabs, std::fabs(e));
     }
-    std::printf("%-20s max_abs=%.5f rel_l2=%.6f\n", name, maxabs, std::sqrt(num / (den + 1e-30)));
+    const double rel = std::sqrt(num / (den + 1e-30));
+    std::printf("%-20s max_abs=%.5f rel_l2=%.6f\n", name, maxabs, rel);
+    return rel;
 }
 
 float* dev_up(const std::vector<float>& v) {
@@ -252,6 +254,8 @@ void check_block0(const VisionWeights& vw, const std::vector<DeepEncoder::Stage>
 int selftest() {
     std::mt19937 rng(99);
     std::normal_distribution<float> dist(0.0f, 1.0f);
+    bool ok = true;
+    const double kTol = 1e-4;  // synthetic checks must be tight
     // --- plain attention (CLIP-like: S=257, heads=16, relpos=false) ---
     {
         const int S = 257, heads = 16, hd = 64, C = heads * hd;
@@ -287,7 +291,7 @@ int selftest() {
         cuda::attention_flash(d_qkv, nullptr, nullptr, d_ref, 1, S, 1, 1, heads, false);
         std::vector<float> got(ref.size());
         dev_down(d_ref, got);
-        report("selftest attn full", got, ref);
+        ok = ok && report("selftest attn full", got, ref) < kTol;
         cudaFree(d_qkv);
         cudaFree(d_ref);
     }
@@ -314,13 +318,13 @@ int selftest() {
         cuda::layernorm_rows(dx, dw, db, dy, R, C, 1e-6f);
         std::vector<float> got(R * C);
         dev_down(dy, got);
-        report("selftest layernorm", got, ref);
+        ok = ok && report("selftest layernorm", got, ref) < kTol;
         cudaFree(dx);
         cudaFree(dw);
         cudaFree(db);
         cudaFree(dy);
     }
-    // --- attention ---
+    // --- attention (windowed, small S: exercises the f32 path) ---
     {
         const int H = 14, W = 14, heads = 12, hd = 64, S = H * W, B = 9;
         const int C = heads * hd;
@@ -332,17 +336,50 @@ int selftest() {
         for (auto& v : relw) v = dist(rng);
         std::vector<float> ref = cpu_sam_attention(qkv, relh, relw, B, H, W, heads);
         float *d_qkv = dev_up(qkv), *d_rh = dev_up(relh), *d_rw = dev_up(relw);
-        float* d_out = dev_up(ref);
+        // Zero the output buffer so a failed/partial kernel cannot masquerade
+        // as a pass by leaving the reference values in place (PITFALLS 20).
+        float* d_out = nullptr;
+        cudaMalloc(&d_out, ref.size() * sizeof(float));
+        cudaMemset(d_out, 0, ref.size() * sizeof(float));
         cuda::attention_flash(d_qkv, d_rh, d_rw, d_out, B, S, H, W, heads, true);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) std::printf("selftest attention launch: %s\n", cudaGetErrorString(err));
         std::vector<float> got(ref.size());
         dev_down(d_out, got);
-        report("selftest attention", got, ref);
+        ok = ok && report("selftest attention", got, ref) < kTol;
         cudaFree(d_qkv);
         cudaFree(d_rh);
         cudaFree(d_rw);
         cudaFree(d_out);
     }
-    return 0;
+    // --- attention (large S: exercises the tensor-core path) ---
+    {
+        const int H = 32, W = 32, heads = 12, hd = 64, S = H * W, B = 1;
+        const int C = heads * hd;
+        std::vector<float> qkv(static_cast<std::size_t>(B) * S * 3 * C);
+        for (auto& v : qkv) v = dist(rng);
+        std::vector<float> relh(static_cast<std::size_t>(2 * H - 1) * hd);
+        std::vector<float> relw(static_cast<std::size_t>(2 * W - 1) * hd);
+        for (auto& v : relh) v = dist(rng);
+        for (auto& v : relw) v = dist(rng);
+        std::vector<float> ref = cpu_sam_attention(qkv, relh, relw, B, H, W, heads);
+        float *d_qkv = dev_up(qkv), *d_rh = dev_up(relh), *d_rw = dev_up(relw);
+        float* d_out = nullptr;
+        cudaMalloc(&d_out, ref.size() * sizeof(float));
+        cudaMemset(d_out, 0, ref.size() * sizeof(float));
+        cuda::attention_flash(d_qkv, d_rh, d_rw, d_out, B, S, H, W, heads, true);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+            std::printf("selftest attention-tc launch: %s\n", cudaGetErrorString(err));
+        std::vector<float> got(ref.size());
+        dev_down(d_out, got);
+        ok = ok && report("selftest attention-tc", got, ref) < kTol;
+        cudaFree(d_qkv);
+        cudaFree(d_rh);
+        cudaFree(d_rw);
+        cudaFree(d_out);
+    }
+    return ok ? 0 : 1;
 }
 
 }  // namespace

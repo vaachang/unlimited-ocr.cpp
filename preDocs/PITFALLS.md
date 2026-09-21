@@ -339,5 +339,20 @@ position_ids = arange(past_key_values_length, seq_length + past_key_values_lengt
    如果 kernel launch 失败，`d_out` 原封不动等于 `ref`，`report` 打出 rel_l2=0，
    误以为正确。定向验证新 kernel 时**必须把输出缓冲置零**（或填 NaN），并检查
    launch 错误。另外原来的 attention selftest 是 `H=W=14, S=196`，根本走不到
-   “大 S 才启用”的 TC 分支——要专门加 `H=W=64, S=4096` 的 case。
+   “大 S 才启用”的 TC 分支——要专门加 `H=W=32, S=1024` 的 case（现已加入并注册为
+   ctest `compare_vision_gpu_selftest`）。
+3. **转置的 V^T 面板按错误的行数分配（2026-09-21，TC attention 数值错误的真凶）**：
+   `attention_flash_tc_kernel` 里 `sVhi/sVlo` 是 `[head_dim][key]`，head_dim=64，
+   却写成 `sVhi = sKlo + kTcBN * RS; sVlo = sVhi + kTcBN * RS;`（只按 32 行算），
+   staging 又按 `sVhi[d * RS + j]`（d 取到 63）寻址 → `d≥32` 的行越界写进 `sVlo`
+   与 `sPhi`，把 V（以及随后被 softmax 覆盖的 P）踩坏。launcher 的 shared 字节数
+   `(4*kTcBM + 4*kTcBN)*kTcRS` 同样少算了 `(HD-BN)` 行。表现是 **PV 结果错、
+   但 QK^T/sS/softmax-L 全对**（V 不参与 S），且结果**跨进程/跨 launch 不稳定**
+   （越界写的最终内容取决于线程调度）——「同一二进制不同运行结果不同」是这类
+   shared 越界的典型信号。修法：V 面板按 `kAttnHD` 行分配，且为控制 1024px 的
+   shared 占用，V/P 改用更窄的 stride `kTcRS2 = kTcBN + 8`（16B 对齐、无 bank
+   conflict），launcher 字节按新尺寸重算。教训：**任何 `ldmatrix` 读取的 shared
+   面板，其分配行数/stride 必须和转置后的逻辑形状一致**；先用「输出置零 + 与 CPU
+   全量对比 sS/P/O」分段定位，比盲猜 mma fragment 布局快得多（本次 QK^T、PV 在
+   隔离测试里都正确，问题只在共享内存布局）。
 

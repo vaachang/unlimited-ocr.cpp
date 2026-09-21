@@ -242,26 +242,29 @@ CUDA Graph 确实把逐步发射压到常数级。
 `tools/compare_vision_gpu` 在真实视觉权重上对比 GPU 编码器与 CPU 参考编码器
 （CPU 编码器已对齐 PyTorch f32 参考，见 `ALIGNMENT.md` §4），随机归一化图像：
 
-| size | GPU 编码（P3 收尾后） | 原 f32 GEMM | CPU 编码 | visual rel_l2 | clip rel_l2 | sam rel_l2 |
-|---|---|---|---|---|---|---|
-| 224 | **18 ms** | 34 ms | — | 3.9e-5 | — | — |
-| 640 | **95 ms** | 153 ms | ~43 s | 6.3e-5 | — | — |
-| 1024 | **366 ms** | 612 ms | ~2 min | **8.2e-5** | 9.9e-5 | 1.7e-5 |
+| size | GPU 编码（TC attention 后） | P3 收尾（f32 attn） | 原 f32 GEMM | CPU 编码 | visual rel_l2 | clip rel_l2 | sam rel_l2 |
+|---|---|---|---|---|---|---|---|
+| 224 | **18 ms** | 18 ms | 34 ms | — | 3.9e-5 | 5.1e-5 | 1.6e-5 |
+| 640 | **75 ms** | 95 ms | 153 ms | ~43 s | 7.4e-5 | 9.0e-5 | 1.9e-5 |
+| 1024 | **248–254 ms** | 366 ms | 612 ms | ~2 min | **1.44e-4** | 1.77e-4 | 4.6e-5 |
 
-验收线为 rel_l2 ≤ 6e-4（tAgent 2.10），实测约 **7×** 余量。提升来自：视觉线性/
+验收线为 rel_l2 ≤ 6e-4（tAgent 2.10），实测约 **4×** 余量。提升来自：视觉线性/
 卷积改用 **split-bf16 tensor-core GEMM**（`matmul_t_split_bf16`，激活 hi/lo 两片，
 2 次 mma/面板；见 `CORE_TECH.md` §5.8）+ SAM attention 的 **relpos 因式分解**
-（每 query 预计算 `H+W` 长度查找表，内层循环去掉每 key 的 global load 与归约）。
-`--selftest` 的 layernorm / relpos attention / full attention rel_l2 ≤ 1e-6。
++ **split-bf16 tensor-core flash attention**（`attention_flash_tc_kernel`，见
+`CORE_TECH.md` §5.11）。`--selftest` 的 layernorm / relpos attention / full
+attention / **大 S TC attention** rel_l2 ≤ 1e-5。
 
-1024 的 kernel 分解（`nsys`）：attention_flash(RELPOS) **239 ms**（4 个 SAM global
-块各 ~52 ms）、`matmul_t_split_bf16` **98 ms**、其余 <5 ms。**未达 150–250ms 目标**：
-f32 CUDA-core attention 只有 ~1 TFLOPS，进一步提速需要 tensor-core attention。
+1024 的 kernel 分解（P3 收尾时 `nsys`）：attention_flash(RELPOS) **239 ms**（4 个
+SAM global 块各 ~52 ms）、`matmul_t_split_bf16` **98 ms**、其余 <5 ms。改用 TC
+attention 后总时间 **366 → ~250 ms**，进入 150–250ms 目标区间（略贴上限）；TC
+attention 本身约 121 ms（f32 为 239 ms，~2×）。进一步提速受限于 **每个 block
+~90 KB shared 只能 1 block/SM**（`sRel` 因式分解表 32 KB 是最大项，见
+`CORE_TECH.md` §5.11「剩余」）。
 
-> **WIP**：`attention_flash_tc_kernel`（split-bf16 TC attention，见 `CORE_TECH.md`
-> §5.11）实测 1024 编码 **~250 ms**，已进入目标区间，但 `visual_embeddings`
-> rel_l2 ≈ **1.12**（目标 6e-4），因此 dispatch 关闭、正式路径仍是上表 366 ms。
-> 调通后本节数字预计更新为 ~250 ms。
+> 当 `S < 512`（windowed/CLIP）或 tile shared 超过 sm_120 的 101376 B opt-in
+> 上限时，`attention_flash` 自动回退 f32 CUDA-core 版本（正确性不变）。
+
 
 ## 2.10 grouped INT4 专家 GEMM（2026-09-20，`bench/bench_batch_real_int4_grouped.txt`）
 
