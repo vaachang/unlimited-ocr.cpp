@@ -390,7 +390,7 @@ global attention（S≥512）准备的 tensor-core 版本，`attention_flash` �
 |---|---|---|
 | 固定+环形双层 KV 管理 | `RSWACache` + `BlockManager`（前缀引用计数 + 环形池） | 已实现 |
 | CUDA Graph 下的动态 MoE 路由 | 路由在 Graph 内以 device kernel 求值、expert 以"全调度 + 掩码跳过"执行；单请求与 batched decode 均整步捕获 | 已实现（含连续批处理） |
-| Prefill 的 KV 分区写入 | 参考实现并不丢弃 gap（见 PITFALLS §1），当前按参考语义；分区丢弃作为优化 TODO | 未实现优化 |
+| Prefill 的 KV 分区写入 | 参考实现并不丢弃 gap（见 PITFALLS §1），且 decode 在完整 `P+W` 上做 attention、无 window mask；本工作负载 `V+W > P` 无可丢弃 gap。经分析判定不实现（详见 tAgent 2.6） | 分析后不实现 |
 
 ## 7. 端到端数据流（当前）
 

@@ -109,6 +109,8 @@ unlimited-ocr.cpp/
 | 2026-09-21 P3 | 修通视觉 TC attention：真因是 V^T 面板按错误行数分配/寻址（越界写坏 sV/sPhi），改为按 `kAttnHD` 分配 + V/P 窄 stride `kTcRS2`；selftest 加输出置零的 S=1024 case 并注册 ctest | `CORE_TECH.md` §5.11、`PITFALLS.md` §20、`BENCHMARKS.md` §2.9；1024 编码 366→248–254ms，rel_l2 1.44e-4；640 95→75ms |
 | 2026-09-21 P3 | TC attention occupancy：block 8 warp、mma n 维对半拆（`kTcSplit=2`），每调度器 2 warp 掩盖延迟；nsys 复核（GEMM 98ms 成最大头、TC attention 81ms、windowed f32 30ms） | `CORE_TECH.md` §5.11、`BENCHMARKS.md` §2.9；1024 编码 248→238–246ms，rel_l2 不变 |
 | 2026-09-21 P3 | CUDA/INT4 端到端 OCR 回归（2.11）：`compare_ocr --gpu/--int4`；CUDA/BF16 24/24、CUDA/INT4 与 CPU/INT4 一致但量化精度不足 | `ALIGNMENT.md` §5.2、`tAgent.md` 2.11 |
+| 2026-09-21 P3 | 2.6 分析：参考 decode 在完整 P+W 上 attention、无 window mask，且本负载 V+W>P，无可丢弃 gap → 判定不实现 | `tAgent.md` 2.6、`CORE_TECH.md` §6 |
+| 2026-09-21 P3 | 2.7 量化消融：`inspect_model --quant-check` 扩展为 scheme×group 扫描；OmniDocBench 因缺外部工具链未接入 | `BENCHMARKS.md` §2.13、`tAgent.md` 2.7 |
 
 > 每一步的实现/坑/数据分别沉淀在 `CORE_TECH.md` / `PITFALLS.md` / `BENCHMARKS.md`；
 > 当前性能与回归见 `tAgent.md` §1。
@@ -120,4 +122,5 @@ unlimited-ocr.cpp/
 | config | hidden 1280、intermediate 6848、moe_intermediate 896、12 层、heads 10、64 路由专家、top-6、shared 2、首层 dense、vocab 129280 |
 | checkpoint | 2710 个张量，6.21 GiB（BF16）；MoE 专家张量 2112 个（3 × 64 × 11 层） |
 | AWQ INT4（group=128） | 采样专家 rel-L2 ≈ 0.101；单矩阵 0.55 MB（BF16 2.19 MB，约 25%） |
+| INT4 消融（group 32/64/128/256） | 非对称 RTN：0.081/0.091/0.101/0.110；对称：0.097/0.108/0.118/0.127（`BENCHMARKS.md` §2.13） |
 | 显存（CUDA，INT4） | 权重常驻约 2.2 GB；batch=16 峰值约 3.37 GB（含 331MB 设备 embedding 表） |

@@ -341,6 +341,20 @@ time ./build-cuda/benchmarks/bench_cuda_batch --real --int4 --prompt 64 --steps 
 
 `mmap + cudaHostRegister` pinned 直通受本机 `ulimit -l = 8MB` 限制不可行（`tAgent.md` §2.9）。
 
+## 2.13 INT4 量化误差消融（2026-09-21，`inspect_model --quant-check`）
+
+12 个采样专家矩阵的 weight round-trip rel-L2（括号为有效 bit/权重）：
+
+| scheme | g=32 | g=64 | g=128 | g=256 |
+|---|---|---|---|---|
+| awq/asym（当前） | **0.0809**(6.00) | 0.0913(5.00) | 0.1010(4.50) | 0.1096(4.26) |
+| symmetric | 0.0974(6.00) | 0.1082(5.00) | 0.1180(4.50) | 0.1268(4.26) |
+
+当前 `quantize_int4_awq` 实为 group-wise RTN（最小/最大值非对称），未用激活统计，
+g=128 权重误差 ~10%；端到端见 `ALIGNMENT.md` §5.2（prefill logits rel_l2 ~0.36、
+合成用例 top-1 翻转）。缩到 g=32 降到 ~8%、top-1 恢复但仍分叉。真正 AWQ/GPTQ 需
+校准前向，列为 2.7 的后续。
+
 ## 3. 回归快照
 
 数值对齐的方法、逐项结果与根因分析统一记录在 **`ALIGNMENT.md`**（端到端 OCR

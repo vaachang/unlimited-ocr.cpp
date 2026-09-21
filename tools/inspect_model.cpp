@@ -76,32 +76,57 @@ int main(int argc, char** argv) {
     }
 
     if (quant) {
-        std::printf("\nAWQ INT4 quantization error (sampled experts):\n");
-        double max_rel = 0.0;
-        int sampled = 0;
-        for (int l = cfg.first_k_dense_replace; l < cfg.num_hidden_layers && sampled < 4; ++l) {
-            for (int e = 0; e < cfg.n_routed_experts && sampled < 4; ++e) {
-                const std::string name = "model.layers." + std::to_string(l) + ".mlp.experts." +
-                                         std::to_string(e) + ".gate_proj.weight";
-                if (!st.contains(name)) continue;
-                std::vector<float> w = st.read_f32(name);
-                QuantizedMatrix q = quantize_int4_awq(w.data(), cfg.moe_intermediate_size,
-                                                      cfg.hidden_size, 128);
-                std::vector<float> deq;
-                q.dequantize(deq);
-                double num = 0, den = 0;
-                for (std::size_t i = 0; i < w.size(); ++i) {
-                    const double d = static_cast<double>(w[i]) - deq[i];
-                    num += d * d;
-                    den += static_cast<double>(w[i]) * w[i];
+        // Sample a spread of expert matrices (gate/up/down across layers) and
+        // compare the round-trip weight error of the two quantizers over a group
+        // size sweep.  This is the "AWQ vs naive INT4" ablation (task 2.7).
+        std::vector<std::string> names;
+        const char* projs[3] = {"gate_proj", "up_proj", "down_proj"};
+        for (int l = cfg.first_k_dense_replace; l < cfg.num_hidden_layers && names.size() < 12; ++l)
+            for (int e = 0; e < cfg.n_routed_experts && names.size() < 12; ++e)
+                for (int p = 0; p < 3 && names.size() < 12; ++p) {
+                    const std::string name = "model.layers." + std::to_string(l) +
+                                             ".mlp.experts." + std::to_string(e) + "." + projs[p] +
+                                             ".weight";
+                    if (st.contains(name)) names.push_back(name);
                 }
-                const double rel = std::sqrt(num / (den + 1e-12));
-                max_rel = std::max(max_rel, rel);
-                std::printf("  layer %d expert %d: rel-L2=%.4f, packed=%.2f MB\n", l, e, rel,
-                            q.packed_bytes() / (1024.0 * 1024.0));
-                ++sampled;
+        std::printf("\nINT4 weight quantization error (mean rel-L2 over %zu sampled expert matrices):\n",
+                    names.size());
+        const int groups[] = {32, 64, 128, 256};
+        std::printf("%-14s", "scheme");
+        for (int g : groups) std::printf("%12s", ("g=" + std::to_string(g)).c_str());
+        std::printf("\n");
+        auto sweep = [&](const char* label, bool symmetric) {
+            std::printf("%-14s", label);
+            for (int g : groups) {
+                double rel_sum = 0;
+                double bpw = 0;
+                for (const std::string& nm : names) {
+                    std::vector<float> wf = st.read_f32(nm);
+                    const std::vector<i64>& shp = st.info(nm).shape;
+                    const int rows = static_cast<int>(shp[0]);
+                    const int cols = shp.size() > 1 ? static_cast<int>(shp[1]) : 1;
+                    QuantizedMatrix q = symmetric
+                                            ? quantize_int4_symmetric(wf.data(), rows, cols, g)
+                                            : quantize_int4_awq(wf.data(), rows, cols, g);
+                    std::vector<float> deq;
+                    q.dequantize(deq);
+                    double num = 0, den = 0;
+                    for (std::size_t i = 0; i < wf.size(); ++i) {
+                        const double d = static_cast<double>(wf[i]) - deq[i];
+                        num += d * d;
+                        den += static_cast<double>(wf[i]) * wf[i];
+                    }
+                    rel_sum += std::sqrt(num / (den + 1e-12));
+                    const double ng = q.n_groups();
+                    const double bytes = q.packed_bytes() + 4.0 * rows * ng + 4.0 * rows * ng;
+                    bpw += bytes * 8.0 / (static_cast<double>(rows) * cols);
+                }
+                std::printf("%7.4f(%4.2f)", rel_sum / names.size(), bpw / names.size());
             }
-        }
+            std::printf("   [rel-L2(bits/weight)]\n");
+        };
+        sweep("awq/asym", false);
+        sweep("symmetric", true);
     }
     return 0;
 }

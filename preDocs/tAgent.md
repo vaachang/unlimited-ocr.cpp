@@ -22,7 +22,7 @@
   bf16 TC GEMM）、P3（cp.async 流水线 TC GEMM、DeepEncoder CUDA 移植、**grouped INT4
   专家 GEMM + device router**、**device embedding 查表**、**INT4 量化并行加载**、
   **视觉 split-bf16 TC GEMM + relpos 因式分解**、**视觉 tensor-core flash attention**）
-  均已完成。**约 96–98%**（对照 `prj.md`）。视觉编码器 1024 进入 150–250ms 目标区间。
+  均已完成（2.6 分析后判定不适用/不实现，见该节）。**约 97–98%**（对照 `prj.md`）。
 - **回归**：`compare_ocr` greedy **24/24**（CPU/f32 与 **CUDA/BF16+GPU vision** 两条路径）；
   `uocr_tests` **20/20**；`uocr_cuda_tests` **全过**；`compare_vision_gpu_selftest` **全过**。
   **INT4（group-128 RTN）** 端到端与参考分叉（top-1 翻转、0/24），CPU/INT4 与
@@ -56,13 +56,17 @@ ctest --test-dir build-cuda --output-on-failure
 按收益/成本排序。每项给出目标、方案、验收与涉及文件；完成后在本文档勾掉并更新 §1。
 
 > **下一步优先级（2026-09-21）**：
-> 1. ✅ **2.10 收尾 — tensor-core flash attention 已调通**（1024 编码 366→248–254ms，
->    visual rel_l2 1.44e-4）。剩余可选优化（sRel 表缩小 / 提高 occupancy）非阻塞。
-> 2. **2.11 CUDA 端真实 INT4 OCR 端到端回归**（需先导出 `ref_ocr`，**先确认**）。
-> 3. 2.10 剩余：整栈 CUDA Graph / 非方形尺寸 / occupancy（收益小、非阻塞）。
-> 4. 2.6 Prefill KV 分区、2.7 精度评测（均**需先确认**）；2.8 受 ncu 权限限制。
+> 1. ✅ **2.10 TC attention 调通 + occupancy 优化**：1024 编码 366→238–246ms，
+>    visual rel_l2 1.44e-4。剩余（非阻塞）：整栈 CUDA Graph / 非方形尺寸 /
+>    进一步砍 `sRel` / 视觉 GEMM。
+> 2. ✅ **2.11 CUDA 端 INT4 OCR 端到端回归**：CUDA/BF16 24/24；CUDA/INT4 与
+>    CPU/INT4 一致但量化精度不足（根因是 RTN 非真 AWQ）。
+> 3. 🔶 **2.7 精度评测**：本地量化消融已做；OmniDocBench 待外部工具链（Docker/
+>    TeX Live）。真正 AWQ/GPTQ 需校准前向，**先确认**。
+> 4. ⛔ **2.6 Prefill KV 分区**：分析后判定与参考不兼容且本负载无 gap，**不实现**。
+> 5. 2.8 受 ncu 权限限制（nsys 可用）。
 >
-> 以下 ✅/🔶 是 2026-09-20/21 的完成快照。✅ 已完成；🔶 部分完成。
+> 以下 ✅/🔶 是 2026-09-20/21 的完成快照。✅ 已完成；🔶 部分完成；⛔ 分析后不实现。
 
 ### ✅ 2.1 高性能 TC GEMM 重写（2026-09-20 完成）
 
@@ -137,16 +141,44 @@ ctest --test-dir build-cuda --output-on-failure
   TTFT/TPOT 分解。**注意**：本机 `ncu` 报 `ERR_NVGPUCTRPERM`（PITFALLS §17），
   该子项暂时做不了，只能用 nsys + 消融。
 
-### 2.6 Prefill KV 分区写入优化（prj.md 创新点三）
+### 2.6 Prefill KV 分区写入优化（prj.md 创新点三）— 分析后判定不适用/不实现
 
-- **方案**：prefill 时按位置分区（视觉区/环形区/gap 丢弃），省 ~70% KV 写入带宽。
-- **注意**：参考实现并不丢弃 gap（`PITFALLS.md` §1），改动会偏离参考数值，**先确认是否接受**。
-- **涉及**：`src/kernels/cuda/rswa_attention.cu`（写出逻辑）、`GpuRSWACache`。
+- **prj.md 设想**：prefill 时按位置分区（视觉区 / 环形区 / gap 丢弃），省 ~70% KV
+  写入带宽。
+- **与参考冲突（关键）**：参考实现（`modeling_deepseekv2.py`
+  `SlidingWindowLlamaAttention`）**prefill 写全部 P 个 KV**，且 **decode 在完整
+  `P+W` cache 上做 attention、没有任何 window mask**（`_attn_forward` 只在真 prefill
+  用 causal mask；ring decode 路径对全 cache 做 softmax）。因此 **P 区每个槽位 decode
+  都会读到**，丢弃任何 gap 都会改变输出；要自洽就必须同时把 decode 改成 windowed
+  mask，那是与参考不同的新设计。
+- **对本工作负载无收益**：真实 OCR 用例 `P=278`（273 视觉 + 5 文本/special）、
+  `W=128`，`V + W = 401 > P`，**没有可丢弃的 gap**（丢弃比例 0%）。视觉区 KV 的
+  跨请求共享（创新点一）已由 block manager 实现。
+- **结论**：不实现该分区（会偏离参考且无收益）。若将来要支持「超长文本 prompt +
+  windowed decode」的新语义，需要单独的 design + `EngineConfig` 开关，并与参考路径
+  隔离评测。**涉及**：`src/kernels/cuda/rswa_attention.cu`、`GpuRSWACache`。
 
-### 2.7 精度评测
+### 🔶 2.7 精度评测（部分完成：本地量化消融已做；OmniDocBench 待外部工具链）
 
-- **方案**：接入 OmniDocBench v1.6（AWQ vs BF16 综合分）、AWQ vs 朴素 INT4 消融。
-- **注意**：需下载外部工具链/数据，**先询问确认**。
+- **已完成（本地量化消融，2026-09-21）**：`inspect_model --quant-check` 扩展为
+  scheme × group 扫描（12 个采样专家矩阵，weight round-trip rel-L2 / 有效 bit）：
+
+  | scheme | g=32 | g=64 | g=128 | g=256 |
+  |---|---|---|---|---|
+  | awq/asym（当前实现） | **0.0809**(6.00b) | 0.0913(5.00b) | 0.1010(4.50b) | 0.1096(4.26b) |
+  | symmetric | 0.0974(6.00b) | 0.1082(5.00b) | 0.1180(4.50b) | 0.1268(4.26b) |
+
+  即当前 `quantize_int4_awq` 实为 **RTN（round-to-nearest）group 量化**，未用激活
+  统计；即使 group=32 也有 ~8% 权重误差，端到端 prefill logits rel_l2 0.31–0.36
+  （见 `ALIGNMENT.md` §5.2）。对称量化更差。
+- **未做（受外部工具链限制）**：OmniDocBench v1.6 端到端评测需要 1651 页数据集
+  + TeX Live 2025(~7GB) + ImageMagick 7 + Ghostscript + Python 3.10 环境（官方推荐
+  Docker 镜像 `ghcr.io/zeng-weijun/omnidocbench-eval:repro-ubuntu2204`），本机无
+  Docker/该工具链，**未接入**。接入后可按 `configs/end2end.yaml` 跑 text Edit /
+  TEDS / CDM 综合分。
+- **改进方向（需单独确认）**：真正 AWQ（激活感知 per-channel scaling，需校准前向）
+  或 GPTQ 误差补偿，预计把权重误差从 ~10% 降到 ~3–5%；或在显存允许时直接用
+  BF16 专家（3B/6.2GB，16GB 卡可放下，端到端已 24/24）。
 
 ### ✅ 2.10 视觉编码器性能收尾（完成；TC attention 已调通 2026-09-21）
 
