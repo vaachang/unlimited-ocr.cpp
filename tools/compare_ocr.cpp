@@ -22,6 +22,7 @@
 
 #include "uocr/config.h"
 #if defined(UOCR_CUDA_ENABLED)
+#include "uocr/gpu_decoder.h"
 #include "uocr/gpu_encoder.h"
 #endif
 #include "uocr/deep_encoder.h"
@@ -100,10 +101,17 @@ int main(int argc, char** argv) {
     std::string model_dir = "models";
     std::string ref_dir = "/tmp/opencode/ref_ocr";
     bool gpu_vision = false;
+    bool gpu = false;
+    bool int4 = false;
+    int int4_group = 128;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--model") && i + 1 < argc) model_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--ref") && i + 1 < argc) ref_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--gpu-vision")) gpu_vision = true;
+        else if (!std::strcmp(argv[i], "--gpu")) gpu = true;
+        else if (!std::strcmp(argv[i], "--int4")) int4 = true;
+        else if (!std::strcmp(argv[i], "--int4-group") && i + 1 < argc)
+            int4_group = std::atoi(argv[++i]);
     }
 
     std::ifstream mf(ref_dir + "/manifest.json");
@@ -156,10 +164,24 @@ int main(int argc, char** argv) {
     // ---- 3. visual embeddings (Engine) ----
     EngineConfig ecfg;
     ecfg.model_dir = model_dir;
-    ecfg.use_int4_experts = false;
+    ecfg.use_int4_experts = int4;
+    ecfg.int4_group_size = int4_group;
     ecfg.max_seq_len = 1024;
     ecfg.memory_pool_bytes = 1 << 20;
+#if defined(UOCR_CUDA_ENABLED)
+    auto engine = Engine::load(ecfg, gpu ? Backend::CUDA : Backend::CPU);
+    cuda::GpuDecoder* gdec = gpu ? engine->gpu_decoder() : nullptr;
+    UOCR_CHECK(!gpu || gdec != nullptr, "--gpu: engine did not create a CUDA decoder");
+#else
+    UOCR_CHECK(!gpu, "--gpu requires a CUDA build (ENGINE_BACKEND=CUDA)");
     auto engine = Engine::load(ecfg, Backend::CPU);
+#endif
+#if defined(UOCR_CUDA_ENABLED)
+    std::printf("decoder backend        : %s\n",
+                gdec ? (int4 ? "CUDA/INT4" : "CUDA/BF16") : "CPU/f32");
+#else
+    std::printf("decoder backend        : CPU/f32\n");
+#endif
 
     const std::string weights_path = model_dir + "/model-00001-of-000001.safetensors";
     std::printf("loading vision weights (this takes a while) ...\n");
@@ -197,7 +219,14 @@ int main(int argc, char** argv) {
     RSWACache cache(cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim(),
                     cfg.sliding_window);
     std::vector<float> our_logits;
-    engine->decoder().prefill_embeds(cache, inputs, our_logits);
+#if defined(UOCR_CUDA_ENABLED)
+    if (gdec) {
+        gdec->prefill_embeds(inputs.data(), seq, our_logits);
+    } else
+#endif
+    {
+        engine->decoder().prefill_embeds(cache, inputs, our_logits);
+    }
     std::vector<float> ref_logits = load_f32(ref_dir, T.at("prefill_logits"));
     report("prefill_logits", our_logits, ref_logits);
 
@@ -225,7 +254,11 @@ int main(int argc, char** argv) {
                     got == want ? "OK" : "DIFF");
         if (s + 1 >= steps.size()) break;
         std::vector<float> next_logits;
-        engine->decoder().decode(cache, got, pos, next_logits);
+#if defined(UOCR_CUDA_ENABLED)
+        if (gdec) gdec->decode_token(got, pos, next_logits);
+        else
+#endif
+            engine->decoder().decode(cache, got, pos, next_logits);
         cur_logits = std::move(next_logits);
         ++pos;
     }

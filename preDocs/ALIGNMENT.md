@@ -196,6 +196,36 @@ OMP_NUM_THREADS=8 ./build/tools/compare_ocr --model models --ref /tmp/opencode/r
    在 `[len-window, len-ngram+1)` 内搜索"，原实现按完整 n-gram 匹配。
    已在 `Sampler::apply_no_repeat_ngram` 修正。
 
+### 5.2 CUDA 端端到端回归（2.11，2026-09-21）
+
+`compare_ocr` 新增 `--gpu`（CUDA 解码器）/`--int4`/`--int4-group N`，可对同一
+`ref_ocr` 跑 CPU、CUDA-BF16、CUDA-INT4 三条路径：
+
+```bash
+./build-cuda/tools/compare_ocr --model models --ref /tmp/opencode/ref_ocr --gpu --gpu-vision            # CUDA/BF16
+./build-cuda/tools/compare_ocr --model models --ref /tmp/opencode/ref_ocr --gpu --gpu-vision --int4     # CUDA/INT4
+./build-cuda/tools/compare_ocr --model models --ref /tmp/opencode/ref_ocr --gpu-vision --int4           # CPU/INT4
+```
+
+| 路径 | visual rel_l2 | prefill logits rel_l2 | top-1 | greedy |
+|---|---|---|---|---|
+| CPU/f32（旧基线） | 0.0419 | 0.0637 | 3051 ✓ | **24/24** |
+| CUDA/BF16 + GPU vision | 0.0418 | 0.0601 | 3051 ✓ | **24/24** |
+| CPU/INT4（group 128） | 0.0418 | **0.3623** | 8227 ✗ | 0/24 |
+| CUDA/INT4（group 128） | 0.0418 | **0.3620** | 8227 ✗ | 0/24 |
+| CUDA/INT4（group 32） | 0.0418 | 0.3067 | 3051 ✓ | 1/24 |
+
+结论：
+- **CUDA 解码器正确**——CUDA/INT4 与 CPU/INT4 的 logits/贪心 token 完全一致
+  （8227/28/54678…），所以差异不是 CUDA 移植 bug。
+- **BF16（f32 激活）两条路径都与参考 24/24**，视觉精度的 bf16 漂移不影响生成。
+- **INT4（当前 group-128 非对称 min/max，非真正 AWQ）精度不足**：单专家权重
+  round-trip rel-L2 ≈ 0.10（`PROGRESS.md` §5），12 层 MoE 后 prefill logits 误差
+  ~0.36，翻转 top-1；这个合成图（随机 RGB 梯度、非真实文字）本身输出是退化重复
+  序列，任何扰动都会级联，故 0/24。group=32 把误差降到 0.31、top-1 恢复但第 2 步
+  仍分叉。**真实 OCR 精度需 OmniDocBench 评估（任务 2.7）**；量化器本身是
+  round-to-nearest，`quantize_int4_awq` 的名字并不名副其实（未用激活统计）。
+
 ## 6. R-SWA 环形覆写验证（P1，已完成）
 
 用 `--decode-steps 140` 跑过 `P+W=16+128=144` 的覆写拐点（`ref_decoder140`）：

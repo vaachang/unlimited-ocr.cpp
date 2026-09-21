@@ -23,9 +23,10 @@
   专家 GEMM + device router**、**device embedding 查表**、**INT4 量化并行加载**、
   **视觉 split-bf16 TC GEMM + relpos 因式分解**、**视觉 tensor-core flash attention**）
   均已完成。**约 96–98%**（对照 `prj.md`）。视觉编码器 1024 进入 150–250ms 目标区间。
-- **回归**：`compare_ocr` greedy **24/24**（CPU 参考路径）；`uocr_tests` **20/20**；
-  `uocr_cuda_tests` **全过**；`compare_vision_gpu_selftest` **全过**（layernorm/
-  relpos full attention / 大 S TC attention，输出置零防假阳性）。
+- **回归**：`compare_ocr` greedy **24/24**（CPU/f32 与 **CUDA/BF16+GPU vision** 两条路径）；
+  `uocr_tests` **20/20**；`uocr_cuda_tests` **全过**；`compare_vision_gpu_selftest` **全过**。
+  **INT4（group-128 RTN）** 端到端与参考分叉（top-1 翻转、0/24），CPU/INT4 与
+  CUDA/INT4 **完全一致**，属量化精度问题（见 2.11 / `ALIGNMENT.md` §5.2）。
 - **性能**（真实 `baidu/Unlimited-OCR`，prompt=64, steps=16, max_batch=16, warmup 稳态）：
 
   | 指标 | 值 |
@@ -177,14 +178,19 @@ ctest --test-dir build-cuda --output-on-failure
   `src/engine/gpu_encoder.cu`、`tools/compare_vision_gpu.cpp`。详见 `CORE_TECH.md`
   §5.8/§5.11、`BENCHMARKS.md` §2.9、`PITFALLS.md` §20。
 
-### 2.11 CUDA 端真实 INT4 OCR 端到端回归（技术债）
+### ✅ 2.11 CUDA 端真实 OCR 端到端回归（2026-09-21 完成）
 
-- **问题**：当前 OCR 对齐（greedy 24/24）走 CPU 参考路径；CUDA 后端（`GpuDecoder`
-  + `GpuEncoder`）尚未与参考做端到端 greedy 回归。
-- **方案**：导出/复用 `ref_ocr`，用 `compare_ocr --gpu-vision` + CUDA 解码器跑
-  teacher-forced greedy，对比 token 与 logits。
-- **注意**：需要 `ref_ocr` 参考张量（当前仓库无，需重新导出，**先确认**）。
-- **涉及**：`tools/compare_ocr.cpp`、`tools/reference/export_reference.py`。
+- **已做**：`compare_ocr` 新增 `--gpu`（CUDA 解码器）、`--int4`、`--int4-group N`；
+  `Engine` 暴露 `gpu_decoder()`；导出 `ref_ocr` 后跑通 CPU / CUDA-BF16 / CUDA-INT4
+  三条路径（命令与数据见 `ALIGNMENT.md` §5.2）。
+- **结果**：CUDA/BF16+GPU vision **greedy 24/24**（与 CPU 基线一致）；CUDA/INT4 与
+  CPU/INT4 的 logits/token **完全一致**（证明 CUDA 解码器无 bug），但当前
+  group-128 非对称 min/max INT4 的 prefill logits rel_l2 ≈ **0.36**、top-1 翻转、
+  greedy 0/24。group=32 降到 0.31、top-1 恢复但仍在第 2 步分叉。
+- **结论**：差异来自**量化精度**而非移植；`quantize_int4_awq` 实为
+  round-to-nearest（未用激活统计），单专家权重误差 ~0.10。真实 OCR 精度待
+  OmniDocBench（任务 2.7）评估，或改用真正 AWQ / 更小 group。
+- **涉及**：`tools/compare_ocr.cpp`、`include/uocr/engine.h`、`ALIGNMENT.md` §5.2。
 
 > 2.4–2.5 是「能上 GPU 但仍在 CPU」的模型部分（见 §3）；tokenizer、图像预处理、
 > 采样/ngram、调度留 CPU 属设计选择。
@@ -258,8 +264,10 @@ ctest --test-dir build-cuda --output-on-failure
   补偿误差），视觉栈保持 6e-4；f32 CUDA-core 版本仅作 `k%8≠0` 回退。
 - `GpuDecoder::mlp_block_batch` 为未定义的空声明，可删除。
 - `GpuDecoder::batch_import_prefill` 已无调用者，可删除。
-- 真实 INT4 模型下 CUDA 端 greedy 尚未与参考 OCR 做端到端回归（当前 OCR 对齐走
-  CPU 参考路径）。
+- **INT4 量化精度不足**：当前 `quantize_int4_awq` 实为 group-wise RTN（非激活感知
+  AWQ），单专家权重 rel-L2 ≈ 0.10、端到端 prefill logits ≈ 0.36，合成用例 top-1
+  翻转。CUDA/INT4 与 CPU/INT4 一致（移植无误）。真实 OCR 精度待 OmniDocBench
+  （2.7）或真正 AWQ 校准（2.7 消融）。
 - `matmul_t_bf16_ref` 仅用于单测 A/B，release 构建保留。
 
 ---

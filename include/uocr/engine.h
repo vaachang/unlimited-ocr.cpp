@@ -100,6 +100,10 @@ public:
         gpu_vision_ = std::move(enc);
     }
     const cuda::GpuEncoder* vision_gpu() const { return gpu_vision_.get(); }
+
+    // Direct access to the device decoder (CUDA backend only).  Used by the
+    // alignment tools to drive a teacher-forced / step-by-step comparison.
+    cuda::GpuDecoder* gpu_decoder() { return gpu_decoder_.get(); }
 #endif
 
     // Insert visual embeddings into `tokens`/`inputs` at image-token positions.
