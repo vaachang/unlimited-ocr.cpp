@@ -104,7 +104,10 @@ struct EngineConfig {
     // prefill as well as decode.  This is faster than the per-expert tensor-core
     // GEMM path when few tokens route to each expert (single-request prefill).
     bool use_device_moe_prefill = true;
-    bool use_int4_experts = true;
+    // Expert weight format.  Defaults to BF16: the INT4 path uses group-wise
+    // round-to-nearest quantization (~10% weight error) which perturbs greedy
+    // output, so it is opt-in for memory/speed-constrained runs.
+    bool use_int4_experts = false;
     int int4_group_size = 128;
     // Tile size for the grouped INT4 expert GEMM (ragged prefill): `bn` columns
     // in {8,16,32,64} and `bm` rows in {64,128}.

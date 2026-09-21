@@ -111,6 +111,7 @@ unlimited-ocr.cpp/
 | 2026-09-21 P3 | CUDA/INT4 端到端 OCR 回归（2.11）：`compare_ocr --gpu/--int4`；CUDA/BF16 24/24、CUDA/INT4 与 CPU/INT4 一致但量化精度不足 | `ALIGNMENT.md` §5.2、`tAgent.md` 2.11 |
 | 2026-09-21 P3 | 2.6 分析：参考 decode 在完整 P+W 上 attention、无 window mask，且本负载 V+W>P，无可丢弃 gap → 判定不实现 | `tAgent.md` 2.6、`CORE_TECH.md` §6 |
 | 2026-09-21 P3 | 2.7 量化消融：`inspect_model --quant-check` 扩展为 scheme×group 扫描；OmniDocBench 因缺外部工具链未接入 | `BENCHMARKS.md` §2.13、`tAgent.md` 2.7 |
+| 2026-09-21 P3 | 可用性收尾：独立 OCR CLI `tools/ocr_image`（PNG/PPM → 文本，默认 CUDA+GPU 视觉+BF16）；`EngineConfig::use_int4_experts` 默认改 BF16；`generate_from_image` 单测 | `tools/ocr_image.cpp`、`include/uocr/image.h`；单元测试 20→21 |
 
 > 每一步的实现/坑/数据分别沉淀在 `CORE_TECH.md` / `PITFALLS.md` / `BENCHMARKS.md`；
 > 当前性能与回归见 `tAgent.md` §1。

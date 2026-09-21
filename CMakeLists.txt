@@ -65,6 +65,10 @@ find_package(Threads REQUIRED)
 # OpenMP parallelises the CPU reference kernels (vision encoder especially).
 find_package(OpenMP QUIET)
 
+# libpng lets the standalone OCR CLI read real images.  Optional: without it the
+# tools fall back to binary PPM.
+find_package(PNG QUIET)
+
 # ---------------------------------------------------------------------------
 # Core library (runtime + scheduler + engine + CPU kernels)
 # ---------------------------------------------------------------------------
@@ -100,6 +104,12 @@ target_link_libraries(uocr_core
 if(OpenMP_CXX_FOUND)
     target_link_libraries(uocr_core PRIVATE OpenMP::OpenMP_CXX)
     message(STATUS "OpenMP enabled for CPU kernels")
+endif()
+
+if(PNG_FOUND)
+    target_compile_definitions(uocr_core PRIVATE UOCR_HAVE_PNG=1)
+    target_link_libraries(uocr_core PRIVATE PNG::PNG)
+    message(STATUS "libpng found: PNG image loading enabled")
 endif()
 
 target_compile_definitions(uocr_core PUBLIC UOCR_CPU_BACKEND=1)

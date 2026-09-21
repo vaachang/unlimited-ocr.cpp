@@ -54,6 +54,9 @@ int main(int argc, char** argv) {
     if (real) {
         EngineConfig ecfg;
         ecfg.model_dir = model_dir;
+        // This CPU decode benchmark targets the INT4 expert path (the engine
+        // default is now BF16); flip it back on explicitly.
+        ecfg.use_int4_experts = true;
         EngineConfig cfg_copy = ecfg;
         cfg = ModelConfig::from_json_file(model_dir + "/config.json");
         weights = DecoderWeights::load(model_dir + "/model-00001-of-000001.safetensors", cfg,

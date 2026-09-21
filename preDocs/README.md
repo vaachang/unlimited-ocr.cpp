@@ -29,11 +29,17 @@
 # CUDA 生产构建（本机 sm_120）
 cmake -S . -B build-cuda -DENGINE_BACKEND=CUDA -DCMAKE_BUILD_TYPE=Release
 cmake --build build-cuda -j8
-ctest --test-dir build-cuda --output-on-failure          # uocr_tests / uocr_cuda_tests
+ctest --test-dir build-cuda --output-on-failure          # uocr_tests / uocr_cuda_tests / vision selftest
 
 # CPU 参考构建
 cmake -S . -B build -DENGINE_BACKEND=CPU -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j8 && ctest --test-dir build --output-on-failure
+
+# 端到端 OCR：给一张图片输出文本（默认 CUDA + GPU 视觉 + BF16 专家）
+./build-cuda/tools/ocr_image --model models --image page.png
+# 其他用法：--cpu（纯 CPU 参考路径）、--int4（更省显存但精度下降）、
+#           --no-crop-mode、--prompt "<image>\nFree OCR."、--max-new-tokens N
+# 输入图片：PNG（需 libpng，系统一般自带）或二进制 P6 PPM。
 
 # 真实模型连续批处理吞吐
 ./build-cuda/benchmarks/bench_cuda_batch --real --int4 --prompt 64 --steps 16 --max-batch 16

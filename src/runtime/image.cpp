@@ -7,6 +7,11 @@
 #include <fstream>
 #include <limits>
 #include <set>
+#include <vector>
+
+#if defined(UOCR_HAVE_PNG)
+#include <png.h>
+#endif
 
 #include "uocr/log.h"
 
@@ -116,6 +121,67 @@ bool save_ppm(const std::string& path, const ImageRGB& img) {
     f.write(reinterpret_cast<const char*>(img.pixels.data()),
             static_cast<std::streamsize>(img.pixels.size()));
     return f.good();
+}
+
+ImageRGB load_png(const std::string& path) {
+#if defined(UOCR_HAVE_PNG)
+    FILE* fp = std::fopen(path.c_str(), "rb");
+    if (!fp) return ImageRGB{};
+    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    if (!png) { std::fclose(fp); return ImageRGB{}; }
+    png_infop info = png_create_info_struct(png);
+    if (!info) { png_destroy_read_struct(&png, nullptr, nullptr); std::fclose(fp); return ImageRGB{}; }
+    ImageRGB img;
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_read_struct(&png, &info, nullptr);
+        std::fclose(fp);
+        return ImageRGB{};
+    }
+    png_init_io(png, fp);
+    png_read_info(png, info);
+    const int w = static_cast<int>(png_get_image_width(png, info));
+    const int h = static_cast<int>(png_get_image_height(png, info));
+    const png_byte color = png_get_color_type(png, info);
+    const png_byte depth = png_get_bit_depth(png, info);
+    if (depth == 16) png_set_strip_16(png);
+    if (color == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
+    if (color == PNG_COLOR_TYPE_GRAY && depth < 8) png_set_expand_gray_1_2_4_to_8(png);
+    if (png_get_valid(png, info, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png);
+    if (color == PNG_COLOR_TYPE_GRAY || color == PNG_COLOR_TYPE_GRAY_ALPHA)
+        png_set_gray_to_rgb(png);
+    png_set_strip_alpha(png);
+    png_read_update_info(png, info);
+    if (w <= 0 || h <= 0) {
+        png_destroy_read_struct(&png, &info, nullptr);
+        std::fclose(fp);
+        return ImageRGB{};
+    }
+    img.width = w;
+    img.height = h;
+    img.pixels.resize(static_cast<std::size_t>(w) * h * 3);
+    std::vector<png_bytep> rows(static_cast<std::size_t>(h));
+    for (int y = 0; y < h; ++y)
+        rows[static_cast<std::size_t>(y)] =
+            img.pixels.data() + static_cast<std::size_t>(y) * w * 3;
+    png_read_image(png, rows.data());
+    png_destroy_read_struct(&png, &info, nullptr);
+    std::fclose(fp);
+    return img;
+#else
+    (void)path;
+    return ImageRGB{};
+#endif
+}
+
+ImageRGB load_image(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.good()) return ImageRGB{};
+    unsigned char sig[8] = {};
+    f.read(reinterpret_cast<char*>(sig), sizeof(sig));
+    f.close();
+    static const unsigned char kPng[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    if (std::memcmp(sig, kPng, sizeof(kPng)) == 0) return load_png(path);
+    return load_ppm(path);
 }
 
 ImageRGB resize_bicubic(const ImageRGB& src, int out_w, int out_h) {

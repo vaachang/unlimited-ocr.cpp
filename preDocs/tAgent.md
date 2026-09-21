@@ -23,10 +23,16 @@
   专家 GEMM + device router**、**device embedding 查表**、**INT4 量化并行加载**、
   **视觉 split-bf16 TC GEMM + relpos 因式分解**、**视觉 tensor-core flash attention**）
   均已完成（2.6 分析后判定不适用/不实现，见该节）。**约 97–98%**（对照 `prj.md`）。
-- **回归**：`compare_ocr` greedy **24/24**（CPU/f32 与 **CUDA/BF16+GPU vision** 两条路径）；
-  `uocr_tests` **20/20**；`uocr_cuda_tests` **全过**；`compare_vision_gpu_selftest` **全过**。
+- **入口/可用性**：新增独立 CLI `tools/ocr_image`（`--image page.png` → 打印识别文本，
+  默认 CUDA + GPU 视觉 + **BF16 专家**；`--cpu`/`--int4`/`--no-crop-mode` 可选；图片支持
+  PNG（libpng）与 PPM）。`EngineConfig::use_int4_experts` 默认改为 **false（BF16）**，
+  INT4 作为显存/速度受限时的显式选项；`generate_from_image` 增加单测。
+- **回归**：`ocr_image` 在参考图上与 PyTorch 参考输出**逐字一致**；`compare_ocr`
+  greedy **24/24**（CPU/f32 与 **CUDA/BF16+GPU vision** 两条路径）；`uocr_tests`
+  **21/21**；`uocr_cuda_tests` **全过**；`compare_vision_gpu_selftest` **全过**。
   **INT4（group-128 RTN）** 端到端与参考分叉（top-1 翻转、0/24），CPU/INT4 与
-  CUDA/INT4 **完全一致**，属量化精度问题（见 2.11 / `ALIGNMENT.md` §5.2）。
+  CUDA/INT4 **完全一致**，属量化精度问题（见 2.11 / `ALIGNMENT.md` §5.2），故默认
+  不再用 INT4。
 - **性能**（真实 `baidu/Unlimited-OCR`，prompt=64, steps=16, max_batch=16, warmup 稳态）：
 
   | 指标 | 值 |
@@ -46,6 +52,8 @@
 cmake -S . -B build-cuda -DENGINE_BACKEND=CUDA -DCMAKE_BUILD_TYPE=Release
 cmake --build build-cuda -j8
 ctest --test-dir build-cuda --output-on-failure
+# 端到端 OCR（CUDA + GPU 视觉 + BF16 专家；--int4 可切 INT4）
+./build-cuda/tools/ocr_image --model models --image page.png
 ./build-cuda/benchmarks/bench_cuda_batch --real --int4 --prompt 64 --steps 16 --max-batch 16
 ```
 
@@ -293,7 +301,9 @@ ctest --test-dir build-cuda --output-on-failure
 - **视觉编码器已进入 150–250ms 目标区间**（1024：238–246ms）。nsys 显示最大头
   已是视觉 GEMM（`matmul_t_split_bf16` 98ms），其次全局 TC attention 81ms、
   windowed f32 attention 30ms；TC attention 受 ~90KB shared → 1 block/SM（`sRel`
-  表 32KB）限制。非方形尺寸支持与整栈 CUDA Graph 未做。见任务 2.10。
+  表 32KB）限制。整栈 CUDA Graph 未做。**任意长宽比的输入图片可用**（`ocr_image`
+  经 `image_embeddings` 做 aspect-preserving resize + 居中 pad 成正方形后再喂
+  编码器）；只有直接调用 `GpuEncoder::encode` 时才要求正方形。见任务 2.10。
 - 单请求 `GpuDecoder::prefill_tokens` 仍在 host 查 embedding（每请求一次，非每步）；
   position 仍是 4B pinned H2D（本就是 int，未做成表）。
 - BF16 专家的 ragged 大批量 prefill 仍是 host top-k + 逐专家 GEMM（grouped 只做了

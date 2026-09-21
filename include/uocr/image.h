@@ -27,6 +27,13 @@ struct ImageRGB {
 ImageRGB load_ppm(const std::string& path);
 bool save_ppm(const std::string& path, const ImageRGB& img);
 
+// Decode a PNG (8/16-bit, gray/palette/RGB/RGBA, alpha stripped).  Returns an
+// empty image when the build has no libpng (`UOCR_HAVE_PNG` unset).
+ImageRGB load_png(const std::string& path);
+
+// Generic loader: sniff the file signature and dispatch to PNG or PPM.
+ImageRGB load_image(const std::string& path);
+
 // Pillow-compatible bicubic resize (Catmull-Rom, a=-0.5, antialiased).
 ImageRGB resize_bicubic(const ImageRGB& src, int out_w, int out_h);
 

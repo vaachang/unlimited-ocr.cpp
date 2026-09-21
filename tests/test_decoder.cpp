@@ -1,4 +1,5 @@
 #include "test_main.h"
+#include "uocr/engine.h"
 #include "uocr/moe_decoder.h"
 
 #include <cmath>
@@ -95,4 +96,33 @@ UOCR_TEST(router_trace_valid) {
             for (int e : tr.experts) CHECK(e >= 0 && e < cfg.n_routed_experts);
         }
     }
+}
+
+// Smoke test for the high-level image path: scatter visual embeddings into the
+// prompt, prefill and greedily decode.  Uses random tiny weights + random
+// visual rows, so it only checks the plumbing (shape/range), not quality.
+UOCR_TEST(engine_generate_from_image_smoke) {
+    ModelConfig cfg = tiny_config();
+    EngineConfig ecfg;
+    ecfg.max_batch_size = 2;
+    ecfg.max_seq_len = 64;
+    ecfg.max_new_tokens = 3;
+    ecfg.use_int4_experts = false;
+    ecfg.memory_pool_bytes = 1u << 20;
+
+    Engine engine(cfg, ecfg, DecoderWeights::random(cfg, 7), Backend::CPU);
+
+    std::vector<int> prompt = {1, 2, 3, 4, 200, 6, 200, 8, 200, 10, 200, 12};
+    std::vector<std::uint8_t> mask(prompt.size(), 0);
+    mask[4] = mask[6] = mask[8] = mask[10] = 1;
+    std::vector<float> visual(4 * cfg.hidden_size);
+    for (std::size_t i = 0; i < visual.size(); ++i)
+        visual[i] = 0.05f * static_cast<float>(static_cast<int>(i % 13) - 6);
+
+    GenerationResult res =
+        engine.generate_from_image(prompt, mask, visual, cfg.hidden_size, 3);
+    CHECK_EQ(res.prefill_tokens, static_cast<int>(prompt.size()));
+    CHECK(static_cast<int>(res.tokens.size()) <= 3);
+    for (int t : res.tokens) CHECK(t >= 0 && t < cfg.vocab_size);
+    CHECK(std::isfinite(res.ttft_ms));
 }
