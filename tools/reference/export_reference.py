@@ -230,8 +230,27 @@ def det_rgb(w, h, seed):
     return np.stack([r, g, b], axis=-1)
 
 
+def reference_dynamic_preprocess(model):
+    """Return the reference model's own `dynamic_preprocess` (exact grid/tie-break)."""
+    try:
+        import importlib
+
+        mod = importlib.import_module(type(model).__module__)
+        fn = getattr(mod, "dynamic_preprocess", None)
+        if fn is not None:
+            return fn
+    except Exception:
+        pass
+    return None
+
+
 def run_ocr(args, model):
-    """End-to-end image+prompt case (E3/E4)."""
+    """End-to-end image+prompt case (E3/E4).
+
+    With `crop_mode` and an image larger than the local view size (640), this
+    runs the same `dynamic_preprocess` (Gundam) grid selection as the reference
+    `infer()`, so the exported reference covers the multi-crop path as well.
+    """
     import math
 
     from PIL import Image, ImageOps
@@ -249,14 +268,19 @@ def run_ocr(args, model):
     text_splits = prompt.split("<image>")
     assert len(text_splits) == 2, "run_ocr expects exactly one <image>"
 
-    w, h = args.ocr_width, args.ocr_height
-    arr = det_rgb(w, h, args.seed)
+    if args.image_file:
+        im = Image.open(args.image_file).convert("RGB")
+        arr = np.asarray(im)
+        w, h = im.size
+    else:
+        w, h = args.ocr_width, args.ocr_height
+        arr = det_rgb(w, h, args.seed)
+        im = Image.fromarray(arr)
     arr.tofile(os.path.join(out, "ocr_image.bin"))
     manifest["image_hw"] = [h, w]
     manifest["prompt"] = prompt
     manifest["crop_mode"] = crop_mode
 
-    im = Image.fromarray(arr)
     mean = np.array([0.5, 0.5, 0.5], dtype=np.float32).reshape(3, 1, 1)
     std = np.array([0.5, 0.5, 0.5], dtype=np.float32).reshape(3, 1, 1)
     pad_color = tuple(int(x * 255) for x in mean.reshape(-1))
@@ -266,14 +290,30 @@ def run_ocr(args, model):
         return (a.transpose(2, 0, 1) - mean) / std
 
     crop_ratio = [1, 1]
+    images_crop_list = []
     if crop_mode:
         global_view = ImageOps.pad(im, (base_size, base_size), color=pad_color)
         images_ori = transform(global_view)
+        # Reference `infer`: images that already fit in the local view size use a
+        # single global view (crop_ratio [1,1]); larger images go through
+        # `dynamic_preprocess`.
+        if w > image_size or h > image_size:
+            dp = reference_dynamic_preprocess(model)
+            assert dp is not None, "cannot access the reference dynamic_preprocess"
+            images_crop_raw, crop_ratio = dp(im)
+            images_crop_list = [transform(c) for c in images_crop_raw]
     else:
         sq = im.resize((image_size, image_size))
         global_view = ImageOps.pad(sq, (image_size, image_size), color=pad_color)
         images_ori = transform(global_view)
-    images_crop = np.zeros((1, 3, base_size, base_size), dtype=np.float32)
+    if images_crop_list:
+        images_crop = np.stack(images_crop_list).astype(np.float32)
+    else:
+        images_crop = np.zeros((1, 3, base_size, base_size), dtype=np.float32)
+
+    width_crop_num, height_crop_num = int(crop_ratio[0]), int(crop_ratio[1])
+    manifest["crop_ratio"] = [width_crop_num, height_crop_num]
+    manifest["num_local_crops"] = len(images_crop_list)
 
     # token layout
     patch_size, downsample_ratio = 16, 4
@@ -288,6 +328,9 @@ def run_ocr(args, model):
         if crop_mode:
             img = ([image_token_id] * num_queries_base + [image_token_id]) * num_queries_base
             img += [image_token_id]
+            if width_crop_num > 1 or height_crop_num > 1:
+                img += ([image_token_id] * (num_queries * width_crop_num) + [image_token_id]) * (
+                    num_queries * height_crop_num)
         else:
             img = ([image_token_id] * num_queries + [image_token_id]) * num_queries
             img += [image_token_id]
@@ -389,6 +432,7 @@ def run_ocr(args, model):
     with open(os.path.join(out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
     print(f"[ocr] ids={len(ids)} visual_tokens={visual.shape[0]} "
+          f"crop_ratio=({width_crop_num},{height_crop_num}) local_crops={len(images_crop_list)} "
           f"prefill_tok={steps[0]['token'] if steps else -1} -> {out}/manifest.json")
 
 
@@ -407,6 +451,8 @@ def main():
     ap.add_argument("--no-crop-mode", dest="crop_mode", action="store_false")
     ap.add_argument("--ocr-width", type=int, default=500)
     ap.add_argument("--ocr-height", type=int, default=400)
+    ap.add_argument("--image-file", default="",
+                    help="real image for --mode ocr (overrides --ocr-width/--ocr-height)")
     ap.add_argument("--ngram-size", type=int, default=0)
     ap.add_argument("--ngram-window", type=int, default=0)
     args = ap.parse_args()

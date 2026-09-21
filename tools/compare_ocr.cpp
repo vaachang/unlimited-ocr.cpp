@@ -60,11 +60,12 @@ std::vector<int> load_i32(const std::string& dir, const json& e) {
     return out;
 }
 
-void report(const std::string& name, const std::vector<float>& a, const std::vector<float>& b,
-            bool print = true) {
+// Prints the comparison and returns the relative L2 error (or -1 on size mismatch).
+double report(const std::string& name, const std::vector<float>& a, const std::vector<float>& b,
+              bool print = true) {
     if (a.size() != b.size()) {
         std::printf("%-22s SIZE MISMATCH ours=%zu ref=%zu\n", name.c_str(), a.size(), b.size());
-        return;
+        return -1.0;
     }
     double max_abs = 0, num = 0, den = 0;
     std::size_t top1_ours = 0, top1_ref = 0;
@@ -77,10 +78,12 @@ void report(const std::string& name, const std::vector<float>& a, const std::vec
         if (a[i] > best_o) { best_o = a[i]; top1_ours = i; }
         if (b[i] > best_r) { best_r = b[i]; top1_ref = i; }
     }
+    const double rel = den > 0 ? std::sqrt(num / den) : std::sqrt(num);
     if (print)
         std::printf("%-22s max_abs=%.6g rel_l2=%.6g top1(ours=%zu ref=%zu)%s\n", name.c_str(), max_abs,
-                    den > 0 ? std::sqrt(num / den) : std::sqrt(num), top1_ours, top1_ref,
+                    rel, top1_ours, top1_ref,
                     top1_ours == top1_ref ? "" : "  <-- TOP1 DIFF");
+    return rel;
 }
 
 std::vector<std::string> split_on(const std::string& s, const std::string& sep) {
@@ -103,6 +106,9 @@ int main(int argc, char** argv) {
     bool gpu_vision = false;
     bool gpu = false;
     bool int4 = false;
+    bool strict = false;
+    double visual_tol = 0.15;   // bf16/f32 drift is ~0.06
+    double logits_tol = 0.15;
     int int4_group = 128;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--model") && i + 1 < argc) model_dir = argv[++i];
@@ -110,6 +116,11 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--gpu-vision")) gpu_vision = true;
         else if (!std::strcmp(argv[i], "--gpu")) gpu = true;
         else if (!std::strcmp(argv[i], "--int4")) int4 = true;
+        else if (!std::strcmp(argv[i], "--strict")) strict = true;
+        else if (!std::strcmp(argv[i], "--visual-tol") && i + 1 < argc)
+            visual_tol = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "--logits-tol") && i + 1 < argc)
+            logits_tol = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--int4-group") && i + 1 < argc)
             int4_group = std::atoi(argv[++i]);
     }
@@ -200,7 +211,7 @@ int main(int argc, char** argv) {
 
     std::vector<float> visual = engine->image_embeddings(image, crop_mode);
     std::vector<float> ref_visual = load_f32(ref_dir, T.at("visual_scattered"));
-    report("visual_embeddings", visual, ref_visual);
+    const double visual_rel = report("visual_embeddings", visual, ref_visual);
     std::printf("num_visual_tokens      : ours=%d ref=%d\n", static_cast<int>(visual.size() / cfg.hidden_size),
                 manifest.at("num_visual_tokens").get<int>());
 
@@ -228,7 +239,7 @@ int main(int argc, char** argv) {
         engine->decoder().prefill_embeds(cache, inputs, our_logits);
     }
     std::vector<float> ref_logits = load_f32(ref_dir, T.at("prefill_logits"));
-    report("prefill_logits", our_logits, ref_logits);
+    const double logits_rel = report("prefill_logits", our_logits, ref_logits);
 
     // ---- 5. greedy decode (with optional no-repeat-ngram processor) ----
     const json& steps = manifest.at("decode_steps");
@@ -262,13 +273,13 @@ int main(int argc, char** argv) {
         cur_logits = std::move(next_logits);
         ++pos;
     }
-    double vnum = 0, vden = 0;
-    for (std::size_t i = 0; i < visual.size(); ++i) {
-        const double e = visual[i] - ref_visual[i];
-        vnum += e * e;
-        vden += static_cast<double>(ref_visual[i]) * ref_visual[i];
-    }
-    std::printf("\nsummary: layout=%s visual_rel_l2=%.4g greedy=%d/%d\n", layout_ok ? "OK" : "BAD",
-                std::sqrt(vnum / std::max(vden, 1e-30)), token_matches, token_total);
-    return 0;
+    const bool greedy_ok = token_total > 0 && token_matches == token_total;
+    const bool visual_ok = visual_rel >= 0.0 && visual_rel <= visual_tol;
+    const bool logits_ok = logits_rel >= 0.0 && logits_rel <= logits_tol;
+    const bool ok = layout_ok && greedy_ok && visual_ok && logits_ok;
+    std::printf("\nsummary: layout=%s visual_rel_l2=%.4g (tol %.3g) prefill_rel_l2=%.4g (tol %.3g) "
+                "greedy=%d/%d -> %s\n",
+                layout_ok ? "OK" : "BAD", visual_rel, visual_tol, logits_rel, logits_tol,
+                token_matches, token_total, ok ? "PASS" : "FAIL");
+    return (strict && !ok) ? 1 : 0;
 }

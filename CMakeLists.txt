@@ -188,10 +188,15 @@ if(ENGINE_BUILD_TOOLS AND ENGINE_REFERENCE_DIR AND ENGINE_BUILD_TESTS)
              COMMAND compare_vision --model ${CMAKE_SOURCE_DIR}/models --ref ${_ref}/ref_vision)
     set_tests_properties(compare_vision PROPERTIES ENVIRONMENT "OMP_NUM_THREADS=8")
     add_test(NAME compare_ocr
-             COMMAND compare_ocr --model ${CMAKE_SOURCE_DIR}/models --ref ${_ref}/ref_ocr)
+             COMMAND compare_ocr --model ${CMAKE_SOURCE_DIR}/models --ref ${_ref}/ref_ocr --strict)
     set_tests_properties(compare_ocr PROPERTIES ENVIRONMENT "OMP_NUM_THREADS=8")
+    # Multi-crop path (>640px input, Gundam dynamic_preprocess grid).  Guards the
+    # layout / visual-assembly / interpolation code against silent regressions.
+    add_test(NAME compare_ocr_large
+             COMMAND compare_ocr --model ${CMAKE_SOURCE_DIR}/models --ref ${_ref}/ref_ocr_large --strict)
+    set_tests_properties(compare_ocr_large PROPERTIES ENVIRONMENT "OMP_NUM_THREADS=8")
     set_tests_properties(compare_reference compare_tokenizer compare_layout compare_image
-                         compare_vision compare_ocr PROPERTIES LABELS reference)
+                         compare_vision compare_ocr compare_ocr_large PROPERTIES LABELS reference)
 endif()
 
 message(STATUS "-------------------------------------------------------------")

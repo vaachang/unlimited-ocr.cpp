@@ -22,7 +22,8 @@
   bf16 TC GEMM）、P3（cp.async 流水线 TC GEMM、DeepEncoder CUDA 移植、**grouped INT4
   专家 GEMM + device router**、**device embedding 查表**、**INT4 量化并行加载**、
   **视觉 split-bf16 TC GEMM + relpos 因式分解**、**视觉 tensor-core flash attention**）
-  均已完成（2.6 分析后判定不适用/不实现，见该节）。**约 97–98%**（对照 `prj.md`）。
+  均已完成（2.6 分析后判定不适用/不实现，见该节）。**约 98%**（对照 `prj.md`；
+  仅剩 2.7 精度评测/2.8 profiling 受外部工具与权限限制，2.14 为纯性能项）。
 - **入口/可用性**：新增独立 CLI `tools/ocr_image`（`--image page.png` → 打印识别文本，
   默认 CUDA + GPU 视觉 + **BF16 专家**；`--cpu`/`--int4`/`--no-crop-mode` 可选；图片支持
   PNG（libpng）与 PPM）。`EngineConfig::use_int4_experts` 默认改为 **false（BF16）**，
@@ -35,10 +36,16 @@
   `image_embeddings` 计数互相校验。验证：800×400 多 crop 参考 visual rel_l2
   **0.057**、prefill 0.024、greedy **16/16**；1×1 参考对齐不变（0.0418、24/24）；
   `uocr_tests` **27/27**。现在 **>640px 图片可直接用默认 crop mode**。
+- **多 crop 回归入库（2.13，2026-09-21）**：`export_reference.py --mode ocr` 支持
+  `--image-file` 与参考自身 `dynamic_preprocess`；`compare_ocr --strict` 作为回归判定；
+  CTest 注册 `compare_ocr`（1×1）与 `compare_ocr_large`（800×400，(2,1) 双 crop），
+  两条均 **Passed**。真实 800×1000 页面（4×5=20 crop，2323 visual tokens）经
+  `ocr_image` 识别正确。
+- **可用性**：新增根目录 `README.md`（构建 / 权重 / 用法 / 对齐 / 目录结构入口）。
 - **回归**：`ocr_image` 在参考图上与 PyTorch 参考输出**逐字一致**；`compare_ocr`
-  greedy **24/24**（CPU/f32 与 **CUDA/BF16+GPU vision** 两条路径）；`uocr_tests`
-  **27/27**（含 PNG/PPM 图像加载 + 多尺寸布局/异常校验回归）；`uocr_cuda_tests`
-  **全过**；`compare_vision_gpu_selftest` **全过**。
+  greedy **24/24**（CPU/f32 与 **CUDA/BF16+GPU vision** 两条路径），多 crop
+  16/16（见上）；`uocr_tests` **27/27**（含 PNG/PPM 图像加载 + 多尺寸布局/异常校验
+  回归）；`uocr_cuda_tests` **全过**；`compare_vision_gpu_selftest` **全过**。
   **INT4（group-128 RTN）** 端到端与参考分叉（top-1 翻转、0/24），CPU/INT4 与
   CUDA/INT4 **完全一致**，属量化精度问题（见 2.11 / `ALIGNMENT.md` §5.2），故默认
   不再用 INT4。
@@ -76,8 +83,9 @@ ctest --test-dir build-cuda --output-on-failure
 > 1. ✅ **2.12 可用性修复**：`UOCR_THROW` 补 `throw`；`Engine::image_crops` 统一多 crop
 >    布局/视觉；视觉 SAM `pos_embed`/`rel_pos` 对非 1024 输入插值。>640px 图片默认
 >    crop mode 现已可用（见 §1、`PITFALLS.md` §21）。
-> 2. 🔶 **2.13 多 crop 参考回归入库**：把临时导出脚本固化进 `export_reference.py`，
->    导出 `ref_ocr_large` 并注册 CTest，防多尺寸路径回归。**建议下一步做**。
+> 2. ✅ **2.13 多 crop 参考回归入库**（2026-09-21 完成）：`export_reference.py --mode ocr`
+>    支持 `--image-file` 与参考自身的 `dynamic_preprocess`；`compare_ocr` 增加 `--strict`
+>    回归判定；注册 `compare_ocr_large` CTest（800×400，(2,1) 双 crop）。
 > 3. 🔶 **2.7 精度评测**：本地量化消融已做；OmniDocBench 待外部工具链（Docker/
 >    TeX Live）。真正 AWQ/GPTQ 需校准前向，**先确认**。
 > 4. 2.14 **BF16 专家 ragged prefill** 仍走 host 逐专家路径（可加 grouped BF16 内核）；
@@ -108,17 +116,25 @@ ctest --test-dir build-cuda --output-on-failure
   `gpu_encoder.cu`、`tools/{ocr_image,compare_ocr}.cpp`、`tests/test_image.cpp`。
   细节见 `PITFALLS.md` §21。
 
-### 🔶 2.13 多 crop 参考回归入库（下一步，2026-09-21）
+### ✅ 2.13 多 crop 参考回归入库（2026-09-21 完成）
 
-- **目标**：把本轮用于验证的临时导出流程固化进仓库与 CTest，防止多尺寸/多 crop
-  路径再次静默回归（本轮两个 bug 正是因为没有覆盖多 crop 的参考回归）。
-- **方案**：扩展 `tools/reference/export_reference.py --mode ocr`：支持任意
-  `--image-file` 与 `dynamic_preprocess`（按 `infer` 生成 crop 比例、`images_crop`、
-  token 布局），导出 `ref_ocr_large`；在 `CMakeLists.txt` 的
-  `ENGINE_REFERENCE_DIR` 分支注册 `compare_ocr`（多 crop ref）。`compare_ocr` 已改为
-  用 `engine->image_crops()` 构建布局，可直接复用。
-- **验收**：注册后 CTest 通过；多 crop visual rel_l2 ≤6e-4（当前 0.057）、greedy 全中。
-- **涉及**：`tools/reference/export_reference.py`、`CMakeLists.txt`、`ALIGNMENT.md`。
+- **已做**：
+  1. `tools/reference/export_reference.py --mode ocr` 支持 `--image-file`，并用**参考
+     模型自身的 `dynamic_preprocess`**（`importlib` 取 `modeling_unlimitedocr` 同款
+     函数，保证切图网格/平局规则逐位一致）生成 `images_crop`、`crop_ratio` 与多 crop
+     token 布局。
+  2. `tools/compare_ocr` 增加 `--strict`（默认容差 visual/prefill rel_l2 ≤0.15、
+     greedy 全中）；不达标退出码非 0，并顺带修掉原 summary 里 `ref_visual` 越界读的
+     隐患（改为复用 `report()` 的返回值）。
+  3. `CMakeLists.txt` 在 `ENGINE_REFERENCE_DIR` 分支注册 `compare_ocr_large`
+     （`ref_ocr_large`，800×400，crop_ratio `(2,1)`，488 ids / 483 visual），两条
+     `compare_ocr` 测试都加 `--strict`。
+- **验收**：导出 800×400 → `ids=488 visual_tokens=483 crop_ratio=(2,1) local_crops=2`；
+  CTest `compare_ocr`（1×1，24/24）与 `compare_ocr_large`（多 crop，16/16）均
+  **Passed**；CUDA/GPU vision 直跑：多 crop visual rel_l2 **0.0572**、prefill
+  **0.0241**、greedy **16/16**；`--strict --visual-tol 0.001` 能正确 FAIL(exit 1)。
+- **涉及**：`tools/reference/export_reference.py`、`tools/compare_ocr.cpp`、
+  `CMakeLists.txt`、`README.md`、`ALIGNMENT.md` §5.3。
 
 ### ✅ 2.1 高性能 TC GEMM 重写（2026-09-20 完成）
 

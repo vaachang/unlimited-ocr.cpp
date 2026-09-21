@@ -249,7 +249,12 @@ OMP_NUM_THREADS=8 ./build/tools/compare_ocr --model models --ref /tmp/opencode/r
   统一布局/视觉 crop；`image_embeddings` 多 crop 拼接按参考重写；SAM
   `pos_embed`/`rel_pos` 对非 1024 输入插值）。修复后误差与 1×1 路径同量级
   （0.057 vs 0.042），属 bf16/f32 正常漂移。
-- **该参考尚未入库**（临时目录），入库为任务 2.13。
+- **已入库（2.13，2026-09-21）**：`export_reference.py --mode ocr` 现支持 `--image-file`
+  与参考自身的 `dynamic_preprocess`；`compare_ocr --strict` 作为回归判定；CTest 注册
+  `compare_ocr_large`。复核（CUDA/BF16+GPU vision）：
+  `ids=488 / mask=483 / crop_ratio=(2,1) / local_crops=2`，visual rel_l2 **0.0572**、
+  prefill rel_l2 **0.0241**、greedy **16/16**；`ctest -R compare_ocr` 两条均 Passed
+  （`--strict` 下 `--visual-tol 0.001` 会正确 FAIL，证明判定有效）。
 
 ## 6. R-SWA 环形覆写验证（P1，已完成）
 
