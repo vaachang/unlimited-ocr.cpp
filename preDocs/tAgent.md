@@ -83,21 +83,39 @@ ctest --test-dir build-cuda --output-on-failure
 
 按收益/成本排序。每项给出目标、方案、验收与涉及文件；完成后在本文档勾掉并更新 §1。
 
-> **下一步优先级（2026-09-21，更新）**：
-> 1. ✅ **2.12 可用性修复**：`UOCR_THROW` 补 `throw`；`Engine::image_crops` 统一多 crop
->    布局/视觉；视觉 SAM `pos_embed`/`rel_pos` 对非 1024 输入插值。>640px 图片默认
->    crop mode 现已可用（见 §1、`PITFALLS.md` §21）。
-> 2. ✅ **2.13 多 crop 参考回归入库**（2026-09-21 完成）：`export_reference.py --mode ocr`
->    支持 `--image-file` 与参考自身的 `dynamic_preprocess`；`compare_ocr` 增加 `--strict`
->    回归判定；注册 `compare_ocr_large` CTest（800×400，(2,1) 双 crop）。
-> 3. 🔶 **2.7 精度评测**：本地量化消融已做；OmniDocBench 待外部工具链（Docker/
->    TeX Live）。真正 AWQ/GPTQ 需校准前向，**先确认**。
-> 4. 2.14 **BF16 专家 ragged prefill** 仍走 host 逐专家路径（可加 grouped BF16 内核）；
->    `rswa_attn_ragged`（B=16 ~21ms）可优化。
-> 5. ⛔ **2.6 Prefill KV 分区**：分析后判定与参考不兼容且本负载无 gap，**不实现**。
-> 6. 2.8 受 ncu 权限限制（nsys 可用）。
+> **下一阶段计划（2026-09-21 收尾后）**：项目已判定**可用、完整**（见 §1）。
+> 以下为后续 **可选 / 受外部条件限制** 的工作，按收益/成本排序；开工前先确认范围。
 >
-> 以下 ✅/🔶 是 2026-09-20/21 的完成快照。✅ 已完成；🔶 部分完成；⛔ 分析后不实现。
+> 1. **2.14 BF16 grouped ragged prefill（性能，首选）**
+>    - 现状：默认 `use_int4_experts=false`，BF16 大批量 ragged prefill 仍走
+>      host router D2H + 逐专家 `linear_forward`（每层 64×3 次 launch）。
+>    - 方案：仿 `moe_grouped_gate_up_int4` / `moe_grouped_down_int4`，新增
+>      `moe_grouped_gate_up_bf16` / `moe_grouped_down_bf16`（gate+up+SiLU 融合、down
+>      scatter-add，各一次 launch，读 device grouping 表；权重 bf16，激活走
+>      `matmul_t_split_bf16` 或等价 TC 路径）。`forward_ragged` 里 BF16 也走 grouped。
+>    - 验收：整波 prefill（16 请求）**165ms → ≤120ms**、B=16 吞吐 **≥550 tok/s**；
+>      `test_rswa_cuda.cu` 新增 grouped-BF16 vs host 回归 rel_l2 同量级；greedy 不变。
+>    - 涉及：`src/kernels/cuda/moe_device.cu`（或新 `moe_gemm_bf16.cu`）、
+>      `include/uocr/cuda_ops.h`、`src/engine/gpu_decoder.cu`、`tests/test_rswa_cuda.cu`、
+>      `BENCHMARKS.md`。
+> 2. **2.7 精度评测（OmniDocBench v1.6）** — 需外部工具链，**安装前必须先征得同意**。
+>    - 依赖：官方 Docker 镜像 `ghcr.io/zeng-weijun/omnidocbench-eval:repro-ubuntu2204`
+>      （或本机 TeX Live 2025 + ImageMagick 7 + Ghostscript + Python 3.10，~7GB+）。
+>    - 接入后按 `configs/end2end.yaml` 出 text Edit / TEDS / CDM 综合分；本机当前无
+>      Docker，该项未接入。
+> 3. **真正的 AWQ / GPTQ 量化** — 依赖校准前向（可用 2.7 数据或自建校准集）。
+>    当前 `quantize_int4_awq` 实为 group-wise RTN（权重误差 ~10%、端到端 logits ~0.36，
+>    top-1 翻转），改用激活感知 per-channel scaling 预计降到 ~3–5%，INT4 端到端才有意义。
+>    涉及 `src/runtime/quant.cpp`、`weights.cpp`。
+> 4. **2.8 profiling 补全（受限）** — 本机 `ncu` 报 `ERR_NVGPUCTRPERM`（PITFALLS §17），
+>    只能用 `nsys` + 消融；需要 SM/DRAM 峰值利用率时先解决权限。
+> 5. **非阻塞优化**：`rswa_attn_ragged`（B=16 ~21ms，grouped 之后的第二大头）；
+>    整栈 CUDA Graph（encoder+cache 一起捕获）；视觉 GEMM cp.async；单请求 prefill
+>    的 host embedding gather。
+> 6. ⛔ **2.6 Prefill KV 分区**：分析后判定与参考实现不兼容、且本负载 `V+W>P` 无
+>    可丢弃 gap，**不实现**（见该节）。
+>
+> 以下 ✅/🔶/⛔ 是 2026-09-20/21 的完成快照。✅ 已完成；🔶 部分完成；⛔ 分析后不实现。
 
 ### ✅ 2.12 可用性修复：异常校验 + 多 crop 端到端（2026-09-21 完成）
 

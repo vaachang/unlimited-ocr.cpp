@@ -65,7 +65,7 @@ unlimited-ocr.cpp/
 ✅ 可编译骨架（CPU + CUDA 双后端，sm_120）
 ✅ CPU 参考实现（R-SWA / MoE / 调度 / 分词 / 视觉编码器）
 ✅ CUDA 内核（R-SWA attention / INT4 MoE GEMM / RMSNorm / RoPE）
-✅ 单元测试 20/20（CPU）；uocr_cuda_tests 全过
+✅ 单元测试 27/27（CPU）；uocr_cuda_tests、compare_vision_gpu_selftest 全过
 ✅ 真实权重 mmap 加载验证
 ✅ 基准测试可运行
 ✅ PyTorch 参考环境（.venv, torch 2.10+cu128, transformers 4.57.1）
@@ -86,7 +86,26 @@ unlimited-ocr.cpp/
 ✅ 权重加载：INT4 量化 OpenMP 并行（真实模型加载 20.5→7.4s；P3）
 ✅ 多尺寸可用性：修复 `UOCR_CHECK` 静默失效、多 crop 布局/视觉不一致、视觉编码器非 1024 输入的 SAM pos/relpos 插值；>640px 图片默认 crop mode 可用（P3）
 ✅ 多 crop 参考回归入库：`export_reference.py` 用参考 `dynamic_preprocess` + `--image-file`；`compare_ocr --strict`；CTest `compare_ocr_large`（P3，2.13）
+✅ 根目录 `README.md`（构建 / 权重 / 用法 / 对齐 / 目录结构）
 ```
+
+### 3.1 收尾验证快照（2026-09-21，全绿）
+
+在真实 `baidu/Unlimited-OCR` 权重 + RTX 5060 Ti 上复核：
+
+| 验证项 | 结果 |
+|---|---|
+| CUDA Release 构建（`-DENGINE_BACKEND=CUDA`） | ✅ |
+| CPU 参考构建（`-DENGINE_BACKEND=CPU`） | ✅ |
+| `uocr_tests` | ✅ **27/27** |
+| `uocr_cuda_tests` / `compare_vision_gpu_selftest` | ✅ |
+| `compare_ocr --strict`（1×1，`ref_ocr`） | ✅ greedy **24/24**，visual rel_l2 0.0418、prefill 0.0596 → PASS |
+| `compare_ocr --strict`（多 crop，`ref_ocr_large` 800×400） | ✅ greedy **16/16**，visual rel_l2 0.0572、prefill 0.0241 → PASS |
+| `--strict` 判定有效性 | ✅ `--visual-tol 0.001` 时正确 FAIL（exit 1） |
+| `ocr_image` 真实 800×1000 页面 | ✅ 逐字正确（4×5=20 crop，2323 visual tokens） |
+
+> 结论：项目判定为**可用、完整**，本轮不再改功能代码。后续可选/受限项见
+> `tAgent.md` §2「下一阶段计划」（2.14 性能、2.7 外部工具链、AWQ/GPTQ、2.8 profiling）。
 
 ## 4. 开发历程
 
