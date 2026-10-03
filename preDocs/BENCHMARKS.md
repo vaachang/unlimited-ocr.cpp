@@ -396,6 +396,43 @@ prefill **43 / 49 / 59 / 81 / 121 ms**、B=16 **489.7 tok/s**（与 §2.10 的 1
 2 层 8 专家 top-2），相对逐请求 host 路径 worst **rel_l2 0.0016**、`grouped=1`，
 与 INT4 grouped 用例同量级。
 
+## 2.15 激活感知 INT4（GPTQ）量化（2026-10-03，`bench/quant_gptq_compare.txt`）
+
+`tools/reference/quantize_gptq.py` 用参考模型校准前向（8×512 文本 + 1 张真实文字图）
+收集每层 MoE 输入二阶矩，跑 block-wise GPTQ（group-wise 非对称仿射，与引擎一致），
+写出引擎可直接加载的 `packed(U8)/scales(F32)/zeros(F32)` safetensors（约 1.8 GB @ g32）。
+命令：
+
+```bash
+.venv/bin/python tools/reference/quantize_gptq.py --model models \
+    --out models/int4_gptq_g32.safetensors --group 32 \
+    --calib-text models/Unlimited-OCR/README.md --images page.png
+./build-cuda/tools/ocr_image --model models --image page.png \
+    --int4 --int4-quant models/int4_gptq_g32.safetensors
+```
+
+真实文字图（1000×500）端到端对比（`compare_ocr --gpu --gpu-vision --strict`，
+参考由 `export_reference.py --mode ocr --image-file` 导出）：
+
+| 配置 | prefill logits rel_l2 | top-1 | greedy | 实际 OCR |
+|---|---|---|---|---|
+| BF16 | **0.0345** | ✓ | **24/24** | 正确 |
+| INT4 g128 RTN | 0.3538 | ✗ | 0/24 | 乱码 |
+| INT4 g32 RTN | 0.3577 | ✓ | **23/24** | 与 BF16 一致 |
+| INT4 g32 GPTQ | 0.3045 | ✓ | 3/24 | 内容正确 |
+| INT4 g128 GPTQ | 0.3538 | ✓ | 3/24 | 内容基本正确 |
+
+- **logits L2**：GPTQ g32 比 RTN g32 低 15%（0.358→0.305）；单矩阵激活加权误差
+  −20%（0.097→0.077）。`inspect_model --quant-check --int4-quant <file>` 可复核加载
+  后的权重 rel-L2（g32：RTN 0.081 / GPTQ 0.101——GPTQ 用权重误差换输出误差）。
+- **greedy 是脆弱指标**：`compare_ocr` 逐步回填自己的 token，一次早期 top-1 翻转即
+  级联；GPTQ 优化平均输出，不保证 argmax，故该指标反而差。带 `no-repeat-ngram` 的
+  实际 `ocr_image` 输出两种 group=32 都对。
+- **默认改动**：`EngineConfig::int4_group_size` 128→**32**；`--int4` 默认走 g32 RTN
+  （24/24→23/24、OCR 输出与 BF16 一致）；activation-aware 用 `--int4-quant` 显式启用。
+- 备注：`quantize_gptq.py` 的 group 存在 safetensors 元数据里，加载时自动采用，无需
+  再传 `--int4-group`。
+
 ## 3. 回归快照
 
 数值对齐的方法、逐项结果与根因分析统一记录在 **`ALIGNMENT.md`**（端到端 OCR

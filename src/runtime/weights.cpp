@@ -5,6 +5,8 @@
 #include <cstring>
 #include <random>
 
+#include <nlohmann/json.hpp>
+
 #include "uocr/log.h"
 #include "uocr/ops.h"
 
@@ -124,21 +126,54 @@ std::vector<float> vec_f32(const SafetensorsFile& st, const std::string& name) {
     return st.read_f32(name);
 }
 
-WeightMatrix make_quantized(const SafetensorsFile& st, const std::string& name, int group) {
-    std::vector<float> tmp = st.read_f32(name);
+WeightMatrix make_quantized(const SafetensorsFile& st, const SafetensorsFile* qst,
+                            const std::string& name, int group) {
     const auto& in = st.info(name);
     UOCR_CHECK(in.shape.size() == 2, "expected 2-D tensor: " + name);
     WeightMatrix w;
     w.rows = static_cast<int>(in.shape[0]);
     w.cols = static_cast<int>(in.shape[1]);
     w.fmt = WeightFormat::INT4;
+
+    // Pre-quantized (activation-aware GPTQ) tensors when available: same packed
+    // layout, but the values were chosen with calibration activations.
+    if (qst != nullptr && qst->contains(name + ".packed")) {
+        // The quantizer stores its group size in the file metadata; it is
+        // authoritative (the caller's `group` is only a fallback).
+        int file_group = group;
+        auto mit = qst->metadata().find("uocr_int4");
+        if (mit != qst->metadata().end()) {
+            try {
+                auto j = nlohmann::json::parse(mit->second);
+                if (j.contains("group")) file_group = j.at("group").get<int>();
+            } catch (const std::exception&) {
+                // fall back to the caller-provided group
+            }
+        }
+        w.q.rows = w.rows;
+        w.q.cols = w.cols;
+        w.q.group_size = file_group;
+        w.q.packed = qst->read_u8(name + ".packed");
+        w.q.scales = qst->read_f32(name + ".scales");
+        w.q.zeros = qst->read_f32(name + ".zeros");
+        const std::size_t ng = w.q.n_groups();
+        UOCR_CHECK(w.q.packed.size() == static_cast<std::size_t>(w.rows) * ((w.cols + 1) / 2),
+                   "packed shape mismatch for " + name);
+        UOCR_CHECK(w.q.scales.size() == static_cast<std::size_t>(w.rows) * ng &&
+                       w.q.zeros.size() == static_cast<std::size_t>(w.rows) * ng,
+                   "scales/zeros shape mismatch for " + name);
+        return w;
+    }
+
+    std::vector<float> tmp = st.read_f32(name);
     w.q = quantize_int4_awq(tmp.data(), w.rows, w.cols, group);
     return w;
 }
 
-Linear load_linear(const SafetensorsFile& st, const std::string& name, bool quantize, int group) {
+Linear load_linear(const SafetensorsFile& st, const SafetensorsFile* qst, const std::string& name,
+                   bool quantize, int group) {
     Linear l;
-    l.weight = quantize ? make_quantized(st, name, group) : view_bf16(st, name);
+    l.weight = quantize ? make_quantized(st, qst, name, group) : view_bf16(st, name);
     return l;
 }
 
@@ -160,10 +195,21 @@ Linear random_linear(int out, int in, std::mt19937& rng) {
 }  // namespace
 
 DecoderWeights DecoderWeights::load(const std::string& path, const ModelConfig& cfg,
-                                    bool quantize_experts_int4, int int4_group_size) {
+                                    bool quantize_experts_int4, int int4_group_size,
+                                    const std::string& int4_quant_file) {
     DecoderWeights d;
     d.checkpoint = std::make_shared<SafetensorsFile>(path);
     const SafetensorsFile& st = *d.checkpoint;
+
+    // Optional activation-aware (GPTQ) expert weights; the quantized bytes are
+    // copied into each WeightMatrix, so the file can be closed on return.
+    std::unique_ptr<SafetensorsFile> qcheckpoint;
+    const SafetensorsFile* qst = nullptr;
+    if (quantize_experts_int4 && !int4_quant_file.empty()) {
+        qcheckpoint = std::make_unique<SafetensorsFile>(int4_quant_file);
+        qst = qcheckpoint.get();
+        UOCR_INFO("using pre-quantized INT4 experts from %s", int4_quant_file.c_str());
+    }
 
     d.embed_tokens = view_bf16(st, "model.embed_tokens.weight");
     d.lm_head = st.contains("lm_head.weight") ? view_bf16(st, "lm_head.weight")
@@ -189,9 +235,9 @@ DecoderWeights DecoderWeights::load(const std::string& path, const ModelConfig& 
 
         L.is_moe = i >= cfg.first_k_dense_replace;
         if (!L.is_moe) {
-            L.dense.gate = load_linear(st, p + "mlp.gate_proj.weight", false, int4_group_size);
-            L.dense.up = load_linear(st, p + "mlp.up_proj.weight", false, int4_group_size);
-            L.dense.down = load_linear(st, p + "mlp.down_proj.weight", false, int4_group_size);
+            L.dense.gate = load_linear(st, qst, p + "mlp.gate_proj.weight", false, int4_group_size);
+            L.dense.up = load_linear(st, qst, p + "mlp.up_proj.weight", false, int4_group_size);
+            L.dense.down = load_linear(st, qst, p + "mlp.down_proj.weight", false, int4_group_size);
         } else {
             L.router = view_bf16(st, p + "mlp.gate.weight");
             L.experts.resize(cfg.n_routed_experts);
@@ -205,16 +251,16 @@ DecoderWeights DecoderWeights::load(const std::string& path, const ModelConfig& 
             for (int e = 0; e < cfg.n_routed_experts; ++e) {
                 const std::string ep = p + "mlp.experts." + std::to_string(e) + ".";
                 L.experts[e].gate =
-                    load_linear(st, ep + "gate_proj.weight", quantize_experts_int4, int4_group_size);
+                    load_linear(st, qst, ep + "gate_proj.weight", quantize_experts_int4, int4_group_size);
                 L.experts[e].up =
-                    load_linear(st, ep + "up_proj.weight", quantize_experts_int4, int4_group_size);
+                    load_linear(st, qst, ep + "up_proj.weight", quantize_experts_int4, int4_group_size);
                 L.experts[e].down =
-                    load_linear(st, ep + "down_proj.weight", quantize_experts_int4, int4_group_size);
+                    load_linear(st, qst, ep + "down_proj.weight", quantize_experts_int4, int4_group_size);
             }
             const std::string sp = p + "mlp.shared_experts.";
-            L.shared.gate = load_linear(st, sp + "gate_proj.weight", false, int4_group_size);
-            L.shared.up = load_linear(st, sp + "up_proj.weight", false, int4_group_size);
-            L.shared.down = load_linear(st, sp + "down_proj.weight", false, int4_group_size);
+            L.shared.gate = load_linear(st, qst, sp + "gate_proj.weight", false, int4_group_size);
+            L.shared.up = load_linear(st, qst, sp + "up_proj.weight", false, int4_group_size);
+            L.shared.down = load_linear(st, qst, sp + "down_proj.weight", false, int4_group_size);
         }
         UOCR_DEBUG("loaded layer %d", i);
     }

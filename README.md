@@ -69,6 +69,24 @@ models/
 ./build-cuda/benchmarks/bench_cuda_batch --real --int4 --prompt 64 --steps 16 --max-batch 16
 ```
 
+## INT4 激活感知量化（可选，省显存）
+
+默认专家权重为 **BF16**（精度最高）。需要把显存从 ~10.4GB 降到 ~3.4GB 时可用 INT4：
+
+- **group=32 RTN**（`--int4`，默认 group 已改为 32）：`ocr_image` 输出与 BF16 基本
+  一致（`compare_ocr` greedy 23/24）；group=128 会端到端发散。
+- **activation-aware GPTQ**：先用参考模型校准、量化，再让引擎加载（推荐）：
+  ```bash
+  .venv/bin/python tools/reference/quantize_gptq.py --model models \
+      --out models/int4_gptq_g32.safetensors --group 32 \
+      --calib-text models/Unlimited-OCR/README.md --images page.png
+  ./build-cuda/tools/ocr_image --model models --image page.png \
+      --int4 --int4-quant models/int4_gptq_g32.safetensors
+  ```
+  GPTQ 用校准激活统计降低误差：prefill logits rel_l2 0.358→**0.305**、单矩阵激活
+  加权误差 −20%，实际 OCR 内容正确。数据见 `preDocs/BENCHMARKS.md` §2.15、
+  `preDocs/ALIGNMENT.md` §5.4。
+
 ## 与 PyTorch 参考对齐
 
 参考张量由 `tools/reference/export_*.py`（`.venv` 中的 PyTorch）导出，随后作为 CTest

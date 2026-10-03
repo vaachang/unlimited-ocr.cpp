@@ -7,6 +7,7 @@
 // checkpoints can be inspected without copying.
 
 #include <cstddef>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -40,8 +41,14 @@ public:
     std::size_t file_size() const { return file_size_; }
     const std::string& path() const { return path_; }
 
+    // Top-level `__metadata__` string map (empty when absent).
+    const std::map<std::string, std::string>& metadata() const { return metadata_; }
+
     // Decode a tensor to row-major float32.
     std::vector<float> read_f32(const std::string& name) const;
+
+    // Raw byte view of a U8/I8 tensor (e.g. packed INT4 weights) copied out.
+    std::vector<std::uint8_t> read_u8(const std::string& name) const;
 
 private:
     std::string path_;
@@ -50,6 +57,7 @@ private:
     std::size_t data_start_ = 0;
     std::unordered_map<std::string, Info> tensors_;
     std::vector<std::string> names_;
+    std::map<std::string, std::string> metadata_;
 };
 
 }  // namespace uocr

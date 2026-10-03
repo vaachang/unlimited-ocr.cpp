@@ -1,0 +1,17 @@
+loading models (bf16, cuda)...
+`torch_dtype` is deprecated! Use `dtype` instead!
+Some weights of UnlimitedOCRForCausalLM were not initialized from the model checkpoint at models and are newly initialized: ['model.vision_model.embeddings.position_ids']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+calibrating on 9 cases...
+  layer 1 done
+  layer 2 done
+  layer 3 done
+  layer 4 done
+  layer 5 done
+  layer 6 done
+  layer 7 done
+  layer 8 done
+  layer 9 done
+  layer 10 done
+  layer 11 done
+wrote models/int4_gptq.safetensors (6336 tensors, 9 calib cases)

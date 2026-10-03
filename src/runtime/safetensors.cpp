@@ -50,7 +50,13 @@ SafetensorsFile::SafetensorsFile(const std::string& path) : path_(path) {
 
     data_start_ = data_start;
     for (auto it = root.begin(); it != root.end(); ++it) {
-        if (it.key() == "__metadata__") continue;
+        if (it.key() == "__metadata__") {
+            if (it.value().is_object())
+                for (auto mit = it.value().begin(); mit != it.value().end(); ++mit)
+                    if (mit.value().is_string())
+                        metadata_[mit.key()] = mit.value().get<std::string>();
+            continue;
+        }
         Info info;
         info.dtype = parse_dtype(it.value().at("dtype").get<std::string>());
         for (const auto& d : it.value().at("shape")) info.shape.push_back(d.get<i64>());
@@ -117,6 +123,17 @@ std::vector<float> SafetensorsFile::read_f32(const std::string& name) const {
         default:
             UOCR_THROW("read_f32: unsupported dtype for " + name);
     }
+    return out;
+}
+
+std::vector<std::uint8_t> SafetensorsFile::read_u8(const std::string& name) const {
+    const Info& in = info(name);
+    UOCR_CHECK(in.dtype == DType::U8 || in.dtype == DType::I8,
+               "read_u8: expected U8/I8 tensor for " + name);
+    std::size_t n = 1;
+    for (i64 d : in.shape) n *= static_cast<std::size_t>(d);
+    std::vector<std::uint8_t> out(n);
+    std::memcpy(out.data(), in.data, n * sizeof(std::uint8_t));
     return out;
 }
 

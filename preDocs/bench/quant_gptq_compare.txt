@@ -1,0 +1,52 @@
+===== BF16 =====
+decode step 14           : token ours=28494 ref=28494 OK
+decode step 15           : token ours=14 ref=14 OK
+decode step 16           : token ours=223 ref=223 OK
+decode step 17           : token ours=5151 ref=5151 OK
+decode step 18           : token ours=63 ref=63 OK
+decode step 19           : token ours=128819 ref=128819 OK
+decode step 20           : token ours=4437 ref=4437 OK
+decode step 21           : token ours=31915 ref=31915 OK
+decode step 22           : token ours=15 ref=15 OK
+decode step 23           : token ours=119316 ref=119316 OK
+
+summary: layout=OK visual_rel_l2=0.03449 (tol 0.15) prefill_rel_l2=0.03452 (tol 0.15) greedy=24/24 -> PASS
+===== RTN g32 =====
+decode step 14           : token ours=27470 ref=28494 DIFF
+decode step 15           : token ours=14 ref=14 OK
+decode step 16           : token ours=223 ref=223 OK
+decode step 17           : token ours=5151 ref=5151 OK
+decode step 18           : token ours=63 ref=63 OK
+decode step 19           : token ours=128819 ref=128819 OK
+decode step 20           : token ours=4437 ref=4437 OK
+decode step 21           : token ours=31915 ref=31915 OK
+decode step 22           : token ours=15 ref=15 OK
+decode step 23           : token ours=119316 ref=119316 OK
+
+summary: layout=OK visual_rel_l2=0.03449 (tol 0.15) prefill_rel_l2=0.3577 (tol 0.15) greedy=23/24 -> FAIL
+===== GPTQ g32 =====
+decode step 14           : token ours=223 ref=28494 DIFF
+decode step 15           : token ours=27470 ref=14 DIFF
+decode step 16           : token ours=14 ref=223 DIFF
+decode step 17           : token ours=223 ref=5151 DIFF
+decode step 18           : token ours=5151 ref=63 DIFF
+decode step 19           : token ours=63 ref=128819 DIFF
+decode step 20           : token ours=128819 ref=4437 DIFF
+decode step 21           : token ours=4437 ref=31915 DIFF
+decode step 22           : token ours=31915 ref=15 DIFF
+decode step 23           : token ours=15 ref=119316 DIFF
+
+summary: layout=OK visual_rel_l2=0.03449 (tol 0.15) prefill_rel_l2=0.3045 (tol 0.15) greedy=3/24 -> FAIL
+===== GPTQ g128 =====
+decode step 14           : token ours=8367 ref=28494 DIFF
+decode step 15           : token ours=6205 ref=14 DIFF
+decode step 16           : token ours=201 ref=223 DIFF
+decode step 17           : token ours=128818 ref=5151 DIFF
+decode step 18           : token ours=2067 ref=63 DIFF
+decode step 19           : token ours=764 ref=128819 DIFF
+decode step 20           : token ours=1942 ref=4437 DIFF
+decode step 21           : token ours=14 ref=31915 DIFF
+decode step 22           : token ours=223 ref=15 DIFF
+decode step 23           : token ours=17895 ref=119316 DIFF
+
+summary: layout=OK visual_rel_l2=0.03449 (tol 0.15) prefill_rel_l2=0.3538 (tol 0.15) greedy=3/24 -> FAIL

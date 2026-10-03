@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -35,11 +36,16 @@ std::string norm_key(const std::string& k) {
 
 int main(int argc, char** argv) {
     std::string dir = "models";
+    std::string int4_quant;
     bool quant = false;
     bool load = false;
+    int quant_group = 128;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--model") && i + 1 < argc) dir = argv[++i];
         else if (!std::strcmp(argv[i], "--quant-check")) quant = true;
+        else if (!std::strcmp(argv[i], "--int4-quant") && i + 1 < argc) int4_quant = argv[++i];
+        else if (!std::strcmp(argv[i], "--quant-group") && i + 1 < argc)
+            quant_group = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--load")) load = true;
     }
 
@@ -127,6 +133,43 @@ int main(int argc, char** argv) {
         };
         sweep("awq/asym", false);
         sweep("symmetric", true);
+
+        // Optional: measure the round-trip error of a pre-quantized file
+        // produced by tools/reference/quantize_gptq.py using the same C++ loader
+        // path.  This validates the file format / packed layout end to end.
+        if (!int4_quant.empty()) {
+            SafetensorsFile qst(int4_quant);
+            double rel_sum = 0;
+            int cnt = 0;
+            for (const std::string& nm : names) {
+                if (!qst.contains(nm + ".packed")) continue;
+                std::vector<float> wf = st.read_f32(nm);
+                const std::vector<i64>& shp = st.info(nm).shape;
+                QuantizedMatrix q;
+                q.rows = static_cast<int>(shp[0]);
+                q.cols = static_cast<int>(shp[1]);
+                q.group_size = quant_group;
+                q.packed = qst.read_u8(nm + ".packed");
+                q.scales = qst.read_f32(nm + ".scales");
+                q.zeros = qst.read_f32(nm + ".zeros");
+                std::vector<float> deq;
+                q.dequantize(deq);
+                double num = 0, den = 0;
+                for (std::size_t i = 0; i < wf.size(); ++i) {
+                    const double d = static_cast<double>(wf[i]) - deq[i];
+                    num += d * d;
+                    den += static_cast<double>(wf[i]) * wf[i];
+                }
+                rel_sum += std::sqrt(num / (den + 1e-12));
+                ++cnt;
+            }
+            if (cnt > 0)
+                std::printf("pre-quantized (%s, group=%d, %d matrices): mean weight rel-L2 = %.4f\n",
+                            int4_quant.c_str(), quant_group, cnt, rel_sum / cnt);
+            else
+                std::printf("pre-quantized file %s: no matching expert matrices\n",
+                            int4_quant.c_str());
+        }
     }
     return 0;
 }

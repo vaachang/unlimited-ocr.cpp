@@ -53,9 +53,14 @@ MoE 路由（`moe_detail::moe_gate`）：
 权重存储与计算解耦：`WeightMatrix` 支持 `F32`、`BF16_EXT`（零拷贝 mmap 视图）、
 `INT4`（AWQ group 量化）三种格式，`matmul` 自动分派（`src/runtime/weights.cpp`）。
 
-## 3. AWQ INT4 量化（`include/uocr/quant.h`, `src/runtime/quant.cpp`）
+## 3. INT4 量化（`include/uocr/quant.h`, `src/runtime/quant.cpp`）
 
-逐行、按 `group_size`（默认 128）做仿射量化：
+### 3.0 组内仿射 RTN（`quantize_int4_awq`）
+
+> 名字沿用 `awq`，实现其实是 **round-to-nearest（RTN）**，未用激活统计；真正激活感知
+> 的版本见 §3.1。
+
+逐行、按 `group_size`（默认 **32**）做仿射量化：
 
 ```
 scale = (max - min) / 15
@@ -74,6 +79,26 @@ H2D 上传只有 ~2s。量化按专家独立、`quantize_int4_awq` 为纯函数�
 mmap，因此在 `weights.cpp` 的专家循环加 `#pragma omp parallel for schedule(dynamic)`
 （仅在量化时并行；`_OPENMP` 未定义时自动退化为串行），实测进程墙钟 20.5→7.4s。
 `cudaHostRegister` 直通方案受本机 `ulimit -l = 8MB` 限制无法实施（见 `tAgent.md` §2.9）。
+
+### 3.1 激活感知量化（GPTQ，`tools/reference/quantize_gptq.py` + `weights.cpp` 加载器）
+
+- **校准**：参考模型 BF16 前向时 hook 每个 routed expert 的 `gate_proj`（gate/up 输入
+  相同）与 `down_proj`，累加**按层池化**的输入二阶矩 `H = Σ x xᵀ`（gate/up 一个
+  `[hidden,hidden]`，down 一个 `[inter,inter]`）。MoE 稀疏使每专家样本很少（<~500 行，
+  远小于 k=1280），故池化到层级；`H` 尺度对 GPTQ 无影响（补偿中分子分母同阶抵消）。
+- **GPTQ**：block-wise（128）逐列量化并做误差补偿：
+  `d = Hinv[j,j]`、`err = (w-q)/d`、`W[:, j:] -= err · Hinv[j, j:]`；group 边界重算
+  非对称 scale/zero。因 `H` 层内共享，**同层 64 个专家批量化**（`[E,R,C]`）一起跑，
+  2112 个矩阵只需 33 次 `H` 求逆、约 2 分钟。
+- **输出/加载**：safetensors 键 `<原始权重名>.packed/.scales/.zeros`（布局与
+  `QuantizedMatrix` 完全一致，空半字节匹配），元数据写 `uocr_int4={"group":N,...}`。
+  引擎 `DecoderWeights::load(..., int4_quant_file)` 读该文件（`read_u8` 取 packed），
+  并把 group 取自**文件元数据**（`SafetensorsFile::metadata()`），避免与
+  `--int4-group` 不一致。`--int4-quant` 显式启用（不再自动探测）。
+- **实测**（真实文字图）：g32 GPTQ 的 prefill logits rel_l2 0.358→**0.305**、单矩阵
+  激活加权误差 −20%；但 autoregressive greedy 脆弱（3/24 vs RTN 23/24）。详见
+  `BENCHMARKS.md` §2.15、`ALIGNMENT.md` §5.4。
+- **默认**：`EngineConfig::int4_group_size` = **32**（g128 会端到端发散）。
 
 ## 4. Block Manager 与显存池（`include/uocr/block_manager.h`, `src/scheduler/`）
 

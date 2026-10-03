@@ -1,0 +1,16 @@
+===== RTN g32 (default --int4) =====
+===== OCR =====
+ Text to the following:
+<|det|>title [37, 92, 581, 190]<|/det|>Unlimited-OCR Engine Test
+<|det|>text [37, 269, 495, 347]<|/det|>The quick brown fox jumps over
+<|det|>text [37, 448, 420, 521]<|/det|>the lazy dog. 0123456789
+<|det|>text [37, 628, 456, 694]<|/det|>R-SWA + MoE INT4 inference
+===============
+===== GPTQ g32 (--int4-quant) =====
+===== OCR =====
+ Text to the source image.
+<|det|>title [37, 92, 581, 190]<|/det|>Unlimited-OCR Engine Test
+<|det|>text [37, 269, 495, 346]<|/det|>The quick brown fox jumps over
+<|det|>text [37, 448, 420, 521]<|/det|>the lazy dog. 0123456789
+<|det|>text [37, 628, 456, 694]<|/det|>R-SWA + MoE INT4 inference
+===============

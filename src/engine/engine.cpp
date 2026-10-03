@@ -70,17 +70,25 @@ std::unique_ptr<Engine> Engine::load(const EngineConfig& ecfg, Backend backend) 
 
     std::string weights_path = ecfg.weights_file;
     if (weights_path.empty()) {
+        // The model dir also holds small pre-quantized (INT4) safetensors files;
+        // pick the largest one, which is the BF16 checkpoint.
+        std::uintmax_t best = 0;
         for (const auto& entry : fs::directory_iterator(dir)) {
-            if (entry.path().extension() == ".safetensors") {
+            if (entry.path().extension() != ".safetensors") continue;
+            const auto sz = fs::file_size(entry.path());
+            if (sz > best) {
+                best = sz;
                 weights_path = entry.path().string();
-                break;
             }
         }
     }
     UOCR_CHECK(!weights_path.empty(), "no .safetensors checkpoint found in " + ecfg.model_dir);
 
-    DecoderWeights w =
-        DecoderWeights::load(weights_path, mcfg, ecfg.use_int4_experts, ecfg.int4_group_size);
+    // Activation-aware INT4 is opt-in via an explicit file (its metadata carries
+    // the group size).  Plain `--int4` stays on the on-the-fly quantizer.
+    const std::string& quant_file = ecfg.int4_quant_file;
+    DecoderWeights w = DecoderWeights::load(weights_path, mcfg, ecfg.use_int4_experts,
+                                            ecfg.int4_group_size, quant_file);
     return std::make_unique<Engine>(mcfg, ecfg, std::move(w), backend);
 }
 

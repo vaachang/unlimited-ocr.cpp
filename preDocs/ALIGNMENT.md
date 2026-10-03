@@ -256,6 +256,33 @@ OMP_NUM_THREADS=8 ./build/tools/compare_ocr --model models --ref /tmp/opencode/r
   prefill rel_l2 **0.0241**、greedy **16/16**；`ctest -R compare_ocr` 两条均 Passed
   （`--strict` 下 `--visual-tol 0.001` 会正确 FAIL，证明判定有效）。
 
+### 5.4 激活感知 INT4（GPTQ）端到端对比（2026-10-03）
+
+新增 `tools/reference/quantize_gptq.py`：校准前向 hooks 收集每层 MoE 的输入二阶矩
+（gate/up 共用、down 独立，**按层在专家间池化**以解决 MoE 稀疏导致的样本不足）→
+block-wise GPTQ（引擎同款 group-wise 非对称仿射）→ 写出引擎 INT4 `packed/scales/zeros`；
+引擎 `--int4-quant <file>` 直接加载（文件元数据自带 group）。在真实文字图（1000×500，
+`/tmp/opencode/ocr_test.png`）导出 `ref_ocr` 后对比：
+
+| 路径 | prefill logits rel_l2 | top-1 | greedy | `ocr_image` 文本 |
+|---|---|---|---|---|
+| CPU/CUDA BF16 | 0.0345 | ✓ | **24/24** | 正确（与 BF16 逐字） |
+| INT4 group=128 RTN | 0.3538 | ✗ | 0/24 | 乱码 / 早停 |
+| INT4 group=32 RTN | 0.3577 | ✓ | **23/24** | 与 BF16 一致 |
+| INT4 group=32 **GPTQ** | **0.3045** | ✓ | 3/24 | 内容正确（开头短语略异） |
+| INT4 group=128 GPTQ | 0.3538 | ✓ | 3/24 | 内容基本正确 |
+
+- activation-aware GPTQ 把 prefill logits rel_l2 从 0.358 → **0.305**（−15%），采样
+  矩阵的**激活加权**输出误差从 0.097 → 0.077（−20%；`quantize_gptq.py --metrics`）。
+  原始输出：`bench/quant_gptq_compare.txt`、`bench/quantize_gptq_g32.txt`。
+- 但 **autoregressive greedy（逐步回填自己的 token）极脆弱**：一次早期 top-1 翻转即
+  级联，故 GPTQ 在该指标上反而 3/24（RTN g32 为 23/24）——GPTQ 优化的是平均输出
+  误差，不保证 argmax。带 `no-repeat-ngram` 的**实际 `ocr_image` 输出两种 group=32
+  都正确**（`bench/ocr_int4_g32.txt`）。
+- **可用性结论**：group=32（RTN 或 GPTQ）即可端到端；`EngineConfig::int4_group_size`
+  默认由 128 改为 **32**，group=128 仍会发散。activation-aware 通过显式
+  `--int4-quant` 启用（不再自动探测，避免静默换用更差的文件）。
+
 ## 6. R-SWA 环形覆写验证（P1，已完成）
 
 用 `--decode-steps 140` 跑过 `P+W=16+128=144` 的覆写拐点（`ref_decoder140`）：

@@ -57,7 +57,9 @@ void usage(const char* argv0) {
         "  --no-crop-mode         disable Gundam dynamic crops (single 640px view)\n"
         "  --cpu                  force the CPU backend + CPU DeepEncoder\n"
         "  --cpu-vision           CUDA decoder but CPU DeepEncoder\n"
-        "  --int4                 use INT4 expert weights (default: BF16)\n",
+        "  --int4                 use INT4 expert weights (default: BF16)\n"
+        "  --int4-quant FILE      activation-aware INT4 expert file (implies --int4)\n"
+        "  --int4-group N         INT4 group size (default: 32)\n",
         argv0);
 }
 
@@ -72,6 +74,8 @@ int main(int argc, char** argv) {
     bool force_cpu = false;
     bool cpu_vision = false;
     bool int4 = false;
+    int int4_group = 32;
+    std::string int4_quant;
 
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--model") && i + 1 < argc) model_dir = argv[++i];
@@ -83,6 +87,11 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--cpu")) force_cpu = true;
         else if (!std::strcmp(argv[i], "--cpu-vision")) cpu_vision = true;
         else if (!std::strcmp(argv[i], "--int4")) int4 = true;
+        else if (!std::strcmp(argv[i], "--int4-quant") && i + 1 < argc) {
+            int4_quant = argv[++i];
+            int4 = true;
+        }
+        else if (!std::strcmp(argv[i], "--int4-group") && i + 1 < argc) int4_group = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "-h") || !std::strcmp(argv[i], "--help")) {
             usage(argv[0]);
             return 0;
@@ -118,7 +127,8 @@ int main(int argc, char** argv) {
     EngineConfig ecfg;
     ecfg.model_dir = model_dir;
     ecfg.use_int4_experts = int4;
-    ecfg.int4_group_size = 128;
+    ecfg.int4_group_size = int4_group;
+    ecfg.int4_quant_file = int4_quant;
     ecfg.max_seq_len = 4096;
     ecfg.max_new_tokens = max_new;
     // The host block manager only needs a small bookkeeping arena: on the CPU
@@ -136,10 +146,12 @@ int main(int argc, char** argv) {
     std::printf("backend: %s, experts: %s, vision: %s\n",
                 backend == Backend::CUDA ? "CUDA" : "CPU", int4 ? "INT4" : "BF16",
                 (backend == Backend::CUDA && !cpu_vision) ? "GPU" : "CPU");
-    if (int4)
+    if (int4 && int4_quant.empty())
         std::fprintf(stderr,
-                     "warning: INT4 experts use group-128 round-to-nearest quantization "
-                     "(~10%% weight error); prefer BF16 unless memory-bound\n");
+                     "note: INT4 experts use group-%d round-to-nearest quantization; for "
+                     "activation-aware weights pass --int4-quant <file> from "
+                     "tools/reference/quantize_gptq.py\n",
+                     int4_group);
 
 #if defined(UOCR_CUDA_ENABLED)
     if (backend == Backend::CUDA && !cpu_vision) {

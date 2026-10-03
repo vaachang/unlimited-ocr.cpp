@@ -107,15 +107,20 @@ int main(int argc, char** argv) {
     bool gpu = false;
     bool int4 = false;
     bool strict = false;
+    std::string int4_quant;
     double visual_tol = 0.15;   // bf16/f32 drift is ~0.06
     double logits_tol = 0.15;
-    int int4_group = 128;
+    int int4_group = 32;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--model") && i + 1 < argc) model_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--ref") && i + 1 < argc) ref_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--gpu-vision")) gpu_vision = true;
         else if (!std::strcmp(argv[i], "--gpu")) gpu = true;
         else if (!std::strcmp(argv[i], "--int4")) int4 = true;
+        else if (!std::strcmp(argv[i], "--int4-quant") && i + 1 < argc) {
+            int4_quant = argv[++i];
+            int4 = true;
+        }
         else if (!std::strcmp(argv[i], "--strict")) strict = true;
         else if (!std::strcmp(argv[i], "--visual-tol") && i + 1 < argc)
             visual_tol = std::atof(argv[++i]);
@@ -163,6 +168,7 @@ int main(int argc, char** argv) {
     ecfg.model_dir = model_dir;
     ecfg.use_int4_experts = int4;
     ecfg.int4_group_size = int4_group;
+    ecfg.int4_quant_file = int4_quant;
     ecfg.max_seq_len = 1024;
     ecfg.memory_pool_bytes = 1 << 20;
 #if defined(UOCR_CUDA_ENABLED)

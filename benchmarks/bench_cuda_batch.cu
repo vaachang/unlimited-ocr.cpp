@@ -63,11 +63,16 @@ ModelConfig synthetic_config() {
 int main(int argc, char** argv) {
     bool real = false, int4 = false, no_graph = false;
     std::string model_dir = "models";
+    std::string int4_quant;
     int prompt_len = 64, steps = 32, max_batch = 16, grouped_bn = 32, grouped_bm = 128;
     int only_batch = 0;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--real")) real = true;
         else if (!std::strcmp(argv[i], "--int4")) int4 = true;
+        else if (!std::strcmp(argv[i], "--int4-quant") && i + 1 < argc) {
+            int4_quant = argv[++i];
+            int4 = true;
+        }
         else if (!std::strcmp(argv[i], "--no-graph")) no_graph = true;
         else if (!std::strcmp(argv[i], "--model") && i + 1 < argc) model_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_len = std::atoi(argv[++i]);
@@ -91,7 +96,7 @@ int main(int argc, char** argv) {
     if (real) {
         cfg = ModelConfig::from_json_file(model_dir + "/config.json");
         weights = DecoderWeights::load(model_dir + "/model-00001-of-000001.safetensors", cfg, int4,
-                                       128);
+                                       128, int4_quant);
     } else {
         cfg = synthetic_config();
         weights = DecoderWeights::random(cfg, 1234);

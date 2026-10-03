@@ -94,10 +94,14 @@ struct DecoderWeights {
     std::vector<LayerWeights> layers;
 
     // Convenience: load decoder weights from a safetensors checkpoint.
+    // `int4_quant_file` optionally points at a pre-quantized expert safetensors
+    // (tools/reference/quantize_gptq.py); when set, expert INT4 weights are read
+    // from it instead of being RTN-quantized from the BF16 checkpoint.
     static DecoderWeights load(const std::string& safetensors_path,
                                const ModelConfig& cfg,
                                bool quantize_experts_int4 = false,
-                               int int4_group_size = 128);
+                               int int4_group_size = 128,
+                               const std::string& int4_quant_file = "");
 
     // Deterministic random weights for a (small) config.  Skips vision.
     static DecoderWeights random(const ModelConfig& cfg, std::uint64_t seed = 1234);

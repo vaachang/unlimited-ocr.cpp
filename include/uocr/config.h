@@ -104,11 +104,18 @@ struct EngineConfig {
     // prefill as well as decode.  This is faster than the per-expert tensor-core
     // GEMM path when few tokens route to each expert (single-request prefill).
     bool use_device_moe_prefill = true;
-    // Expert weight format.  Defaults to BF16: the INT4 path uses group-wise
-    // round-to-nearest quantization (~10% weight error) which perturbs greedy
-    // output, so it is opt-in for memory/speed-constrained runs.
+    // Expert weight format.  Defaults to BF16: the INT4 path perturbs greedy
+    // output, so it is opt-in for memory/speed-constrained runs.  The default
+    // group size is 32: group=128 round-to-nearest diverges end to end, while
+    // group=32 matches the BF16 OCR output (23/24 teacher-free greedy).
     bool use_int4_experts = false;
-    int int4_group_size = 128;
+    int int4_group_size = 32;
+    // Optional pre-quantized expert weights (safetensors produced by
+    // tools/reference/quantize_gptq.py).  When set with use_int4_experts, the
+    // experts are loaded from this file instead of being RTN-quantized on the
+    // fly; the file's metadata carries its group size.  Empty -> RTN from the
+    // BF16 checkpoint at `int4_group_size`.
+    std::string int4_quant_file;
     // Tile size for the grouped INT4 expert GEMM (ragged prefill): `bn` columns
     // in {8,16,32,64} and `bm` rows in {64,128}.
     int grouped_moe_bn = 32;
