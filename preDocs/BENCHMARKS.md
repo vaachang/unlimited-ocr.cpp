@@ -355,6 +355,47 @@ g=128 权重误差 ~10%；端到端见 `ALIGNMENT.md` §5.2（prefill logits rel
 合成用例 top-1 翻转）。缩到 g=32 降到 ~8%、top-1 恢复但仍分叉。真正 AWQ/GPTQ 需
 校准前向，列为 2.7 的后续。
 
+## 2.14 grouped BF16 专家 GEMM（2026-10-03，`bench/bench_batch_real_bf16_grouped_214.txt`）
+
+任务 2.14：ragged 多请求 prefill 的 **BF16 专家**不再走「router D2H + host top-k
++ 逐专家 `linear_forward`」，改为与 INT4 相同的 device router + 两个 grouped 内核
+`moe_grouped_gate_up_bf16` / `moe_grouped_down_bf16`（各一次 launch、读同一套设备
+分组表；权重是专家各自的 bf16 设备矩阵，经 `gate_ptrs/up_ptrs/down_ptrs` 指针数组
+寻址，无 dequant；tile 同 INT4 `bn=32/bm=128`）。命令同 §2.6，BF16 为默认专家：
+
+```bash
+./build-cuda/benchmarks/bench_cuda_batch --real --prompt 64 --steps 16 --max-batch 16
+./build-cuda/benchmarks/bench_cuda_batch --real --int4 --prompt 64 --steps 16 --max-batch 16
+```
+
+`--real` BF16（warmup 稳态，grouped_bn=32/bm=128）：
+
+| batch | 整波 prefill | decode_ms | tok/s | 显存峰值 |
+|---|---|---|---|---|
+| 1 | 20.5 ms | 93.3 | 171.5 | 9.58 GB |
+| 2 | 24.8 ms | 155.3 | 206.1 | 9.64 GB |
+| 4 | 33.1 ms | 207.9 | 307.9 | 9.74 GB |
+| 8 | 51.4 ms | 274.6 | 466.2 | 9.95 GB |
+| 16 | **86.3 ms** | 410.8 | **623.2** | 10.36 GB |
+
+对照同机同命令的 INT4（`forward_ragged` 的 INT4 分支未改动）：B=1/2/4/8/16
+prefill **43 / 49 / 59 / 81 / 121 ms**、B=16 **489.7 tok/s**（与 §2.10 的 120 ms /
+488–516 一致，说明环境可比）。
+
+| 指标 | 2.14 前（host 逐专家，§2.6/§2.11） | 2.14 后（grouped BF16） |
+|---|---|---|
+| 整波 prefill (B=16) | ~165–174 ms | **86 ms** |
+| BF16 B=16 tok/s | 519–533 | **623** |
+| BF16 B=1 tok/s | 155.8 | 171.5 |
+
+验收线是「整波 prefill ≤120 ms、B=16 ≥550 tok/s」，实测 **86 ms / 623 tok/s**，
+超出约 1.4× / 1.13×。BF16 专家（默认、端到端对齐 24/24）现在在 prefill 与吞吐上
+都超过 INT4 路径，同时保持精度——INT4 仅剩显存优势（3.37 GB vs 10.36 GB 峰值）。
+
+回归：`uocr_cuda_tests` 新增「Grouped BF16 ragged prefill」用例（3 请求 ~600 行，
+2 层 8 专家 top-2），相对逐请求 host 路径 worst **rel_l2 0.0016**、`grouped=1`，
+与 INT4 grouped 用例同量级。
+
 ## 3. 回归快照
 
 数值对齐的方法、逐项结果与根因分析统一记录在 **`ALIGNMENT.md`**（端到端 OCR
@@ -374,3 +415,5 @@ CUDA 单元测试（`ctest --test-dir build-cuda` 的 `uocr_cuda_tests`）：
 | Graph decode vs plain（20 步，含 ring 覆写） | rel_l2 0.00000 |
 | attn_dense Graph vs plain | rel_l2 0.00000 |
 | device INT4 专家 vs CPU（plain/graph） | rel_l2 0.0025 |
+| Grouped INT4 ragged prefill vs per-request | rel_l2 0.0017 |
+| Grouped BF16 ragged prefill vs per-request（2.14） | rel_l2 0.0016 |

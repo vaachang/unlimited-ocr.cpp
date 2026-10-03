@@ -87,6 +87,7 @@ unlimited-ocr.cpp/
 ✅ 多尺寸可用性：修复 `UOCR_CHECK` 静默失效、多 crop 布局/视觉不一致、视觉编码器非 1024 输入的 SAM pos/relpos 插值；>640px 图片默认 crop mode 可用（P3）
 ✅ 多 crop 参考回归入库：`export_reference.py` 用参考 `dynamic_preprocess` + `--image-file`；`compare_ocr --strict`；CTest `compare_ocr_large`（P3，2.13）
 ✅ 根目录 `README.md`（构建 / 权重 / 用法 / 对齐 / 目录结构）
+✅ grouped BF16 专家 GEMM（device router + gate_up/down 各一次 launch；ragged prefill BF16 B=16 165→86ms、522→623 tok/s；2.14）
 ```
 
 ### 3.1 收尾验证快照（2026-09-21，全绿）
@@ -135,6 +136,7 @@ unlimited-ocr.cpp/
 | 2026-09-21 P3 | 可用性收尾：独立 OCR CLI `tools/ocr_image`（PNG/PPM → 文本，默认 CUDA+GPU 视觉+BF16）；`EngineConfig::use_int4_experts` 默认改 BF16；`generate_from_image` 单测 + PNG/PPM 加载单测 | `tools/ocr_image.cpp`、`include/uocr/image.h`；单元测试 20→24 |
 | 2026-09-21 P3 | 多尺寸修复（2.12）：`UOCR_THROW` 补 `throw`；`Engine::image_crops` 统一布局/视觉 crop；`image_embeddings` 多 crop 拼接按参考重写；CPU/GPU 视觉对非 1024 输入插值 SAM pos_embed/rel_pos | 多 crop 800×400 参考 visual rel_l2 **0.057**、greedy 16/16；单元测试 24→27；1×1 对齐不变；`PITFALLS.md` §21、`ALIGNMENT.md` §5.3 |
 | 2026-09-21 P3 | 多 crop 参考回归入库（2.13）：导出器支持 `--image-file` + 参考 `dynamic_preprocess`；`compare_ocr --strict` 回归判定（并修 summary 越界读）；CTest 注册 `compare_ocr_large`；新增根 `README.md` | `ref_ocr_large` 488 ids/483 visual、crop `(2,1)`；`ctest -R compare_ocr`（1×1 24/24、多 crop 16/16）均 Passed；真实 4×5 crop 页面 OCR 正确；`ALIGNMENT.md` §5.3 |
+| 2026-10-03 P3 | grouped BF16 专家 GEMM（2.14）：新增 `moe_gemm_bf16.cu`（device router + gate_up/down 各一次 launch，权重经指针数组寻址）；`forward_ragged` 对 BF16 也走 grouped；新增 CUDA 回归 | 真实 B=16 整波 prefill 165→**86ms**、522→**623 tok/s**；回归 worst rel_l2 **0.0016**、`grouped=1`；`BENCHMARKS.md` §2.14、`CORE_TECH.md` §5.12 |
 
 > 每一步的实现/坑/数据分别沉淀在 `CORE_TECH.md` / `PITFALLS.md` / `BENCHMARKS.md`；
 > 当前性能与回归见 `tAgent.md` §1。

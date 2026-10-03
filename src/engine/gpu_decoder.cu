@@ -564,6 +564,16 @@ void GpuDecoder::mlp_block(int li, const float* h1, const float* normed2, int se
                 L.down_i4.sstride, L.down_i4.ng, d_assign_token_, d_assign_w_, d_count_, ne,
                 router_cap_, h, inter, L.down_i4.group, s.moe_out, grouped_bn_, grouped_bm_,
                 stream);
+        } else if (grouped) {
+            // BF16 grouped path (task 2.14): same device grouping table and
+            // launch scheme as the INT4 grouped pair, but the experts are bf16.
+            ++grouped_moe_calls_;
+            cuda::moe_grouped_gate_up_bf16(normed2, L.gate_ptrs, L.up_ptrs, d_assign_token_,
+                                           d_count_, ne, router_cap_, h, inter, d_act_,
+                                           grouped_bn_, grouped_bm_, stream);
+            cuda::moe_grouped_down_bf16(d_act_, L.down_ptrs, d_assign_token_, d_assign_w_,
+                                        d_count_, ne, router_cap_, h, inter, s.moe_out,
+                                        grouped_bn_, grouped_bm_, stream);
         } else if (L.int4_experts) {
             cuda::moe_experts_masked_int4(
                 normed2, seq, L.gate_i4.packed, L.gate_i4.scales, L.gate_i4.zeros,
@@ -1052,12 +1062,12 @@ void GpuDecoder::forward_ragged(const float* x, int total, const int* positions,
     // per token but the kernel is well occupied); once several tokens share an
     // expert, the per-expert tensor-core GEMM amortises the weight read and
     // becomes much faster.  Crossover is around 2 tokens/expert.
-    // The grouped INT4 kernel removes the per-layer router D2H and the
-    // per-expert host loop, and (unlike the masked kernel) reads every expert
-    // weight exactly once per row tile, so it wins at small *and* large totals.
-    // It needs float4-addressable activations, hence the % 4 guards.
-    const bool grouped =
-        int4_experts_ && (h % 4 == 0) && (cfg_.moe_intermediate_size % 4 == 0);
+    // The grouped kernels (INT4 and, since 2.14, BF16) remove the per-layer
+    // router D2H and the per-expert host loop, and (unlike the masked kernel)
+    // read every expert weight exactly once per row tile, so they win at small
+    // *and* large totals.  They need float4-addressable activations, hence the
+    // % 4 guards.
+    const bool grouped = (h % 4 == 0) && (cfg_.moe_intermediate_size % 4 == 0);
     // Without the grouped path, fall back to the masked device kernel for small
     // batches and the host per-expert path for large ones.
     const bool dev_moe = grouped || total <= 2 * cfg_.n_routed_experts;

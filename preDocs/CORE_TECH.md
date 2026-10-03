@@ -383,6 +383,33 @@ global attention（S≥512）准备的 tensor-core 版本，`attention_flash` �
   （32 KB，最大项）/改 register-resident flash attention，或优化视觉 GEMM
   （cp.async）。整栈 CUDA Graph 捕获与非方形尺寸支持仍未做。
 
+### 5.12 grouped BF16 专家 GEMM（2.14，2026-10-03）
+
+`src/kernels/cuda/moe_gemm_bf16.cu` 的
+`moe_grouped_gate_up_bf16` / `moe_grouped_down_bf16` 是 grouped INT4 内核（§5.9）
+的 BF16 对偶，供 ragged 多请求 prefill 使用（`GpuDecoder::forward_ragged` →
+`mlp_block(grouped=true)`）。
+
+- **分组表**：仍由 `moe_router_topk` 在设备端产出 `assign_token/assign_w`（[ne, cap]）
+  与 `count`（[ne]），无 host D2H；每个 block 负责一个 `(expert, n-tile)`，在
+  `count[e]` 范围内按 `BM=128` 行 tile 循环该专家的 token。
+- **权重寻址**：BF16 专家是每个专家一块设备矩阵，经 `gate_ptrs/up_ptrs/down_ptrs`
+  （设备端 `bf16*` 数组）取该专家的基址，**无 dequant**；`stage_weight_bf16` 在
+  `[n0,n0+BN)×[k0,k0+BK)` 全在界内且 `k%8==0` 时用 `uint4`（8×bf16）16B 向量拷贝，
+  越界走标量补零。
+- **计算**：激活用 `bf16_stage_act_gather`（按 `assign_token` 聚合行）/`bf16_stage_act_rows`
+  stage 成 bf16 shared，`ldmatrix` + `mma.m16n8k16.bf16.bf16.f32`，`bk=64`、stride
+  `bk+8` 免 bank 冲突；gate_up 面板同时算 gate/up 并写入 `silu(gate)*up`，down 面板
+  `atomicAdd(w * down)` 散加到 `[total, hidden]`。tile 由 `EngineConfig::grouped_moe_bn/bm`
+  控制（默认 32/128，与 INT4 相同）。
+- **启动**：`grid=(ceil(n/BN), n_experts)`、`block=(BM/16)*32`；`n_experts`、`cap`、
+  形状都来自模型配置，网格与路由结果无关（满足 Graph 静态性；本路径不在 Graph 内）。
+- **验收/数据**：`uocr_cuda_tests` 新增回归，device grouped BF16 vs 逐请求 host 路径
+  worst rel_l2 **0.0016**；真实模型 B=16 整波 prefill **165→86 ms**、**522→623 tok/s**。
+  见 `BENCHMARKS.md` §2.14。
+- **注意**：使能条件 `grouped = hidden%4==0 && moe_intermediate%4==0`（激活
+  `float4` stage 需 16B 对齐）；小 batch 也走此路径（与 INT4 一致）。
+
 
 ## 6. 与 `prj.md` 三大创新点的对应
 

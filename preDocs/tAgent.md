@@ -14,20 +14,26 @@
 
 ---
 
-## 1. 当前状态（2026-09-21 快照）
+## 1. 当前状态（2026-10-03 快照）
 
 - **后端**：CPU 参考（OpenMP）+ CUDA 生产（sm_120），`-DENGINE_BACKEND=CPU|CUDA` 双构建。
 - **完成度**：M1–M6、P0（端到端 OCR 对齐 E0–E5）、P1（R-SWA 环形覆写 / CUDA 设备端
   decoder）、P2（TC INT4 GEMM、CUDA Graph、device INT4 权重、连续批处理、batched graph、
   bf16 TC GEMM）、P3（cp.async 流水线 TC GEMM、DeepEncoder CUDA 移植、**grouped INT4
   专家 GEMM + device router**、**device embedding 查表**、**INT4 量化并行加载**、
-  **视觉 split-bf16 TC GEMM + relpos 因式分解**、**视觉 tensor-core flash attention**）
-  均已完成（2.6 分析后判定不适用/不实现，见该节）。**约 98%**（对照 `prj.md`；
-  仅剩 2.7 精度评测/2.8 profiling 受外部工具与权限限制，2.14 为纯性能项）。
-- **收尾决定（2026-09-21）**：项目判定为**可用、完整**，本轮不再改功能代码。
-  2.14（BF16 grouped ragged prefill）保留为性能可选项；2.7（OmniDocBench）需先安装
-  外部工具链（Docker/TeX Live 等）；2.8 受本机 `ncu` 权限限制。若后续要做，按 §2 各节
-  的验收口径实施。
+  **视觉 split-bf16 TC GEMM + relpos 因式分解**、**视觉 tensor-core flash attention**、
+  **grouped BF16 专家 GEMM（2.14，默认路径）**）均已完成（2.6 分析后判定不适用/不实现，
+  见该节）。**约 99%**（对照 `prj.md`；仅剩 2.7 精度评测/2.8 profiling 受外部工具与
+  权限限制）。
+- **2.14 完成（2026-10-03）**：ragged 多请求 prefill 的 **BF16 专家**（默认）从
+  「router D2H + host 逐专家 `linear_forward`」改为 device router + grouped BF16 内核
+  （`moe_gemm_bf16.cu`，各投影一次 launch、无 dequant、专家权重经设备指针数组寻址）。
+  真实模型 B=16 整波 prefill **~165→86 ms**、吞吐 **~522→623 tok/s**，超过 2.14 验收线
+  （≤120 ms / ≥550 tok/s），且 BF16 现在在 prefill 与吞吐上均优于 INT4 路径而精度不变。
+  见 `BENCHMARKS.md` §2.14、`CORE_TECH.md` §5.12。
+- **收尾说明**：项目**可用、完整**（CUDA/CPU 双构建 + 全部单测 + 真实图片端到端 OCR
+  逐字正确）。2.7（OmniDocBench）需先安装外部工具链（Docker/TeX Live 等，安装前需征得
+  同意）；2.8 受本机 `ncu` 权限限制；真正 AWQ/GPTQ 与其余非阻塞优化见 §2。
 - **入口/可用性**：新增独立 CLI `tools/ocr_image`（`--image page.png` → 打印识别文本，
   默认 CUDA + GPU 视觉 + **BF16 专家**；`--cpu`/`--int4`/`--no-crop-mode` 可选；图片支持
   PNG（libpng）与 PPM）。`EngineConfig::use_int4_experts` 默认改为 **false（BF16）**，
@@ -57,10 +63,10 @@
 
   | 指标 | 值 |
   |---|---|
-  | BF16 batch=16 吞吐 | **~520 tok/s**（显存峰值 10.4GB） |
-  | INT4 batch=16 吞吐 | **~518 tok/s**（显存峰值 3.37GB，含 331MB bf16 embedding 表） |
-  | 整波 prefill（16 请求） | **~165 ms** BF16 / **120 ms** INT4 |
-  | batch=1 吞吐 | 155.8 BF16 / 138.2 INT4 tok/s |
+  | BF16 batch=16 吞吐 | **623 tok/s**（显存峰值 10.4GB；2.14 grouped BF16） |
+  | INT4 batch=16 吞吐 | **~490 tok/s**（显存峰值 3.37GB，含 331MB bf16 embedding 表） |
+  | 整波 prefill（16 请求） | **86 ms** BF16（2.14） / **121 ms** INT4 |
+  | batch=1 吞吐 | 171.5 BF16 / 133.5 INT4 tok/s |
   | lm_head m=16（n=129280） | **1174 µs**（原 2652，2.3×） |
   | 单图视觉编码（1024, GPU） | **238–246 ms**（CPU 参考 ~2 min；rel_l2 1.44e-4；TC attention + 8-warp n-split） |
 
@@ -83,39 +89,48 @@ ctest --test-dir build-cuda --output-on-failure
 
 按收益/成本排序。每项给出目标、方案、验收与涉及文件；完成后在本文档勾掉并更新 §1。
 
-> **下一阶段计划（2026-09-21 收尾后）**：项目已判定**可用、完整**（见 §1）。
-> 以下为后续 **可选 / 受外部条件限制** 的工作，按收益/成本排序；开工前先确认范围。
+> **下一阶段计划（2026-10-03 更新）**：项目**可用、完整**（见 §1）；2.14（BF16
+> grouped ragged prefill）已完成。以下为后续 **可选 / 受外部条件限制** 的工作，
+> 按收益/成本排序；开工前先确认范围。
 >
-> 1. **2.14 BF16 grouped ragged prefill（性能，首选）**
->    - 现状：默认 `use_int4_experts=false`，BF16 大批量 ragged prefill 仍走
->      host router D2H + 逐专家 `linear_forward`（每层 64×3 次 launch）。
->    - 方案：仿 `moe_grouped_gate_up_int4` / `moe_grouped_down_int4`，新增
->      `moe_grouped_gate_up_bf16` / `moe_grouped_down_bf16`（gate+up+SiLU 融合、down
->      scatter-add，各一次 launch，读 device grouping 表；权重 bf16，激活走
->      `matmul_t_split_bf16` 或等价 TC 路径）。`forward_ragged` 里 BF16 也走 grouped。
->    - 验收：整波 prefill（16 请求）**165ms → ≤120ms**、B=16 吞吐 **≥550 tok/s**；
->      `test_rswa_cuda.cu` 新增 grouped-BF16 vs host 回归 rel_l2 同量级；greedy 不变。
->    - 涉及：`src/kernels/cuda/moe_device.cu`（或新 `moe_gemm_bf16.cu`）、
->      `include/uocr/cuda_ops.h`、`src/engine/gpu_decoder.cu`、`tests/test_rswa_cuda.cu`、
->      `BENCHMARKS.md`。
-> 2. **2.7 精度评测（OmniDocBench v1.6）** — 需外部工具链，**安装前必须先征得同意**。
+> 1. **2.7 精度评测（OmniDocBench v1.6）** — 需外部工具链，**安装前必须先征得同意**。
 >    - 依赖：官方 Docker 镜像 `ghcr.io/zeng-weijun/omnidocbench-eval:repro-ubuntu2204`
 >      （或本机 TeX Live 2025 + ImageMagick 7 + Ghostscript + Python 3.10，~7GB+）。
 >    - 接入后按 `configs/end2end.yaml` 出 text Edit / TEDS / CDM 综合分；本机当前无
 >      Docker，该项未接入。
-> 3. **真正的 AWQ / GPTQ 量化** — 依赖校准前向（可用 2.7 数据或自建校准集）。
+> 2. **真正的 AWQ / GPTQ 量化** — 依赖校准前向（可用 2.7 数据或自建校准集）。
 >    当前 `quantize_int4_awq` 实为 group-wise RTN（权重误差 ~10%、端到端 logits ~0.36，
 >    top-1 翻转），改用激活感知 per-channel scaling 预计降到 ~3–5%，INT4 端到端才有意义。
 >    涉及 `src/runtime/quant.cpp`、`weights.cpp`。
-> 4. **2.8 profiling 补全（受限）** — 本机 `ncu` 报 `ERR_NVGPUCTRPERM`（PITFALLS §17），
+> 3. **2.8 profiling 补全（受限）** — 本机 `ncu` 报 `ERR_NVGPUCTRPERM`（PITFALLS §17），
 >    只能用 `nsys` + 消融；需要 SM/DRAM 峰值利用率时先解决权限。
-> 5. **非阻塞优化**：`rswa_attn_ragged`（B=16 ~21ms，grouped 之后的第二大头）；
+> 4. **非阻塞优化**：`rswa_attn_ragged`（B=16 ~21ms，grouped 之后的第二大头）；
 >    整栈 CUDA Graph（encoder+cache 一起捕获）；视觉 GEMM cp.async；单请求 prefill
->    的 host embedding gather。
-> 6. ⛔ **2.6 Prefill KV 分区**：分析后判定与参考实现不兼容、且本负载 `V+W>P` 无
+>    的 host embedding gather；BF16 grouped 的 kernel 分解可用 nsys 复核。
+> 5. ⛔ **2.6 Prefill KV 分区**：分析后判定与参考实现不兼容、且本负载 `V+W>P` 无
 >    可丢弃 gap，**不实现**（见该节）。
 >
-> 以下 ✅/🔶/⛔ 是 2026-09-20/21 的完成快照。✅ 已完成；🔶 部分完成；⛔ 分析后不实现。
+> 以下 ✅/🔶/⛔ 是完成快照（2026-09-20/21，2.14 为 2026-10-03）。✅ 已完成；
+> 🔶 部分完成；⛔ 分析后不实现。
+
+### ✅ 2.14 BF16 grouped ragged prefill（2026-10-03 完成）
+
+- **已做**：新增 `src/kernels/cuda/moe_gemm_bf16.cu`，实现
+  `moe_grouped_gate_up_bf16` / `moe_grouped_down_bf16`：与 INT4 grouped 同构的
+  device router + 每投影一次 launch（grid=`(n_tile, n_experts)`，block 8 warp×16 行，
+  `ldmatrix`+`mma.m16n8k16.bf16`，gate+up+SiLU 融合、down scatter-add）。BF16 权重
+  常驻设备、经 `gate_ptrs/up_ptrs/down_ptrs` 指针数组寻址，无 dequant；`bk=64`、
+  tile 复用 `grouped_bn/bm`（默认 32/128）。`forward_ragged` 的 `grouped` 条件去掉
+  `int4_experts_` 限制；`mlp_block` 增加 `grouped && !int4` 分支。新增
+  `uocr_cuda_tests` 回归「Grouped BF16 ragged prefill」。
+- **验收**：真实模型 `--real --prompt 64 --steps 16 --max-batch 16`，B=16 整波 prefill
+  **~165 → 86 ms**、吞吐 **~522 → 623 tok/s**（验收线 ≤120 ms / ≥550 tok/s）；
+  B=1/2/4/8 prefill 20.5/24.8/33.1/51.4 ms；回归 worst rel_l2 **0.0016**、`grouped=1`，
+  与 INT4 grouped 用例（0.0017）同量级；`uocr_tests`/`uocr_cuda_tests`/
+  `compare_vision_gpu_selftest` 全过。BF16 现于 prefill 与吞吐均优于 INT4 且精度不变。
+- **涉及**：`src/kernels/cuda/moe_gemm_bf16.cu`、`CMakeLists.txt`、
+  `include/uocr/cuda_ops.h`、`src/engine/gpu_decoder.cu`、`tests/test_rswa_cuda.cu`。
+  数据见 `BENCHMARKS.md` §2.14、实现见 `CORE_TECH.md` §5.12。
 
 ### ✅ 2.12 可用性修复：异常校验 + 多 crop 端到端（2026-09-21 完成）
 
@@ -332,7 +347,7 @@ ctest --test-dir build-cuda --output-on-failure
 | lm_head | **GPU** | 设备副本 + `matvec`/`matmul_t_bf16` |
 | MoE router / top-k（decode、prefill） | **GPU** | `moe_router_topk`（INT4 expert 的 ragged 路径也走设备端，无 D2H） |
 | MoE 专家 MLP（INT4，ragged prefill） | **GPU** | grouped gate+up+SiLU / down 各一次 launch（§5.9） |
-| MoE 专家 MLP（BF16，ragged 大批量 prefill） | **CPU 调度 + GPU GEMM** | 仍 host top-k + 逐专家 GEMM（未加 grouped BF16） |
+| MoE 专家 MLP（BF16，ragged 大批量 prefill） | **GPU** | device router + grouped BF16 gate_up/down（2.14，各一次 launch） |
 | token embedding 查表 | **GPU** | embedding 表设备常驻 + `embed_gather`；单请求 prefill 仍 host gather |
 | **DeepEncoder 视觉编码器（SAM+CLIP+projector）** | **GPU** | `GpuEncoder`（split-bf16 TC GEMM + vision 内核；SAM global attention 走 **split-bf16 TC flash attention**，小 S/超限时回退 f32）；`set_vision_gpu()` 后启用 |
 | 采样 / no-repeat-ngram | CPU | 每步 D2H logits 后采样，属设计选择 |
@@ -391,8 +406,8 @@ ctest --test-dir build-cuda --output-on-failure
   0.057），但**参考回归尚未入库**（任务 2.13）。
 - 单请求 `GpuDecoder::prefill_tokens` 仍在 host 查 embedding（每请求一次，非每步）；
   position 仍是 4B pinned H2D（本就是 int，未做成表）。
-- BF16 专家的 ragged 大批量 prefill 仍是 host top-k + 逐专家 GEMM（grouped 只做了
-  INT4）；`rswa_attn_ragged`（B=16 ~21 ms）是 grouped 之后的第二大头。
+- BF16 与 INT4 专家的 ragged 大批量 prefill 均已走 device router + grouped GEMM
+  （2.14 补齐 BF16）；`rswa_attn_ragged`（B=16 ~21 ms）是 grouped 之后的第二大头。
 - 视觉编码器 f32 GEMM 已由 **split-bf16 tensor-core GEMM** 取代（激活 hi/lo 两片
   补偿误差），视觉栈保持 6e-4；f32 CUDA-core 版本仅作 `k%8≠0` 回退。
 - **INT4 量化精度不足**：当前 `quantize_int4_awq` 实为 group-wise RTN（非激活感知

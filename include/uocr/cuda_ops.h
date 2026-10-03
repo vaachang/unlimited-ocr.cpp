@@ -182,6 +182,25 @@ void moe_grouped_down_int4(
     const int* count, int n_experts, int cap, int hidden, int inter, int group, float* out,
     int bn = 16, int bm = 64, cudaStream_t stream = 0);
 
+// Grouped BF16 expert GEMM (task 2.14), same device grouping table as the INT4
+// grouped pair above but the experts are already bf16 in device memory.  Weight
+// matrices are addressed through device arrays of per-expert row-major bf16
+// pointers (`gate_w` / `up_w` are [inter, hidden], `down_w` is [hidden, inter]).
+//
+// - `moe_grouped_gate_up_bf16` writes silu(gate) * up into `act`
+//   [n_experts, cap, inter].
+// - `moe_grouped_down_bf16` computes down from `act` and scatter-adds the
+//   routing-weighted result into `out` [total, hidden] (caller zeroes it).
+void moe_grouped_gate_up_bf16(const float* x, const std::uint16_t* const* gate_w,
+                              const std::uint16_t* const* up_w, const int* assign_token,
+                              const int* count, int n_experts, int cap, int hidden, int inter,
+                              float* act, int bn = 16, int bm = 64, cudaStream_t stream = 0);
+
+void moe_grouped_down_bf16(const float* act, const std::uint16_t* const* down_w,
+                           const int* assign_token, const float* assign_w, const int* count,
+                           int n_experts, int cap, int hidden, int inter, float* out, int bn = 16,
+                           int bm = 64, cudaStream_t stream = 0);
+
 // MoE INT4 GEMM: y[m,n] = x[m,k] * dequant(W_int4[n,k]); W is packed 2-per-byte
 // with per-group affine scale/zero.  Scalar reference (correctness baseline).
 void moe_gemm_int4(const float* x, const std::uint8_t* packed, const float* scales,

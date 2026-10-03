@@ -136,6 +136,7 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
         src/kernels/cuda/rope_fused.cu
         src/kernels/cuda/rswa_attention.cu
         src/kernels/cuda/moe_gemm_int4.cu
+        src/kernels/cuda/moe_gemm_bf16.cu
         src/kernels/cuda/gpu_ops.cu
         src/kernels/cuda/gpu_cache.cu
         src/kernels/cuda/moe_device.cu
