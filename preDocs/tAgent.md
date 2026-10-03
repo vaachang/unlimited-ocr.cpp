@@ -22,9 +22,9 @@
   bf16 TC GEMM）、P3（cp.async 流水线 TC GEMM、DeepEncoder CUDA 移植、**grouped INT4
   专家 GEMM + device router**、**device embedding 查表**、**INT4 量化并行加载**、
   **视觉 split-bf16 TC GEMM + relpos 因式分解**、**视觉 tensor-core flash attention**、
-  **grouped BF16 专家 GEMM（2.14，默认路径）**、**激活感知 INT4（GPTQ）量化 + 加载器**）
-  均已完成（2.6 分析后判定不适用/不实现，见该节）。**约 99%**（对照 `prj.md`；仅剩 2.7
-  精度评测/2.8 profiling 受外部工具与权限限制）。
+  **grouped BF16 专家 GEMM（2.14，默认路径）**、**激活感知 INT4（GPTQ + AWQ
+  per-channel scaling）量化 + 加载器**）均已完成（2.6 分析后判定不适用/不实现，见该节）。
+  **约 99%**（对照 `prj.md`；仅剩 2.7 精度评测/2.8 profiling 受外部工具与权限限制）。
 - **2.14 完成（2026-10-03）**：ragged 多请求 prefill 的 **BF16 专家**（默认）从
   「router D2H + host 逐专家 `linear_forward`」改为 device router + grouped BF16 内核
   （`moe_gemm_bf16.cu`，各投影一次 launch、无 dequant、专家权重经设备指针数组寻址）。
@@ -62,9 +62,10 @@
   greedy **24/24**（CPU/f32 与 **CUDA/BF16+GPU vision** 两条路径），多 crop
   16/16（见上）；`uocr_tests` **27/27**（含 PNG/PPM 图像加载 + 多尺寸布局/异常校验
   回归）；`uocr_cuda_tests` **全过**；`compare_vision_gpu_selftest` **全过**。
-  **INT4（group-128 RTN）** 端到端与参考分叉（top-1 翻转、0/24），CPU/INT4 与
-  CUDA/INT4 **完全一致**，属量化精度问题（见 2.11 / `ALIGNMENT.md` §5.2），故默认
-  不再用 INT4。
+  **INT4 group-128 RTN** 端到端与参考分叉（top-1 翻转、0/24），CPU/INT4 与
+  CUDA/INT4 **完全一致**，属量化精度问题（见 2.11 / `ALIGNMENT.md` §5.2）。
+  **现已改为 group=32（默认）**：实际 OCR 与 BF16 逐字一致，activation-aware
+  （GPTQ+AWQ）进一步降 logits 误差（`ALIGNMENT.md` §5.4）。默认仍为 BF16。
 - **性能**（真实 `baidu/Unlimited-OCR`，prompt=64, steps=16, max_batch=16, warmup 稳态）：
 
   | 指标 | 值 |
@@ -95,24 +96,28 @@ ctest --test-dir build-cuda --output-on-failure
 
 按收益/成本排序。每项给出目标、方案、验收与涉及文件；完成后在本文档勾掉并更新 §1。
 
-> **下一阶段计划（2026-10-03 更新）**：项目**可用、完整**（见 §1）；2.14（BF16
-> grouped ragged prefill）已完成。以下为后续 **可选 / 受外部条件限制** 的工作，
-> 按收益/成本排序；开工前先确认范围。
+> **下一阶段计划（2026-10-03 更新）**：2.14（BF16 grouped ragged prefill）与激活感知
+> INT4（GPTQ + AWQ per-channel scaling）均已完成，项目**可用、完整**（见 §1）。
+> 以下为后续 **可选 / 受外部条件限制** 的工作，按收益/成本排序；**开工前先确认范围**。
 >
 > 1. **2.7 精度评测（OmniDocBench v1.6）** — 需外部工具链，**安装前必须先征得同意**。
 >    - 依赖：官方 Docker 镜像 `ghcr.io/zeng-weijun/omnidocbench-eval:repro-ubuntu2204`
 >      （或本机 TeX Live 2025 + ImageMagick 7 + Ghostscript + Python 3.10，~7GB+）。
 >    - 接入后按 `configs/end2end.yaml` 出 text Edit / TEDS / CDM 综合分；本机当前无
->      Docker，该项未接入。
+>      Docker，该项未接入。**这是当前唯一未做、且能给出真实精度数字的评估**。
 > 2. **2.8 profiling 补全（受限）** — 本机 `ncu` 报 `ERR_NVGPUCTRPERM`（PITFALLS §17），
 >    只能用 `nsys` + 消融；需要 SM/DRAM 峰值利用率时先解决权限。
-> 3. **非阻塞优化**：`rswa_attn_ragged`（B=16 ~21ms，grouped 之后的第二大头）；
->    整栈 CUDA Graph（encoder+cache 一起捕获）；视觉 GEMM cp.async；单请求 prefill
->    的 host embedding gather；BF16 grouped 的 kernel 分解可用 nsys 复核。
-> 4. ⛔ **2.6 Prefill KV 分区**：分析后判定与参考实现不兼容、且本负载 `V+W>P` 无
+> 3. **非阻塞优化**（性能）：`rswa_attn_ragged`（B=16 ~21ms，grouped 之后的第二大头）；
+>    整栈 CUDA Graph（encoder+cache 一起捕获）；视觉 GEMM cp.async；单请求 prefill 的
+>    host embedding gather；BF16 grouped 的 kernel 分解可用 nsys 复核。
+> 4. **INT4 精度（低优先；结论已明确，不建议为「贪心 24/24」再投入）**：g32 下实际
+>    OCR 文本已与 BF16 逐字一致；唯一 greedy 分歧是 bbox 坐标 token，g16/g8 仍 23/24，
+>    GPTQ/AWQ 反而 2–3/24（平均误差↓ ≠ argmax 保持）。若仍要压缩，方向应是
+>    hybrid（敏感层/专家保留 BF16）或 2-bit / NVFP4 评测，而非继续调 GPTQ 补偿。
+> 5. ⛔ **2.6 Prefill KV 分区**：分析后判定与参考实现不兼容、且本负载 `V+W>P` 无
 >    可丢弃 gap，**不实现**（见该节）。
 >
-> 以下 ✅/🔶/⛔ 是完成快照（2026-09-20/21，2.14 与激活感知量化见 2026-10-03）。
+> 以下 ✅/🔶/⛔ 是完成快照（2026-09-20/21；2.14 与激活感知量化见 2026-10-03）。
 > ✅ 已完成；🔶 部分完成；⛔ 分析后不实现。
 
 ### ✅ 激活感知 INT4（GPTQ）量化（2026-10-03 完成）
