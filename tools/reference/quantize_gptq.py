@@ -224,6 +224,22 @@ def weight_rel(W, Wq):
     return float(num / (den + 1e-12))
 
 
+def awq_scale(H, alpha):
+    """Per-input-channel AWQ scale from the gate/up activation Hessian diagonal.
+
+    s_j = (rms_j / geomean(rms))^alpha.  Channels carrying more activation
+    energy get more of the quantization grid.  The engine folds 1/s into the
+    post-attention RMSNorm and scales the router/shared weights by s, so the
+    transform is exact and needs no runtime activation multiply.
+    """
+    diag = torch.diag(H).clamp(min=1e-12)
+    rms = torch.sqrt(diag)
+    geo = torch.exp(torch.log(rms).mean())
+    s = (rms / geo).pow(alpha)
+    # Keep 1/s from blowing up on near-dead channels.
+    return s.clamp(min=1.0 / 16.0, max=16.0)
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -245,6 +261,11 @@ def main():
     ap.add_argument("--layers", default="")
     ap.add_argument("--metrics", action="store_true",
                     help="compute (slow) weight/activation error diagnostics")
+    ap.add_argument("--awq", action="store_true",
+                    help="AWQ-style per-input-channel scaling for gate/up (folded "
+                         "into the RMSNorm at load time)")
+    ap.add_argument("--awq-alpha", type=float, default=0.5,
+                    help="AWQ exponent on the per-channel activation RMS")
     args = ap.parse_args()
 
     from transformers import AutoModel
@@ -333,14 +354,24 @@ def main():
         if layer_filter is not None and li not in layer_filter:
             continue
         experts = model.model.layers[li].mlp.experts
+        layer_scale = None
         for proj, pname, hmap in projs:
             H = hmap.get(li)
             Ws = torch.stack([getattr(experts[e], pname).weight.detach().to(torch.float32).cpu()
                               for e in range(n_experts)])
+            # AWQ: scale gate/up columns by `s` (gate and up share one input).
+            Hs = H
+            if args.awq and H is not None and proj in ("gate", "up"):
+                if layer_scale is None:
+                    layer_scale = awq_scale(H, args.awq_alpha)
+                Ws = Ws * layer_scale[None, None, :]
+                # With 1/s folded into the RMSNorm the effective input is x/s,
+                # so the GPTQ Hessian becomes diag(1/s) H diag(1/s).
+                Hs = H / (layer_scale[:, None] * layer_scale[None, :])
             if H is None:
                 codes, scales, zeros = rtn_batch(Ws, args.group)
             else:
-                Hc = H.clone()
+                Hc = Hs.clone()
                 Hc[range(Hc.shape[0]), range(Hc.shape[0])] += args.damp * torch.diag(Hc).mean()
                 Hinv = torch.linalg.inv(Hc)
                 codes, scales, zeros = gptq_batch(Ws, Hinv, args.group, args.blocksize)
@@ -365,12 +396,17 @@ def main():
                         * rs[:, :, gi][:, :, None]
                 # sample a few experts for the (expensive) Hessian metric
                 sel = torch.randperm(n_experts)[:8]
-                hm_r = np.mean([h_metric(Ws[i], Wr[i], H) for i in sel])
-                hm_g = np.mean([h_metric(Ws[i], Wq[i], H) for i in sel])
+                hm_r = np.mean([h_metric(Ws[i], Wr[i], Hs) for i in sel])
+                hm_g = np.mean([h_metric(Ws[i], Wq[i], Hs) for i in sel])
                 stats.append((li, proj, weight_rel(Ws, Wr), weight_rel(Ws, Wq), hm_r, hm_g))
+        if layer_scale is not None:
+            out_tensors[f"model.layers.{li}.expert_in_scale"] = layer_scale.contiguous().float()
         print(f"  layer {li} done", flush=True)
 
-    meta = {"group": args.group, "scheme": "gptq-asym-pooled", "calib_cases": len(cases)}
+    meta = {"group": args.group,
+            "scheme": "gptq-asym-pooled" + ("+awq" if args.awq else ""),
+            "awq": bool(args.awq), "awq_alpha": args.awq_alpha if args.awq else None,
+            "calib_cases": len(cases)}
     from safetensors.torch import save_file
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     save_file(out_tensors, args.out, metadata={"format": "pt", "uocr_int4": json.dumps(meta)})

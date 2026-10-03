@@ -177,6 +177,35 @@ Linear load_linear(const SafetensorsFile& st, const SafetensorsFile* qst, const 
     return l;
 }
 
+// Materialise `w` as F32_OWNED with column c multiplied by s[c].
+WeightMatrix scale_columns(const WeightMatrix& w, const std::vector<float>& s) {
+    std::vector<float> vals;
+    w.to_f32(vals);
+    WeightMatrix out;
+    out.rows = w.rows;
+    out.cols = w.cols;
+    out.fmt = WeightFormat::F32_OWNED;
+    out.f32.resize(vals.size());
+    for (int r = 0; r < w.rows; ++r)
+        for (int c = 0; c < w.cols; ++c)
+            out.f32[static_cast<std::size_t>(r) * w.cols + c] =
+                vals[static_cast<std::size_t>(r) * w.cols + c] * s[static_cast<std::size_t>(c)];
+    return out;
+}
+
+// Apply an AWQ per-input-channel scale `s` (expert gate/up weights were stored
+// pre-multiplied by diag(s)): divide the post-attention norm by s so the expert
+// input becomes x/s, and multiply the other consumers of that norm (router and
+// shared gate/up) by s so their outputs are unchanged.  Exact, no runtime work.
+void apply_expert_input_scale(LayerWeights& L, const std::vector<float>& s) {
+    UOCR_CHECK(s.size() == L.post_attention_layernorm.size(),
+               "expert_in_scale size does not match hidden size");
+    for (std::size_t j = 0; j < s.size(); ++j) L.post_attention_layernorm[j] /= s[j];
+    L.router = scale_columns(L.router, s);
+    L.shared.gate.weight = scale_columns(L.shared.gate.weight, s);
+    L.shared.up.weight = scale_columns(L.shared.up.weight, s);
+}
+
 float rng_normal(std::mt19937& rng) {
     std::normal_distribution<float> d(0.0f, 0.02f);
     return d(rng);
@@ -261,6 +290,10 @@ DecoderWeights DecoderWeights::load(const std::string& path, const ModelConfig& 
             L.shared.gate = load_linear(st, qst, sp + "gate_proj.weight", false, int4_group_size);
             L.shared.up = load_linear(st, qst, sp + "up_proj.weight", false, int4_group_size);
             L.shared.down = load_linear(st, qst, sp + "down_proj.weight", false, int4_group_size);
+            // Optional AWQ input scale (gate/up stored pre-scaled).
+            const std::string skey = p + "expert_in_scale";
+            if (qst != nullptr && qst->contains(skey))
+                apply_expert_input_scale(L, qst->read_f32(skey));
         }
         UOCR_DEBUG("loaded layer %d", i);
     }

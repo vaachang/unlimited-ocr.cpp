@@ -88,7 +88,7 @@ unlimited-ocr.cpp/
 ✅ 多 crop 参考回归入库：`export_reference.py` 用参考 `dynamic_preprocess` + `--image-file`；`compare_ocr --strict`；CTest `compare_ocr_large`（P3，2.13）
 ✅ 根目录 `README.md`（构建 / 权重 / 用法 / 对齐 / 目录结构）
 ✅ grouped BF16 专家 GEMM（device router + gate_up/down 各一次 launch；ragged prefill BF16 B=16 165→86ms、522→623 tok/s；2.14）
-✅ 激活感知 INT4（GPTQ）量化工具 + 引擎加载器（`--int4-quant`；group 存文件元数据；INT4 默认 group 128→32，g32 端到端可用）
+✅ 激活感知 INT4（GPTQ + 可选 AWQ per-channel scaling）量化工具 + 引擎加载器（`--int4-quant`；group 存文件元数据；INT4 默认 group 128→32；g32 实际 OCR 与 BF16 一致）
 ```
 
 ### 3.1 收尾验证快照（2026-09-21，全绿）
@@ -138,7 +138,7 @@ unlimited-ocr.cpp/
 | 2026-09-21 P3 | 多尺寸修复（2.12）：`UOCR_THROW` 补 `throw`；`Engine::image_crops` 统一布局/视觉 crop；`image_embeddings` 多 crop 拼接按参考重写；CPU/GPU 视觉对非 1024 输入插值 SAM pos_embed/rel_pos | 多 crop 800×400 参考 visual rel_l2 **0.057**、greedy 16/16；单元测试 24→27；1×1 对齐不变；`PITFALLS.md` §21、`ALIGNMENT.md` §5.3 |
 | 2026-09-21 P3 | 多 crop 参考回归入库（2.13）：导出器支持 `--image-file` + 参考 `dynamic_preprocess`；`compare_ocr --strict` 回归判定（并修 summary 越界读）；CTest 注册 `compare_ocr_large`；新增根 `README.md` | `ref_ocr_large` 488 ids/483 visual、crop `(2,1)`；`ctest -R compare_ocr`（1×1 24/24、多 crop 16/16）均 Passed；真实 4×5 crop 页面 OCR 正确；`ALIGNMENT.md` §5.3 |
 | 2026-10-03 P3 | grouped BF16 专家 GEMM（2.14）：新增 `moe_gemm_bf16.cu`（device router + gate_up/down 各一次 launch，权重经指针数组寻址）；`forward_ragged` 对 BF16 也走 grouped；新增 CUDA 回归 | 真实 B=16 整波 prefill 165→**86ms**、522→**623 tok/s**；回归 worst rel_l2 **0.0016**、`grouped=1`；`BENCHMARKS.md` §2.14、`CORE_TECH.md` §5.12 |
-| 2026-10-03 P3 | 激活感知 INT4（GPTQ）量化：新增 `tools/reference/quantize_gptq.py`（层内池化 Hessian + 批量化 block GPTQ，group 存元数据）；引擎新增 `--int4-quant` 加载器（`SafetensorsFile::read_u8`/`metadata`）；`int4_group_size` 128→32；新增 `Engine::load` 选最大 checkpoint 文件修 bug | BF16 24/24、RTN g32 **23/24**、RTN g128 0/24；GPTQ g32 logits rel_l2 0.358→**0.305**、实际 OCR 正确；`ALIGNMENT.md` §5.4、`BENCHMARKS.md` §2.15 |
+| 2026-10-03 P3 | 激活感知 INT4（GPTQ + AWQ）量化：新增 `tools/reference/quantize_gptq.py`（层内池化 Hessian + 批量化 block GPTQ；`--awq` per-channel scaling 折叠进 RMSNorm，内核零改动）；引擎新增 `--int4-quant` 加载器（`SafetensorsFile::read_u8`/`metadata`）；`int4_group_size` 128→32；修 `Engine::load` 选最大 checkpoint 文件 bug | g32 RTN 0.358 → GPTQ 0.305 → GPTQ+AWQ **0.263**；实际 OCR 所有 g32 变体与 BF16 逐字一致；greedy 天花板是 bbox 坐标 token；`ALIGNMENT.md` §5.4、`BENCHMARKS.md` §2.15、`CORE_TECH.md` §3.1 |
 
 > 每一步的实现/坑/数据分别沉淀在 `CORE_TECH.md` / `PITFALLS.md` / `BENCHMARKS.md`；
 > 当前性能与回归见 `tAgent.md` §1。

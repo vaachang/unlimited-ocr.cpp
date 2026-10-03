@@ -75,17 +75,17 @@ models/
 
 - **group=32 RTN**（`--int4`，默认 group 已改为 32）：`ocr_image` 输出与 BF16 基本
   一致（`compare_ocr` greedy 23/24）；group=128 会端到端发散。
-- **activation-aware GPTQ**：先用参考模型校准、量化，再让引擎加载（推荐）：
+- **activation-aware GPTQ / AWQ**：先用参考模型校准、量化，再让引擎加载（推荐）：
   ```bash
   .venv/bin/python tools/reference/quantize_gptq.py --model models \
-      --out models/int4_gptq_g32.safetensors --group 32 \
+      --out models/int4_gptq_g32.safetensors --group 32 --awq \
       --calib-text models/Unlimited-OCR/README.md --images page.png
   ./build-cuda/tools/ocr_image --model models --image page.png \
       --int4 --int4-quant models/int4_gptq_g32.safetensors
   ```
-  GPTQ 用校准激活统计降低误差：prefill logits rel_l2 0.358→**0.305**、单矩阵激活
-  加权误差 −20%，实际 OCR 内容正确。数据见 `preDocs/BENCHMARKS.md` §2.15、
-  `preDocs/ALIGNMENT.md` §5.4。
+  GPTQ 用校准激活统计做误差补偿，`--awq` 再加 per-channel scaling（`1/s` 折叠进
+  RMSNorm，内核零改动）：prefill logits rel_l2 0.358→**0.263**，实际 OCR 文本与 BF16
+  逐字一致。数据见 `preDocs/BENCHMARKS.md` §2.15、`preDocs/ALIGNMENT.md` §5.4。
 
 ## 与 PyTorch 参考对齐
 

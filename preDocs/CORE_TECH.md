@@ -95,9 +95,19 @@ mmap，因此在 `weights.cpp` 的专家循环加 `#pragma omp parallel for sche
   引擎 `DecoderWeights::load(..., int4_quant_file)` 读该文件（`read_u8` 取 packed），
   并把 group 取自**文件元数据**（`SafetensorsFile::metadata()`），避免与
   `--int4-group` 不一致。`--int4-quant` 显式启用（不再自动探测）。
-- **实测**（真实文字图）：g32 GPTQ 的 prefill logits rel_l2 0.358→**0.305**、单矩阵
-  激活加权误差 −20%；但 autoregressive greedy 脆弱（3/24 vs RTN 23/24）。详见
-  `BENCHMARKS.md` §2.15、`ALIGNMENT.md` §5.4。
+- **AWQ per-channel scaling（`--awq`）**：对每层 gate/up，用激活 Hessian 对角
+  `diag(H)=Σx_j²` 得 `rms_j`，取 `s_j=(rms_j/geomean)^α`（α=`--awq-alpha`，默认 0.5，
+  限幅 [1/16,16]）；量化前把权重列乘 `s_j`。GPTQ 用的 Hessian 相应变为
+  `diag(1/s) H diag(1/s)`。
+  - **折叠（推理零改动）**：存 `model.layers.i.expert_in_scale`，加载时
+    `post_attention_layernorm /= s`（使专家输入变 `x/s`），并把同源消费者 router、
+    shared gate/up 的权重列乘 `s`（输出不变）。这样专家 `(W·diag(s))·(x/s)=Wx` 精确，
+    **CPU/CUDA 两条路径都无需改内核或加运行时缩放**。
+  - 坐标：`weights.cpp` 的 `scale_columns()` / `apply_expert_input_scale()`。
+- **实测**（真实文字图）：prefill logits rel_l2 g32 RTN 0.358 → GPTQ **0.305** →
+  GPTQ+AWQ **0.263**（−27%）；单矩阵激活加权误差 −20%。但 autoregressive greedy 对
+  bbox 坐标 token 敏感（见 `ALIGNMENT.md` §5.4），三者在 g32 下实际 OCR 文本都与 BF16
+  一致。详见 `BENCHMARKS.md` §2.15。
 - **默认**：`EngineConfig::int4_group_size` = **32**（g128 会端到端发散）。
 
 ## 4. Block Manager 与显存池（`include/uocr/block_manager.h`, `src/scheduler/`）

@@ -1,0 +1,8 @@
+===== RTN g16 =====
+decode step 23           : token ours=119316 ref=119316 OK
+
+summary: layout=OK visual_rel_l2=0.03449 (tol 0.15) prefill_rel_l2=0.2744 (tol 0.15) greedy=23/24 -> FAIL
+===== RTN g8 =====
+decode step 23           : token ours=119316 ref=119316 OK
+
+summary: layout=OK visual_rel_l2=0.03449 (tol 0.15) prefill_rel_l2=0.2463 (tol 0.15) greedy=23/24 -> FAIL

@@ -32,10 +32,11 @@
   （≤120 ms / ≥550 tok/s），且 BF16 现在在 prefill 与吞吐上均优于 INT4 路径而精度不变。
   见 `BENCHMARKS.md` §2.14、`CORE_TECH.md` §5.12。
 - **激活感知 INT4 完成（2026-10-03）**：新增 GPTQ 校准/量化工具
-  `tools/reference/quantize_gptq.py`（层内池化 Hessian + 批量化 block GPTQ）与引擎
-  `--int4-quant` 加载器；`int4_group_size` 默认 128→**32**。真实文字图 `compare_ocr`：
-  BF16 24/24、RTN g32 23/24、RTN g128 0/24；g32 GPTQ prefill logits rel_l2
-  **0.358→0.305**，`ocr_image` 实际 OCR 两种 g32 均正确。见 `BENCHMARKS.md` §2.15。
+  `tools/reference/quantize_gptq.py`（层内池化 Hessian + 批量化 block GPTQ，可选
+  `--awq` per-channel scaling）与引擎 `--int4-quant` 加载器；`int4_group_size` 默认
+  128→**32**。真实文字图 prefill logits rel_l2：g32 RTN 0.358 → GPTQ 0.305 →
+  GPTQ+AWQ **0.263**；所有 g32 变体实际 OCR 文本与 BF16 逐字一致（greedy 唯一分歧是
+  bbox 坐标 token，非文字）。见 `BENCHMARKS.md` §2.15、`ALIGNMENT.md` §5.4。
 - **收尾说明**：项目**可用、完整**（CUDA/CPU 双构建 + 全部单测 + 真实图片端到端 OCR
   逐字正确；INT4 g32 可用）。2.7（OmniDocBench）需先安装外部工具链（Docker/TeX Live
   等，安装前需征得同意）；2.8 受本机 `ncu` 权限限制；其余非阻塞优化见 §2。
@@ -121,13 +122,19 @@ ctest --test-dir build-cuda --output-on-failure
   批量化 GPTQ（同层 64 专家一起），写出引擎 INT4 `packed/scales/zeros` safetensors
   （group 存元数据）。引擎新增 `--int4-quant FILE` 加载器（`SafetensorsFile::read_u8`
   + `metadata()`；`DecoderWeights::load` 新参），`int4_group_size` 默认 128→**32**。
-- **结果**：真实文字图 `compare_ocr --strict`：BF16 24/24、**RTN g32 23/24**、RTN g128
-  0/24；g32 GPTQ prefill logits rel_l2 **0.358→0.305**（单矩阵激活加权误差 −20%），
-  `ocr_image` 实际 OCR 内容两种 g32 均正确。greedy 是级联/脆弱指标，GPTQ 在该指标上
-  3/24（优化平均输出而非 argmax）。`uocr_tests`/`uocr_cuda_tests`/vision selftest 全过。
-- **结论**：group=32 是 INT4 可用的关键；activation-aware GPTQ 进一步降 logits 误差，
-  经 `--int4-quant` 显式启用。见 `BENCHMARKS.md` §2.15、`ALIGNMENT.md` §5.4、
-  `CORE_TECH.md` §3.1。
+- **扩展（AWQ per-channel scaling）**：`--awq` 对 gate/up 按通道激活 RMS 缩放权重，
+  并把 `1/s` 折叠进 post-attention RMSNorm、补偿 router/shared，**推理零内核改动**。
+- **结果**：真实文字图 `compare_ocr --strict`：BF16 24/24、RTN g32/g16/g8 = 23/24、
+  RTN g128 0/24；prefill logits rel_l2 **0.358（g32 RTN）→ 0.305（GPTQ）→ 0.263
+  （GPTQ+AWQ，−27%）**，单矩阵激活加权误差 GPTQ −20%。`ocr_image` 实际 OCR 文本所有
+  g32 变体都与 BF16 逐字一致。
+- **关键发现**：greedy 无法靠降平均误差改善（g16/g8 仍 23/24；GPTQ/AWQ 反而 2–3/24）。
+  唯一首次分歧是 step 14 的 **bbox 坐标** token（参考 `"578"`→另一数字，随后追平），
+  不是文字；用「贪心 24/24」衡量 4-bit 专家不合理。`uocr_tests`/`uocr_cuda_tests`/
+  vision selftest 全过。
+- **结论**：group=32 是 INT4 可用的关键；activation-aware（GPTQ，可选 +AWQ）进一步降
+  logits 误差，经 `--int4-quant` 显式启用。见 `BENCHMARKS.md` §2.15、`ALIGNMENT.md`
+  §5.4、`CORE_TECH.md` §3.1。
 - **涉及**：`tools/reference/quantize_gptq.py`、`src/runtime/weights.cpp`、
   `src/runtime/safetensors.{h,cpp}`、`include/uocr/{config,weights,safetensors}.h`、
   `src/engine/engine.cpp`、`tools/{ocr_image,compare_ocr,inspect_model}.cpp`、
@@ -431,10 +438,10 @@ ctest --test-dir build-cuda --output-on-failure
 - 视觉编码器 f32 GEMM 已由 **split-bf16 tensor-core GEMM** 取代（激活 hi/lo 两片
   补偿误差），视觉栈保持 6e-4；f32 CUDA-core 版本仅作 `k%8≠0` 回退。
 - **INT4 量化**：`quantize_int4_awq` 实为 group-wise RTN；**group=32** 后真实 OCR
-  可用（`compare_ocr` 23/24、`ocr_image` 与 BF16 一致），group=128 发散。激活感知
-  GPTQ（`tools/reference/quantize_gptq.py` + `--int4-quant`）把 prefill logits 误差
-  0.358→0.305，但 autoregressive greedy 脆弱（平均误差↓不等于 argmax 保持）。真实
-  精度仍待 OmniDocBench（2.7）。CUDA/INT4 与 CPU/INT4 一致（移植无误）。
+  可用（实际文本与 BF16 一致），group=128 发散。激活感知 GPTQ（+可选 AWQ）把 prefill
+  logits 误差 0.358→**0.263**，但 autoregressive greedy 有天花板：唯一分歧是 bbox
+  坐标 token（非文字），g16/g8 仍 23/24，GPTQ/AWQ 反而 2–3/24。故用「贪心 24/24」衡量
+  4-bit 专家不合理。真实精度仍待 OmniDocBench（2.7）。CUDA/INT4 与 CPU/INT4 一致。
 - `matmul_t_bf16_ref` 仅用于单测 A/B，release 构建保留。
 
 ---

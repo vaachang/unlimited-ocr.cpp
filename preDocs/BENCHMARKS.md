@@ -419,19 +419,23 @@ prefill **43 / 49 / 59 / 81 / 121 ms**、B=16 **489.7 tok/s**（与 §2.10 的 1
 | BF16 | **0.0345** | ✓ | **24/24** | 正确 |
 | INT4 g128 RTN | 0.3538 | ✗ | 0/24 | 乱码 |
 | INT4 g32 RTN | 0.3577 | ✓ | **23/24** | 与 BF16 一致 |
+| INT4 g16 RTN | 0.2744 | ✓ | 23/24 | 正确 |
+| INT4 g8 RTN | 0.2463 | ✓ | 23/24 | 正确 |
 | INT4 g32 GPTQ | 0.3045 | ✓ | 3/24 | 内容正确 |
-| INT4 g128 GPTQ | 0.3538 | ✓ | 3/24 | 内容基本正确 |
+| INT4 g32 GPTQ+AWQ | **0.2631** | ✓ | 2/24 | 内容正确 |
 
-- **logits L2**：GPTQ g32 比 RTN g32 低 15%（0.358→0.305）；单矩阵激活加权误差
-  −20%（0.097→0.077）。`inspect_model --quant-check --int4-quant <file>` 可复核加载
-  后的权重 rel-L2（g32：RTN 0.081 / GPTQ 0.101——GPTQ 用权重误差换输出误差）。
-- **greedy 是脆弱指标**：`compare_ocr` 逐步回填自己的 token，一次早期 top-1 翻转即
-  级联；GPTQ 优化平均输出，不保证 argmax，故该指标反而差。带 `no-repeat-ngram` 的
-  实际 `ocr_image` 输出两种 group=32 都对。
-- **默认改动**：`EngineConfig::int4_group_size` 128→**32**；`--int4` 默认走 g32 RTN
-  （24/24→23/24、OCR 输出与 BF16 一致）；activation-aware 用 `--int4-quant` 显式启用。
-- 备注：`quantize_gptq.py` 的 group 存在 safetensors 元数据里，加载时自动采用，无需
-  再传 `--int4-group`。
+- **平均误差**：g32 RTN 0.358 → GPTQ 0.305（−15%）→ **GPTQ+AWQ 0.263（−27%）**；
+  单矩阵激活加权误差 GPTQ −20%。`inspect_model --quant-check --int4-quant <file>` 可
+  复核加载权重 rel-L2（GPTQ 用权重误差换输出误差，raw 反而略高）。
+- **greedy 有硬天花板**：`compare_ocr` 逐步回填自己的 token；g16/g8 把 L2 降到
+  0.27/0.25，greedy 仍 23/24，GPTQ/AWQ 更低至 3/24、2/24。唯一首次分歧是 step 14 的
+  **bbox 坐标** token（参考 `"578"` → 另一个数字，随后追平），**不是文字**——BF16 与
+  所有 g32 变体的实际 OCR 文本逐字一致，仅框坐标差 1–3 像素。故 4-bit 下不该用
+  「贪心 24/24」衡量可用性。
+- **AWQ 实现**：`--awq` 对 gate/up 按通道激活 RMS 做 `s=(rms/geo)^0.5` 缩放，`1/s`
+  折叠进 post-attention RMSNorm、并补偿 router/shared，**内核零改动**、CPU/CUDA 均生效。
+- **默认改动**：`EngineConfig::int4_group_size` 128→**32**；`--int4` 走 g32 RTN
+  （OCR 与 BF16 一致）；activation-aware 用 `--int4-quant` 显式启用（file group 存元数据）。
 
 ## 3. 回归快照
 

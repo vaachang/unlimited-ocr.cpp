@@ -1,0 +1,13 @@
+===== compare_ocr: AWQ+GPTQ g32 =====
+decode step 22           : token ours=119316 ref=15 DIFF
+decode step 23           : token ours=8367 ref=119316 DIFF
+
+summary: layout=OK visual_rel_l2=0.03449 (tol 0.15) prefill_rel_l2=0.2631 (tol 0.15) greedy=2/24 -> FAIL
+===== ocr_image: AWQ+GPTQ g32 =====
+===== OCR =====
+ Text to PDF.
+<|det|>text [37, 92, 581, 192]<|/det|>Unlimited-OCR Engine Test
+<|det|>text [34, 269, 495, 348]<|/det|>The quick brown fox jumps over
+<|det|>text [34, 448, 421, 526]<|/det|>the lazy dog. 0123456789
+<|det|>text [34, 626, 456, 698]<|/det|>R-SWA + MoE INT4 inference
+===============
